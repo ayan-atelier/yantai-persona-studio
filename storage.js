@@ -1,0 +1,157 @@
+/** Lightweight IndexedDB resource store with an in-memory fallback for previews/tests. */
+
+export const DB_NAME = 'yantai-persona-studio';
+export const STORE_NAME = 'assets';
+const memory = new Map();
+let dbPromise;
+
+function canUseIndexedDB() {
+  return typeof indexedDB !== 'undefined';
+}
+
+export function openResourceStore({ dbName = DB_NAME, storeName = STORE_NAME } = {}) {
+  if (!canUseIndexedDB()) return Promise.resolve(null);
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(dbName, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(storeName)) {
+        const store = db.createObjectStore(storeName, { keyPath: 'id' });
+        store.createIndex('kind', 'kind', { unique: false });
+        store.createIndex('updatedAt', 'updatedAt', { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => { dbPromise = null; reject(request.error); };
+  });
+  return dbPromise;
+}
+
+function ensureAsset(asset) {
+  if (!asset?.id) throw new Error('asset.id is required');
+  return { ...asset, updatedAt: asset.updatedAt ?? Date.now() };
+}
+
+export async function putAsset(asset, options = {}) {
+  const item = ensureAsset(asset);
+  const db = await openResourceStore(options).catch(() => null);
+  if (!db) { memory.set(item.id, item); return item; }
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(options.storeName ?? STORE_NAME, 'readwrite').objectStore(options.storeName ?? STORE_NAME).put(item);
+    request.onsuccess = () => resolve(item);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getAsset(id, options = {}) {
+  const db = await openResourceStore(options).catch(() => null);
+  if (!db) return memory.get(id) ?? null;
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(options.storeName ?? STORE_NAME, 'readonly').objectStore(options.storeName ?? STORE_NAME).get(id);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function deleteAsset(id, options = {}) {
+  const db = await openResourceStore(options).catch(() => null);
+  if (!db) return memory.delete(id);
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(options.storeName ?? STORE_NAME, 'readwrite').objectStore(options.storeName ?? STORE_NAME).delete(id);
+    request.onsuccess = () => resolve(true);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function listAssets({ kind, ...options } = {}) {
+  const db = await openResourceStore(options).catch(() => null);
+  if (!db) return [...memory.values()].filter(item => !kind || item.kind === kind).sort((a, b) => b.updatedAt - a.updatedAt);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(options.storeName ?? STORE_NAME, 'readonly');
+    const store = tx.objectStore(options.storeName ?? STORE_NAME);
+    const request = kind ? store.index('kind').getAll(kind) : store.getAll();
+    request.onsuccess = () => resolve((request.result ?? []).sort((a, b) => b.updatedAt - a.updatedAt));
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export class ResourceStore {
+  constructor(options = {}) { this.options = options; }
+  put(asset) { return putAsset(asset, this.options); }
+  get(id) { return getAsset(id, this.options); }
+  delete(id) { return deleteAsset(id, this.options); }
+  list(kind) { return listAssets({ ...this.options, kind }); }
+}
+
+function uid(prefix = 'asset') {
+  return `${prefix}_${globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`;
+}
+
+async function digestFile(file) {
+  try {
+    const buffer = await file.arrayBuffer();
+    if (globalThis.crypto?.subtle) {
+      const hash = await crypto.subtle.digest('SHA-256', buffer);
+      return [...new Uint8Array(hash)].map(v => v.toString(16).padStart(2, '0')).join('');
+    }
+  } catch (_) { /* fall through */ }
+  return `${file.size}:${file.lastModified}:${file.name}`;
+}
+
+export function createStorage({ report = () => {} } = {}) {
+  const previewUrls = new Map();
+  const makePreview = (id, blob, fallback = '') => {
+    if (!blob || typeof globalThis.URL?.createObjectURL !== 'function') return fallback || '';
+    const old = previewUrls.get(id);
+    if (old) {
+      try { globalThis.URL.revokeObjectURL(old); } catch (_) { /* stale preview */ }
+    }
+    const url = globalThis.URL.createObjectURL(blob);
+    previewUrls.set(id, url);
+    return url;
+  };
+  const hydrateGallery = async (items = []) => {
+    const result = [];
+    for (const item of items || []) {
+      if (!item?.id) continue;
+      const stored = await getAsset(item.id).catch(() => null);
+      const blob = stored?.blob || item.blob;
+      // Blob URLs are scoped to the origin that created them. Never carry a
+      // stale blob: URL across a localhost/LAN address change; it renders as
+      // a broken image and hides the fact that the original file is missing.
+      const fallback = item.url && !/^blob:/i.test(String(item.url)) ? item.url : '';
+      result.push({ ...item, url: makePreview(item.id, blob, fallback) });
+    }
+    return result;
+  };
+  const releasePreview = id => {
+    const url = previewUrls.get(id);
+    if (!url) return;
+    try { globalThis.URL.revokeObjectURL(url); } catch (_) { /* already released */ }
+    previewUrls.delete(id);
+  };
+  const importFiles = async (files, { kind: preferredKind = null } = {}) => {
+    const result = [];
+    for (const file of [...(files || [])]) {
+      const hash = await digestFile(file);
+      const kind = preferredKind === 'card' || preferredKind === 'avatar'
+        ? preferredKind
+        : (/\.json$/i.test(file.name) || /\.png$/i.test(file.name) && /card|character|角色|卡/i.test(file.name) ? 'card' : 'avatar');
+      const item = { id: `asset_${hash.slice(0, 24)}`, hash, kind, name: file.name, mime: file.type || 'application/octet-stream', size: file.size, blob: file, url: makePreview(`asset_${hash.slice(0, 24)}`, file), createdAt: Date.now(), updatedAt: Date.now() };
+      await putAsset(item);
+      result.push({ ...item, blob: undefined });
+    }
+    return result;
+  };
+  const mergeGallery = (current, added) => {
+    const byId = new Map((current || []).map(item => [item.id, item]));
+    for (const item of added || []) {
+      const previous = byId.get(item.id);
+      if (!previous || (item.updatedAt || 0) >= (previous.updatedAt || 0)) byId.set(item.id, item);
+    }
+    return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  };
+  const clear = async () => { const items = await listAssets(); for (const item of items) { releasePreview(item.id); await deleteAsset(item.id); } };
+  return { openResourceStore, putAsset, getAsset, remove: deleteAsset, listAssets, importFiles, mergeGallery, hydrateGallery, releasePreview, clear, uid };
+}
