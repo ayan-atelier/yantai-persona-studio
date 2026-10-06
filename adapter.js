@@ -635,7 +635,7 @@ export async function snapshot(context = getStContext()) {
 }
 
 export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', report = () => {} } = {}) {
-  const context = () => getStContext(); const listeners = new Map(); const hookedButtons = new Set(); let native = null;
+  const context = () => getStContext(); const listeners = new Map(); const hookedButtons = new Set(); const ownedQuickEntries = new Set(); let native = null;
   const loadNativeApi = async () => { if (!native) native = await nativeApi(); return native; };
   const on = (name, fn) => {
     const ctx = context(); const source = ctx.eventSource; const types = ctx.eventTypes || ctx.event_types || {}; const type = types[name] || name;
@@ -667,6 +667,8 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
       delete button.dataset.yantaiPersonaHooked;
     }
     hookedButtons.clear();
+    for (const entry of ownedQuickEntries) entry.remove?.();
+    ownedQuickEntries.clear();
     globalThis.document?.getElementById?.('yantai-persona-studio-entry')?.remove?.();
     renameNativeTransferLabels(false);
     renameNativePersonaHeader(false);
@@ -680,12 +682,31 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
   const resolvePersona = ({ state, target: passedTarget } = {}) => { const ctx = context(); const nativeBindings = readPersonaBindings(ctx, namespace); const binding = resolveBinding({ ...nativeBindings, session: state?.sessionOverride ?? nativeBindings.session }, ctx); const all = listNativePersonas(ctx, native); const persona = all.find(item => String(item.id) === String(binding.personaId)) || (binding.scope === 'none' ? readNativePersona(ctx, native) : null); return { ...binding, persona, target: passedTarget || { cardKey: getCardFingerprint(ctx), chatKey: getChatId(ctx) || 'current-chat' }, all }; };
   const writeBinding = async ({ scope, mode, personaId = null }) => setNativeBinding(scope, mode === 'none' ? null : personaId, context(), await nativeApi());
   const createPersona = value => ({ ...value, id: value?.id || 'draft_' + Date.now().toString(36), source: value?.source || 'yantai' });
+  function installGalleryEntry() {
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu || document.getElementById('yantai-persona-studio-gallery-menu')) return;
+    const entry = document.createElement('div');
+    entry.id = 'yantai-persona-studio-gallery-menu';
+    entry.className = 'list-group-item flex-container flexGap5 interactable';
+    entry.tabIndex = 0;
+    entry.setAttribute('role', 'button');
+    entry.append(Object.assign(document.createElement('i'), { className: 'fa-solid fa-images' }), Object.assign(document.createElement('span'), { textContent: '图库' }));
+    const open = event => {
+      event?.preventDefault?.();
+      event?.stopImmediatePropagation?.();
+      document.dispatchEvent(new CustomEvent('yantai:persona-studio:gallery'));
+    };
+    entry.addEventListener('click', open);
+    entry.addEventListener('keydown', event => { if (['Enter', ' '].includes(event.key)) { event.preventDefault(); open(event); } });
+    menu.append(entry); ownedQuickEntries.add(entry);
+  }
   const installEntry = async () => {
     // The native top button is deliberately left untouched. SillyTavern's
     // drawer handler owns its async open/close animation; observing the final
     // class state avoids the old double-toggle race and keeps other drawers
     // (including the wand) independent.
     document.getElementById('yantai-persona-studio-entry')?.remove?.();
+    installGalleryEntry();
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };

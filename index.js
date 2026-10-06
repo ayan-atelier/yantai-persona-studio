@@ -7,9 +7,10 @@
 (async () => {
   'use strict';
 
-  const VERSION = '0.2.2-dev8';
+  const VERSION = '0.2.2-dev9';
   const NS = 'yantai-persona-studio';
   const root = globalThis;
+  const CONTROL_REGISTRY_KEY = Symbol.for('yantai.control.registry.v1');
   const RUNTIME_KEY = '__yantaiPersonaStudioRuntime';
   const previousRuntime = root[RUNTIME_KEY];
   if (previousRuntime?.dispose) {
@@ -36,6 +37,75 @@
   let editMode = false;
   let lastNativeOpen = null;
   let syncTimer = null;
+  let controlModule = null;
+
+  function controlRegistry() {
+    const existing = root[CONTROL_REGISTRY_KEY];
+    if (existing && existing.version === 1 && existing.modules instanceof Map) return existing;
+    const registry = existing && typeof existing === 'object' ? existing : {};
+    registry.version = 1;
+    registry.modules = registry.modules instanceof Map ? registry.modules : new Map();
+    root[CONTROL_REGISTRY_KEY] = registry;
+    return registry;
+  }
+
+  function registerControlModule() {
+    const registry = controlRegistry();
+    controlModule = {
+      id: NS,
+      label: '人设库与人设助手',
+      version: VERSION,
+      schemaVersion: 3,
+      namespace: NS,
+      inspect() {
+        const ctx = adapter?.context?.() || {};
+        const gallery = Array.isArray(state?.gallery) ? state.gallery : [];
+        const previewCount = gallery.filter(item => String(item?.url || '').trim()).length;
+        const missingPreview = Math.max(0, gallery.length - previewCount);
+        const threads = state?.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
+        return {
+          installed: true,
+          enabled: state?.enabled !== false,
+          health: missingPreview ? 'degraded' : 'ok',
+          sources: [
+            { kind: 'host-settings', namespace: NS, scope: 'host', portable: 'partial', readable: true, writable: true },
+            { kind: 'indexeddb', namespace: 'yantai-persona-studio/assets', scope: 'device', portable: 'no', readable: true, writable: true, count: gallery.length, missingCount: missingPreview },
+          ],
+          checks: [
+            { id: 'gallery-preview', label: '图库预览', status: missingPreview ? 'degraded' : 'ok', detail: missingPreview ? `${missingPreview} 项只有元数据，当前设备没有可用预览` : `本设备可预览 ${previewCount} 项` },
+            { id: 'assistant-history', label: 'Milo 记录', status: 'ok', detail: `${Object.keys(threads).length} 个对话线程保存在人设馆设置中` },
+            { id: 'context', label: '当前酒馆上下文', status: ctx ? 'ok' : 'unknown', detail: root.location?.origin || '当前来源未知' },
+          ],
+        };
+      },
+      open(options = {}) { return open(options); },
+      async setEnabled(value) {
+        state.enabled = Boolean(value);
+        await save();
+        const galleryEntry = document.getElementById('yantai-persona-studio-gallery-menu');
+        if (galleryEntry) galleryEntry.hidden = !state.enabled;
+        if (!state.enabled) {
+          editMode = false;
+          app?.close();
+          adapter?.setNativeTakeover?.(false);
+          adapter?.setNativeEditMode?.(false);
+        } else {
+          await adapter?.installEntry?.();
+        }
+        root.dispatchEvent?.(new CustomEvent('yantai:control:updated'));
+        return state.enabled;
+      },
+    };
+    registry.modules.set(NS, controlModule);
+    root.dispatchEvent?.(new CustomEvent('yantai:control:updated'));
+  }
+
+  function unregisterControlModule() {
+    const registry = root[CONTROL_REGISTRY_KEY];
+    if (registry?.modules instanceof Map && registry.modules.get(NS) === controlModule) registry.modules.delete(NS);
+    root.dispatchEvent?.(new CustomEvent('yantai:control:updated'));
+    controlModule = null;
+  }
 
   function stopObserver() {
     observer?.disconnect?.();
@@ -54,8 +124,10 @@
     stopObserver();
     if (syncTimer) clearTimeout(syncTimer);
     syncTimer = null;
+    root[RUNTIME_KEY]?.removeGalleryEntry?.();
     adapter?.dispose?.();
     app?.dispose?.();
+    unregisterControlModule();
     initialized = false;
     if (root[RUNTIME_KEY]?.dispose === dispose) delete root[RUNTIME_KEY];
   }
@@ -184,12 +256,16 @@
   }
   async function save() { await adapter.saveExtensionState(state); await refresh(); }
 
-  async function open({ ensureNative = true } = {}) {
+  async function open({ ensureNative = true, tab = 'current' } = {}) {
     if (!initialized) await initialize();
-    // Opening the native smiley is the entry point for the workspace. Always
-    // land on the current persona view; users can move to the other tabs after
-    // that without reopening an old assistant/editor screen unexpectedly.
-    state.ui.tab = 'current';
+    if (state.enabled === false) {
+      report('人设馆已关闭。可在「砚台总库」的模块开关中重新启用。', 'info');
+      return false;
+    }
+    // Opening the native smiley lands on the current view; explicit quick
+    // entries may request the gallery or another workspace tab.
+    const allowedTabs = new Set(['current', 'library', 'editor', 'gallery', 'assistant']);
+    state.ui.tab = allowedTabs.has(tab) ? tab : 'current';
     app?.update?.({ state });
     const nativePanel = ensureNative ? await adapter.openNativePersonaPanel() : ([...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null) || document.querySelector('#persona-management-block'));
     if (!ensureNative && !adapter.isNativePersonaPanelOpen()) {
@@ -212,6 +288,12 @@
 
   async function syncNativeDrawer() {
     const isOpen = Boolean(adapter?.isNativePersonaPanelOpen?.());
+    if (state.enabled === false) {
+      app?.close();
+      adapter?.setNativeTakeover?.(false);
+      adapter?.setNativeEditMode?.(false);
+      return;
+    }
     if (isOpen === lastNativeOpen && !editMode) return;
     lastNativeOpen = isOpen;
     if (isOpen) {
@@ -234,6 +316,7 @@
     initialized = true;
     await loadModules();
     await loadState();
+    registerControlModule();
     app = ui.createApp({ version: VERSION, adapter, storage, actions: {}, report, getState: () => ({ state, target: activeTarget(), current: resolved() }) });
     const actions = {
       open,
@@ -368,7 +451,12 @@
     adapter.on('PERSONA_CREATED', refresh);
     adapter.on('PERSONA_RENAMED', refresh);
     adapter.on('PERSONA_DELETED', refresh);
+    const openGallery = () => { void open({ tab: 'gallery' }); };
+    document.addEventListener('yantai:persona-studio:gallery', openGallery);
+    root[RUNTIME_KEY].removeGalleryEntry = () => document.removeEventListener('yantai:persona-studio:gallery', openGallery);
     await adapter.installEntry();
+    const galleryEntry = document.getElementById('yantai-persona-studio-gallery-menu');
+    if (galleryEntry) galleryEntry.hidden = state.enabled === false;
     // Native drawers can be mounted lazily, especially on mobile and after a
     // theme reload. Keep a tiny, scoped observer so the takeover hook is not
     // lost when SillyTavern replaces the settings subtree.
@@ -391,8 +479,8 @@
         if (!node || node.nodeType !== 1) return false;
         const element = /** @type {Element} */ (node);
         return Boolean(
-          element.matches?.('#PersonaManagement, #persona-management-button, #persona-management-block')
-          || element.querySelector?.('#PersonaManagement, #persona-management-button, #persona-management-block'),
+          element.matches?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu')
+          || element.querySelector?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu'),
         );
       };
       const attachPanelObserver = () => {
