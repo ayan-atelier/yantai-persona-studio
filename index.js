@@ -7,7 +7,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '0.2.2-dev16';
+  const VERSION = '0.2.2-dev17';
   const NS = 'yantai-persona-studio';
   const root = globalThis;
   const CONTROL_REGISTRY_KEY = Symbol.for('yantai.control.registry.v1');

@@ -35,6 +35,7 @@
 #persona-management-block.ytps-takeover > .persona_management_left_column,
 #persona-management-block.ytps-takeover > .persona_management_right_column { display:none !important; }
 #persona-management-block.ytps-takeover > #yt-persona-native-workspace { display:block !important; width:100% !important; max-width:none !important; min-width:0 !important; margin:0; }
+#PersonaManagement:has(#persona-management-block.ytps-takeover) :is(.user_stats_button, #personas_backup, #personas_restore) { display:none !important; }
 #persona-management-block.ytps-native-edit { display:block !important; width:100% !important; min-width:0 !important; }
 #persona-management-block.ytps-native-edit > .persona_management_left_column { display:none !important; }
 #persona-management-block.ytps-native-edit > .persona_management_right_column { display:block !important; width:100% !important; max-width:none !important; }

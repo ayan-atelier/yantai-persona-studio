@@ -4,7 +4,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "砚台",
-  "version": "0.2.2-dev16",
+  "version": "0.2.2-dev17",
   "auto_update": false,
   "minimum_client_version": "1.0.0",
   "description": "原生人设面板接管与整理工具；不复制酒馆已有的人设数据。"
