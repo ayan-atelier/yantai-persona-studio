@@ -573,6 +573,13 @@ function renameNativeTransferLabels(active = true) {
 function renameNativePersonaHeader(active = true) {
   const heading = document.querySelector('#PersonaManagement h3');
   if (!heading) return;
+  if (active) {
+    if (!Object.prototype.hasOwnProperty.call(heading.dataset, 'yantaiOriginalPersonaHeaderDisplay')) heading.dataset.yantaiOriginalPersonaHeaderDisplay = heading.style.display || '';
+    heading.style.display = 'none';
+  } else if (Object.prototype.hasOwnProperty.call(heading.dataset, 'yantaiOriginalPersonaHeaderDisplay')) {
+    heading.style.display = heading.dataset.yantaiOriginalPersonaHeaderDisplay || '';
+    delete heading.dataset.yantaiOriginalPersonaHeaderDisplay;
+  }
   const label = Array.from(heading.querySelectorAll('span')).find(item => !item.closest('a')) || heading.firstElementChild;
   const help = heading.querySelector('a');
   if (label) {
