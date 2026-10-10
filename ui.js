@@ -1,8 +1,8 @@
 const TABS = {
   current: { label: '当前', icon: 'fa-house' },
   library: { label: '人设档案', icon: 'fa-address-card' },
-  editor: { label: '编辑人设', icon: 'fa-pen-to-square' },
-  create: { label: '新建人设', icon: 'fa-user-plus' },
+  create: { label: '新建', icon: 'fa-user-plus' },
+  editor: { label: '编辑', icon: 'fa-pen-to-square' },
   // Keep the navigation label task-oriented. Milo's name is shown once the
   // assistant page is open, so the tab remains clear to first-time users.
   assistant: { label: '人设助手', icon: 'fa-wand-magic-sparkles' },

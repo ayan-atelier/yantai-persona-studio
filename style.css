@@ -217,6 +217,9 @@
 @keyframes ytps-shimmer { to { background-position:-200% 0; } }
 @media (max-width:700px) {
   #yt-persona-native-workspace { margin-bottom:9px; }
+  #yt-persona-native-workspace .ytps-tabs { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:1px; padding:4px; overflow-x:hidden; }
+  #yt-persona-native-workspace .ytps-tab { width:100%; min-width:0; min-height:40px; justify-content:center; gap:3px; padding:5px 2px; font-size:clamp(11px,3vw,13px); white-space:nowrap; }
+  #yt-persona-native-workspace .ytps-tab i { flex:none; font-size:12px; }
   .ytps-title span { display:none; }
   .ytps-body { padding:8px; }
   .ytps-shortcuts,.ytps-ai-grid,.ytps-ai-shell { grid-template-columns:1fr; }
@@ -251,6 +254,11 @@
   .ytps-choice-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
   #yt-persona-native-workspace .ytps-choice-grid > .ytps-choice { min-height:44px; }
   .ytps-editor-footer { justify-content:flex-start; }
+}
+
+@media (max-width:360px) {
+  #yt-persona-native-workspace .ytps-tab { gap:0; font-size:11px; }
+  #yt-persona-native-workspace .ytps-tab i { display:none; }
 }
 
 /* Milo is presented as a small chat surface rather than two nested result
