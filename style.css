@@ -180,6 +180,7 @@
 .ytps-editor-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:2px 2px 5px; }
 .ytps-editor-head h2 { margin:3px 0 0; font-size:19px; }
 .ytps-editor-head p { margin:5px 0 0; }
+.ytps-editor-new { min-height:30px; padding:4px 10px; white-space:nowrap; }
 .ytps-editor-layout { display:grid; grid-template-columns:minmax(150px,30%) minmax(0,1fr); gap:12px; align-items:stretch; }
 .ytps-editor-avatar { position:relative; min-height:270px; width:100%; overflow:hidden; padding:0; border:1px solid var(--ytps-line); border-radius:var(--ytps-radius); color:var(--ytps-accent); background:color-mix(in srgb, var(--ytps-accent) 12%, transparent); cursor:pointer; display:grid; place-items:center; font-size:30px; }
 .ytps-editor-back { display:inline-flex; align-items:center; gap:5px; margin:0 0 8px; padding:3px 0; border:0; color:var(--ytps-muted); background:transparent; cursor:pointer; font-size:11px; }
