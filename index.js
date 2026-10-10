@@ -7,7 +7,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '0.2.2-dev9';
+  const VERSION = '0.2.2-dev10';
   const NS = 'yantai-persona-studio';
   const root = globalThis;
   const CONTROL_REGISTRY_KEY = Symbol.for('yantai.control.registry.v1');
@@ -82,8 +82,6 @@
       async setEnabled(value) {
         state.enabled = Boolean(value);
         await save();
-        const galleryEntry = document.getElementById('yantai-persona-studio-gallery-menu');
-        if (galleryEntry) galleryEntry.hidden = !state.enabled;
         if (!state.enabled) {
           editMode = false;
           app?.close();
@@ -124,7 +122,6 @@
     stopObserver();
     if (syncTimer) clearTimeout(syncTimer);
     syncTimer = null;
-    root[RUNTIME_KEY]?.removeGalleryEntry?.();
     adapter?.dispose?.();
     app?.dispose?.();
     unregisterControlModule();
@@ -368,9 +365,19 @@
       },
       async focusPersona(id) { await adapter.focusNativePersona(id); await refresh(); },
       async openNativeCreate() {
-        const button = document.querySelector('#create_dummy_persona');
-        if (button) { editMode = true; adapter.setNativeEditMode(true); app?.close(); button.click(); return; }
-        report('当前酒馆没有找到原生“新建人设”按钮，请先展开原生人设面板。', 'warning');
+        const panel = await adapter.openNativePersonaPanel?.();
+        const button = panel?.querySelector?.('#create_dummy_persona') || document.querySelector('#create_dummy_persona');
+        if (button) {
+          editMode = true;
+          app?.close();
+          adapter.setNativeTakeover(false);
+          adapter.setNativeEditMode(true);
+          button.click();
+          report('已打开酒馆的“创建空白用户设定”，保存后会作为一份全新人设出现。', 'info');
+          return true;
+        }
+        report('当前酒馆没有找到原生“创建空白用户设定”按钮，请先展开原生人设面板。', 'warning');
+        return false;
       },
       async openNativeEdit(id) { editMode = true; adapter.setNativeEditMode(true); app?.close(); await adapter.selectNativePersona(id); await adapter.focusNativePersona(id); report('已切换到酒馆原生编辑区；编辑完成后关闭并重新打开人设按钮即可回到砚台工作区。', 'info'); },
       async addGalleryAssets(files, kind = null) { const added = await storage.importFiles(files, { kind }); state.gallery = storage.mergeGallery(state.gallery, added); await save(); return added; },
@@ -451,12 +458,7 @@
     adapter.on('PERSONA_CREATED', refresh);
     adapter.on('PERSONA_RENAMED', refresh);
     adapter.on('PERSONA_DELETED', refresh);
-    const openGallery = () => { void open({ tab: 'gallery' }); };
-    document.addEventListener('yantai:persona-studio:gallery', openGallery);
-    root[RUNTIME_KEY].removeGalleryEntry = () => document.removeEventListener('yantai:persona-studio:gallery', openGallery);
     await adapter.installEntry();
-    const galleryEntry = document.getElementById('yantai-persona-studio-gallery-menu');
-    if (galleryEntry) galleryEntry.hidden = state.enabled === false;
     // Native drawers can be mounted lazily, especially on mobile and after a
     // theme reload. Keep a tiny, scoped observer so the takeover hook is not
     // lost when SillyTavern replaces the settings subtree.

@@ -84,7 +84,7 @@ class App {
   library() {
     const q = String(this.state.query || '').toLowerCase();
     const list = this.state.personas.filter(p => !q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q));
-    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><button class="ytps-btn ytps-primary" data-action="native-create"><i class="fa-solid fa-plus"></i> 新建</button><span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">没有匹配的人设。<br><button class="ytps-btn ytps-primary" data-action="native-create">新建人设</button></div>');
+    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><button class="ytps-btn ytps-primary" data-action="native-create"><i class="fa-solid fa-plus"></i> 新建空白人设</button><span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">没有匹配的人设。<br><button class="ytps-btn ytps-primary" data-action="native-create">新建空白人设</button></div>');
   }
   personaBindingLabel(p) {
     const bindings = this.state.bindings || {};
@@ -136,7 +136,7 @@ class App {
     if (!existing && id) this.state.editorDraft = draft;
     const avatar = persona.avatarRef || '';
     const image = avatar ? '<img src="' + esc(avatar) + '" alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
-    if (!id) return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建人设</h2><p class="ytps-muted">先让酒馆创建一份原生人设，之后可以在这里整理头像、备注和描述。</p></div></div><div class="ytps-editor-empty"><i class="fa-solid fa-user-plus"></i><p>创建后，头像会直接来自酒馆的人设库，不需要重新导入。</p><button class="ytps-btn ytps-primary" data-action="native-create"><i class="fa-solid fa-plus"></i> 在酒馆创建人设</button></div></div>';
+    if (!id) return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建空白人设</h2><p class="ytps-muted">这会调用酒馆原生的“创建空白用户设定”，不会覆盖或复制已有条目。</p></div></div><div class="ytps-editor-empty"><i class="fa-solid fa-user-plus"></i><p>保存后，这份人设会作为新条目出现在人设档案中。</p><button class="ytps-btn ytps-primary" data-action="native-create"><i class="fa-solid fa-plus"></i> 创建空白人设</button></div></div>';
     const currentScope = this.personaScope(id);
     const scopeButton = (scope, label) => '<button class="ytps-choice ' + (currentScope === scope ? 'is-active' : '') + '" data-action="editor-bind" data-scope="' + scope + '" data-id="' + esc(id) + '">' + label + '</button>';
     const lorebookField = '<div class="ytps-field ytps-lorebook-field"><span>绑定人设世界书 <small>可留空</small></span><div class="ytps-lorebook-picker"><input class="ytps-input" data-field="editorLorebook" value="' + esc(draft.lorebook) + '" placeholder="未选择" readonly><button class="ytps-btn" data-action="choose-lorebook" data-id="' + esc(id) + '" type="button"><i class="fa-solid fa-book-open"></i> 选择</button></div></div>';
