@@ -7,7 +7,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '0.2.2-dev11';
+  const VERSION = '0.2.2-dev13';
   const NS = 'yantai-persona-studio';
   const root = globalThis;
   const CONTROL_REGISTRY_KEY = Symbol.for('yantai.control.registry.v1');
@@ -261,7 +261,7 @@
     }
     // Opening the native smiley lands on the current view; explicit quick
     // entries may request the gallery or another workspace tab.
-    const allowedTabs = new Set(['current', 'library', 'editor', 'gallery', 'assistant']);
+    const allowedTabs = new Set(['current', 'library', 'editor', 'create', 'gallery', 'assistant']);
     state.ui.tab = allowedTabs.has(tab) ? tab : 'current';
     app?.update?.({ state });
     const nativePanel = ensureNative ? await adapter.openNativePersonaPanel() : ([...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null) || document.querySelector('#persona-management-block'));
@@ -324,10 +324,20 @@
         state.ui = { ...(state.ui || {}), tab: 'editor', editingPersonaId: String(id || '') };
         await save();
       },
+      async startNewPersona() {
+        state.ui = { ...(state.ui || {}), tab: 'create', editingPersonaId: '' };
+        await save();
+      },
       async setGallerySheet(sheet) { state.ui.gallerySheet = sheet === 'cards' ? 'cards' : 'avatars'; await save(); },
       async selectGalleryAsset(id) { state.ui.selectedAssetId = String(id || ''); await save(); },
       async setDefault(id) { await adapter.setDefault(id || null); await refresh(); },
       async updatePersona(id, patch) { const ok = await adapter.updatePersona?.(id, patch); if (ok) await refresh(); return ok; },
+      async createPersona(input) {
+        const created = await adapter.createPersona?.(input);
+        state.ui = { ...(state.ui || {}), tab: 'create', editingPersonaId: '' };
+        await refresh();
+        return created;
+      },
       async choosePersonaLorebook(id) { return adapter.choosePersonaLorebook?.(id) || { cancelled: true }; },
       async duplicatePersona(id) { const ok = await adapter.duplicatePersona?.(id); if (ok) await refresh(); return ok; },
       async setBinding(scope, mode, personaId = null) {

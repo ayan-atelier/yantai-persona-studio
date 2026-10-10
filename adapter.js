@@ -139,6 +139,37 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
   await native?.getUserAvatars?.(true, avatarId);
   return { avatarId, created: !overwriteName && createPersona };
 }
+
+/** Create a persona directly from the extension workspace without opening the native drawer. */
+export async function createNativePersona({ name, title = '', description = '', position, depth, role, lorebook = '' } = {}, context = getStContext(), api = null) {
+  const personaName = String(name || '').trim();
+  if (!personaName) throw new Error('请先填写人设名称。');
+  const native = api || await nativeApi();
+  const settings = powerSettings(context);
+  const slug = personaName.replace(/[^a-zA-Z0-9]+/g, '').slice(0, 40) || 'persona';
+  let avatarId = `${Date.now()}-${slug}.png`;
+  while (settings.personas?.[avatarId]) avatarId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}-${slug}.png`;
+  const descriptor = { description: String(description || ''), title: String(title || ''), position, depth, role, lorebook: String(lorebook || '') };
+
+  const response = await fetch('/img/user-default.png', { cache: 'no-cache' });
+  if (!response.ok) throw new Error(`创建人设头像失败：${response.statusText}`);
+  const blob = await response.blob();
+  const file = typeof File === 'function' ? new File([blob], 'persona-default.png', { type: blob.type || 'image/png' }) : blob;
+  await uploadNativeAvatar(file, { resizePrompt: false, overwriteName: avatarId, createPersona: false, context });
+  if (typeof native?.initPersona === 'function') {
+    await native.initPersona(avatarId, personaName, descriptor.description, descriptor.title, { silent: true, position, depth, role, lorebook: descriptor.lorebook });
+  } else {
+    settings.personas = settings.personas || {};
+    settings.persona_descriptions = settings.persona_descriptions || {};
+    settings.personas[avatarId] = personaName;
+    settings.persona_descriptions[avatarId] = { ...descriptor };
+    const saver = context.saveSettingsDebounced ?? context.saveSettings;
+    if (typeof saver === 'function') await Promise.resolve(saver.call(context));
+  }
+  await native?.getUserAvatars?.(true, avatarId);
+  await emitNativeEvent(context, 'PERSONA_CREATED', { avatarId, name: personaName, description: descriptor.description, title: descriptor.title });
+  return { id: avatarId, avatarId, name: personaName };
+}
 function currentNativeId(context, api = null) {
   const settings = powerSettings(context);
   return api?.user_avatar ?? context?.user_avatar ?? settings.user_avatar ?? context?.currentAvatar ?? null;
@@ -681,7 +712,7 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
   const nativePersonas = () => listNativePersonas(context(), native);
   const resolvePersona = ({ state, target: passedTarget } = {}) => { const ctx = context(); const nativeBindings = readPersonaBindings(ctx, namespace); const binding = resolveBinding({ ...nativeBindings, session: state?.sessionOverride ?? nativeBindings.session }, ctx); const all = listNativePersonas(ctx, native); const persona = all.find(item => String(item.id) === String(binding.personaId)) || (binding.scope === 'none' ? readNativePersona(ctx, native) : null); return { ...binding, persona, target: passedTarget || { cardKey: getCardFingerprint(ctx), chatKey: getChatId(ctx) || 'current-chat' }, all }; };
   const writeBinding = async ({ scope, mode, personaId = null }) => setNativeBinding(scope, mode === 'none' ? null : personaId, context(), await nativeApi());
-  const createPersona = value => ({ ...value, id: value?.id || 'draft_' + Date.now().toString(36), source: value?.source || 'yantai' });
+  const createDraftPersona = value => ({ ...value, id: value?.id || 'draft_' + Date.now().toString(36), source: value?.source || 'yantai' });
   const installEntry = async () => {
     // The native top button is deliberately left untouched. SillyTavern's
     // drawer handler owns its async open/close animation; observing the final
@@ -691,6 +722,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createPersona, referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

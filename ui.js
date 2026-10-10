@@ -1,7 +1,8 @@
 const TABS = {
   current: { label: '当前', icon: 'fa-house' },
   library: { label: '人设档案', icon: 'fa-address-card' },
-  editor: { label: '新建 / 编辑', icon: 'fa-pen-to-square' },
+  editor: { label: '编辑人设', icon: 'fa-pen-to-square' },
+  create: { label: '新建人设', icon: 'fa-user-plus' },
   // Keep the navigation label task-oriented. Milo's name is shown once the
   // assistant page is open, so the tab remains clear to first-time users.
   assistant: { label: '人设助手', icon: 'fa-wand-magic-sparkles' },
@@ -71,7 +72,7 @@ class App {
       });
     }
   }
-  view() { return this.state.activeTab === 'library' ? this.library() : this.state.activeTab === 'editor' ? this.editor() : this.state.activeTab === 'gallery' ? this.gallery() : this.state.activeTab === 'assistant' ? this.assistant() : this.current(); }
+  view() { return this.state.activeTab === 'library' ? this.library() : (this.state.activeTab === 'editor' || this.state.activeTab === 'create') ? this.editor() : this.state.activeTab === 'gallery' ? this.gallery() : this.state.activeTab === 'assistant' ? this.assistant() : this.current(); }
   current() {
     const p = this.state.current?.persona || this.state.native || {};
     const name = p.name || '尚未选择人设';
@@ -84,7 +85,7 @@ class App {
   library() {
     const q = String(this.state.query || '').toLowerCase();
     const list = this.state.personas.filter(p => !q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q));
-    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><button class="ytps-btn ytps-primary" data-action="native-create"><i class="fa-solid fa-plus"></i> 新建空白人设</button><span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">没有匹配的人设。<br><button class="ytps-btn ytps-primary" data-action="native-create">新建空白人设</button></div>');
+    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><button class="ytps-btn ytps-primary" data-action="new-persona-form"><i class="fa-solid fa-plus"></i> 新建人设</button><span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">没有匹配的人设。<br><button class="ytps-btn ytps-primary" data-action="new-persona-form">新建人设</button></div>');
   }
   personaBindingLabel(p) {
     const bindings = this.state.bindings || {};
@@ -118,6 +119,7 @@ class App {
     return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + '"><div class="ytps-row-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '" alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + (p.isCurrent ? '<span class="ytps-chip is-current">当前</span>' : '') + '</div><small>' + esc(note) + '</small><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><button class="ytps-btn ytps-primary" data-action="use" data-id="' + esc(p.id) + '">设为当前</button><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></article>';
   }
   editorPersona() {
+    if (this.state.activeTab === 'create' || this.state.creatingPersona) return {};
     const wanted = String(this.state.editingPersonaId || this.state.current?.persona?.id || '');
     return this.state.personas.find(item => String(item.id) === wanted) || this.state.current?.persona || {};
   }
@@ -129,20 +131,24 @@ class App {
     return 'none';
   }
   editor() {
-    const persona = this.editorPersona();
+    const creating = this.state.activeTab === 'create' || this.state.creatingPersona === true;
+    const persona = creating ? {} : this.editorPersona();
     const id = String(persona.id || '');
     const existing = this.state.editorDraft && String(this.state.editorDraft.id || '') === id ? this.state.editorDraft : null;
     const draft = existing || { id, name: persona.name || '', note: persona.title || '', description: persona.description || '', lorebook: persona.lorebook || '' };
-    if (!existing && id) this.state.editorDraft = draft;
+    if (!existing && (id || creating)) this.state.editorDraft = draft;
     const avatar = persona.avatarRef || '';
     const image = avatar ? '<img src="' + esc(avatar) + '" alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
-    if (!id) return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建空白人设</h2><p class="ytps-muted">这会调用酒馆原生的“创建空白用户设定”，不会覆盖或复制已有条目。</p></div></div><div class="ytps-editor-empty"><i class="fa-solid fa-user-plus"></i><p>保存后，这份人设会作为新条目出现在人设档案中。</p><button class="ytps-btn ytps-primary" data-action="native-create"><i class="fa-solid fa-plus"></i> 创建空白人设</button></div></div>';
+    if (creating) {
+      const createButton = '<button class="ytps-btn ytps-primary ytps-editor-save" data-action="save-new-persona"><i class="fa-solid fa-check"></i> 创建人设</button>';
+      return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建人设</h2><p class="ytps-muted">填写完成后直接保存，不会打开酒馆原生页面，也不会改动已有的人设。</p></div><button class="ytps-btn ytps-quiet" data-action="editor-back"><i class="fa-solid fa-arrow-left"></i> 返回当前</button></div><div class="ytps-editor-layout"><div class="ytps-editor-avatar ytps-editor-avatar-placeholder"><i class="fa-solid fa-user-plus"></i><span>保存后可更换头像</span></div><div class="ytps-editor-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + createButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea></div></div><div class="ytps-editor-empty"><i class="fa-solid fa-circle-info"></i><p>创建完成后会自动清空本页；之后可在人设档案中点击铅笔继续编辑。</p></div></div>';
+    }
     const currentScope = this.personaScope(id);
     const scopeButton = (scope, label) => '<button class="ytps-choice ' + (currentScope === scope ? 'is-active' : '') + '" data-action="editor-bind" data-scope="' + scope + '" data-id="' + esc(id) + '">' + label + '</button>';
     const lorebookField = '<div class="ytps-field ytps-lorebook-field"><span>绑定人设世界书 <small>可留空</small></span><div class="ytps-lorebook-picker"><input class="ytps-input" data-field="editorLorebook" value="' + esc(draft.lorebook) + '" placeholder="未选择" readonly><button class="ytps-btn" data-action="choose-lorebook" data-id="' + esc(id) + '" type="button"><i class="fa-solid fa-book-open"></i> 选择</button></div></div>';
     const saveButton = '<button class="ytps-btn ytps-primary ytps-editor-save" data-action="save-editor" data-id="' + esc(id) + '"><i class="fa-solid fa-check"></i> 保存修改</button>';
     const nativeEditButton = '<button class="ytps-btn ytps-quiet ytps-editor-native" data-action="open-native-edit" data-id="' + esc(id) + '"><i class="fa-solid fa-sliders"></i> 原生编辑</button>';
-    return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>编辑人设</h2><p class="ytps-muted">当前正在编辑“' + esc(draft.name || '未命名人设') + '”。</p></div><button class="ytps-btn ytps-primary ytps-editor-new" data-action="native-create"><i class="fa-solid fa-plus"></i> 新建空白人设</button></div><div class="ytps-editor-layout"><button class="ytps-editor-avatar" data-action="editor-avatar-gallery" title="点击打开人设头像图库">' + image + '<span class="ytps-editor-avatar-hint"><i class="fa-solid fa-images"></i> 更换头像</span></button><div class="ytps-editor-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + saveButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea>' + lorebookField + '</div></div><section class="ytps-editor-section"><div class="ytps-section-title"><strong>常用归属</strong><span>选择后会沿用酒馆原生绑定</span>' + nativeEditButton + '</div><div class="ytps-choice-grid"><button class="ytps-choice ' + (currentScope === 'none' ? 'is-active' : '') + '" data-action="editor-unbind" data-id="' + esc(id) + '">未绑定</button>' + scopeButton('global', '默认') + scopeButton('card', '当前角色卡') + scopeButton('chat', '当前存档') + '</div></section><div class="ytps-editor-footer"><button class="ytps-btn ytps-quiet" data-action="export-persona" data-id="' + esc(id) + '"><i class="fa-solid fa-file-export"></i> 导出</button></div></div>';
+    return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>编辑人设</h2><p class="ytps-muted">当前正在编辑“' + esc(draft.name || '未命名人设') + '”。</p></div><button class="ytps-btn ytps-primary ytps-editor-new" data-action="new-persona-form"><i class="fa-solid fa-plus"></i> 新建人设</button></div><div class="ytps-editor-layout"><button class="ytps-editor-avatar" data-action="editor-avatar-gallery" title="点击打开人设头像图库">' + image + '<span class="ytps-editor-avatar-hint"><i class="fa-solid fa-images"></i> 更换头像</span></button><div class="ytps-editor-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + saveButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea>' + lorebookField + '</div></div><section class="ytps-editor-section"><div class="ytps-section-title"><strong>常用归属</strong><span>选择后会沿用酒馆原生绑定</span>' + nativeEditButton + '</div><div class="ytps-choice-grid"><button class="ytps-choice ' + (currentScope === 'none' ? 'is-active' : '') + '" data-action="editor-unbind" data-id="' + esc(id) + '">未绑定</button>' + scopeButton('global', '默认') + scopeButton('card', '当前角色卡') + scopeButton('chat', '当前存档') + '</div></section><div class="ytps-editor-footer"><button class="ytps-btn ytps-quiet" data-action="export-persona" data-id="' + esc(id) + '"><i class="fa-solid fa-file-export"></i> 导出</button></div></div>';
   }
   gallery() {
     const sheet = this.state.gallerySheet === 'cards' ? 'cards' : 'avatars';
@@ -229,7 +235,14 @@ class App {
     event.stopPropagation();
     const action = el.dataset.action;
     if (action === 'close') return this.call('close');
-    if (action === 'tab') { this.state.activeTab = el.dataset.tab; this.render(); await this.call('setTab', el.dataset.tab); return; }
+    if (action === 'tab') {
+      this.state.activeTab = el.dataset.tab;
+      this.state.creatingPersona = this.state.activeTab === 'create';
+      if (this.state.creatingPersona) this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' };
+      this.render();
+      if (this.state.creatingPersona) await this.call('startNewPersona'); else await this.call('setTab', el.dataset.tab);
+      return;
+    }
     if (action === 'gallery-sheet') { this.state.gallerySheet = el.dataset.sheet === 'cards' ? 'cards' : 'avatars'; this.state.assetQuery = ''; this.render(); await this.call('setGallerySheet', this.state.gallerySheet); return; }
     if (action === 'import-assets') { if (!this.fileInput) { this.fileInput = document.createElement('input'); this.fileInput.type = 'file'; this.fileInput.multiple = true; this.fileInput.addEventListener('change', () => this.importFiles(this.fileInput.files)); } this.fileInput.accept = this.state.gallerySheet === 'cards' ? 'image/*,.json' : 'image/*'; this.fileInput.click(); return; }
     if (action === 'remove-asset') return this.call('removeGalleryAsset', el.dataset.id);
@@ -259,6 +272,7 @@ class App {
       return;
     }
     if (action === 'editor-back') { this.state.activeTab = 'current'; this.render(); await this.call('setTab', 'current'); return; }
+    if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.render(); await this.call('startNewPersona'); return; }
     if (action === 'editor-avatar-gallery') { this.state.activeTab = 'gallery'; this.state.gallerySheet = 'avatars'; this.render(); await this.call('setGallerySheet', 'avatars'); await this.call('setTab', 'gallery'); return; }
     if (action === 'gallery-back-editor') { this.state.activeTab = 'editor'; this.render(); await this.call('setTab', 'editor'); return; }
     if (action === 'editor-use') { await this.call('usePersona', el.dataset.id); this.state.activeTab = 'editor'; this.render(); return; }
@@ -280,6 +294,19 @@ class App {
       const draft = this.state.editorDraft;
       if (!draft || !el.dataset.id) return;
       try { await this.call('updatePersona', el.dataset.id, { name: draft.name, note: draft.note, description: draft.description, lorebook: draft.lorebook }); this.options.report?.('人设资料已保存。', 'success'); this.state.editorDraft = null; this.render(); } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
+      return;
+    }
+    if (action === 'save-new-persona') {
+      const draft = this.state.editorDraft || {};
+      if (!String(draft.name || '').trim()) { this.options.report?.('请先填写人设名称。', 'info'); return; }
+      try {
+        await this.call('createPersona', { name: draft.name, title: draft.note, description: draft.description });
+        this.state.creatingPersona = true;
+        this.state.activeTab = 'create';
+        this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' };
+        this.render();
+        this.options.report?.('人设已创建，并已加入人设档案。', 'success');
+      } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
       return;
     }
     if (action === 'export-persona') {
