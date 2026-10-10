@@ -17,7 +17,7 @@ class App {
     this.host = null;
     this.fileInput = null;
     this.visible = false;
-    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null };
+    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
   }
   mount() {
     if (this.root && this.root.isConnected) return this;
@@ -141,7 +141,9 @@ class App {
     const image = avatar ? '<img src="' + esc(avatar) + '" alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
     if (creating) {
       const createButton = '<button class="ytps-btn ytps-primary ytps-editor-save" data-action="save-new-persona"><i class="fa-solid fa-check"></i> 创建人设</button>';
-      return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建人设</h2><p class="ytps-muted">填写完成后直接保存，不会打开酒馆原生页面，也不会改动已有的人设。</p></div><button class="ytps-btn ytps-quiet" data-action="editor-back"><i class="fa-solid fa-arrow-left"></i> 返回当前</button></div><div class="ytps-editor-layout"><div class="ytps-editor-avatar ytps-editor-avatar-placeholder"><i class="fa-solid fa-user-plus"></i><span>保存后可更换头像</span></div><div class="ytps-editor-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + createButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea></div></div><div class="ytps-editor-empty"><i class="fa-solid fa-circle-info"></i><p>创建完成后会自动清空本页；之后可在人设档案中点击铅笔继续编辑。</p></div></div>';
+      const recent = this.state.recentCreatedPersona;
+      const recentBar = recent?.id ? '<div class="ytps-create-result" role="status"><span><i class="fa-solid fa-circle-check"></i> 已创建“' + esc(recent.name || '未命名人设') + '”</span><div class="ytps-create-result-actions"><button class="ytps-btn ytps-primary" data-action="edit-persona" data-id="' + esc(recent.id) + '">立即编辑</button><button class="ytps-btn" data-action="continue-new-persona">继续新建</button></div></div>' : '';
+      return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建人设</h2><p class="ytps-muted">填写后直接保存，不会打开酒馆原生页面或改动已有的人设。</p></div><button class="ytps-btn ytps-quiet" data-action="editor-back"><i class="fa-solid fa-arrow-left"></i> 返回当前</button></div>' + recentBar + '<div class="ytps-editor-fields ytps-create-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + createButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea></label><p class="ytps-muted">保存后可通过“立即编辑”更换头像、设置世界书与归属。</p></div></div>';
     }
     const currentScope = this.personaScope(id);
     const scopeButton = (scope, label) => '<button class="ytps-choice ' + (currentScope === scope ? 'is-active' : '') + '" data-action="editor-bind" data-scope="' + scope + '" data-id="' + esc(id) + '">' + label + '</button>';
@@ -238,7 +240,7 @@ class App {
     if (action === 'tab') {
       this.state.activeTab = el.dataset.tab;
       this.state.creatingPersona = this.state.activeTab === 'create';
-      if (this.state.creatingPersona) this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' };
+      if (this.state.creatingPersona) { this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; }
       this.render();
       if (this.state.creatingPersona) await this.call('startNewPersona'); else await this.call('setTab', el.dataset.tab);
       return;
@@ -260,6 +262,7 @@ class App {
     if (action === 'preview-asset') { this.previewAsset(el.dataset.url, el.dataset.name || '图库预览'); return; }
     if (action === 'lightbox-close') { el.closest('.ytps-lightbox')?.remove?.(); return; }
     if (action === 'edit-persona' || action === 'open-editor') {
+      this.state.creatingPersona = false;
       this.state.editingPersonaId = el.dataset.id || '';
       this.state.editorDraft = null;
       this.state.activeTab = 'editor';
@@ -272,7 +275,8 @@ class App {
       return;
     }
     if (action === 'editor-back') { this.state.activeTab = 'current'; this.render(); await this.call('setTab', 'current'); return; }
-    if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.render(); await this.call('startNewPersona'); return; }
+    if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; this.render(); await this.call('startNewPersona'); return; }
+    if (action === 'continue-new-persona') { this.state.recentCreatedPersona = null; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.render(); this.root?.querySelector('[data-field="editorName"]')?.focus(); return; }
     if (action === 'editor-avatar-gallery') { this.state.activeTab = 'gallery'; this.state.gallerySheet = 'avatars'; this.render(); await this.call('setGallerySheet', 'avatars'); await this.call('setTab', 'gallery'); return; }
     if (action === 'gallery-back-editor') { this.state.activeTab = 'editor'; this.render(); await this.call('setTab', 'editor'); return; }
     if (action === 'editor-use') { await this.call('usePersona', el.dataset.id); this.state.activeTab = 'editor'; this.render(); return; }
@@ -300,10 +304,12 @@ class App {
       const draft = this.state.editorDraft || {};
       if (!String(draft.name || '').trim()) { this.options.report?.('请先填写人设名称。', 'info'); return; }
       try {
-        await this.call('createPersona', { name: draft.name, title: draft.note, description: draft.description });
+        const created = await this.call('createPersona', { name: draft.name, title: draft.note, description: draft.description });
+        if (!created?.id) throw new Error('酒馆没有返回新建人设的编号，请检查人设档案。');
         this.state.creatingPersona = true;
         this.state.activeTab = 'create';
         this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' };
+        this.state.recentCreatedPersona = { id: created.id, name: created.name || String(draft.name).trim() };
         this.render();
         this.options.report?.('人设已创建，并已加入人设档案。', 'success');
       } catch (error) { this.options.report?.(error.message || String(error), 'error'); }

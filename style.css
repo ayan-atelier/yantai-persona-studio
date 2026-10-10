@@ -181,8 +181,10 @@
 .ytps-editor-head h2 { margin:3px 0 0; font-size:19px; }
 .ytps-editor-head p { margin:5px 0 0; }
 .ytps-editor-new { min-height:30px; padding:4px 10px; white-space:nowrap; }
-.ytps-editor-avatar-placeholder { display:grid; place-items:center; align-content:center; gap:8px; color:var(--ytps-em); font-size:12px; }
-.ytps-editor-avatar-placeholder i { color:var(--ytps-accent); font-size:34px; }
+.ytps-create-fields { width:100%; }
+.ytps-create-result { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:9px 11px; border:1px solid var(--ytps-accent); border-radius:var(--ytps-radius); background:color-mix(in srgb, var(--ytps-accent) 10%, transparent); }
+.ytps-create-result > span { display:inline-flex; align-items:center; gap:6px; min-width:0; overflow-wrap:anywhere; }
+.ytps-create-result-actions { display:flex; flex-wrap:wrap; gap:6px; }
 .ytps-editor-layout { display:grid; grid-template-columns:minmax(150px,30%) minmax(0,1fr); gap:12px; align-items:stretch; }
 .ytps-editor-avatar { position:relative; min-height:270px; width:100%; overflow:hidden; padding:0; border:1px solid var(--ytps-line); border-radius:var(--ytps-radius); color:var(--ytps-accent); background:color-mix(in srgb, var(--ytps-accent) 12%, transparent); cursor:pointer; display:grid; place-items:center; font-size:30px; }
 .ytps-editor-back { display:inline-flex; align-items:center; gap:5px; margin:0 0 8px; padding:3px 0; border:0; color:var(--ytps-muted); background:transparent; cursor:pointer; font-size:11px; }
