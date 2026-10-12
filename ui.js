@@ -7,6 +7,7 @@ const TABS = {
   // assistant page is open, so the tab remains clear to first-time users.
   assistant: { label: '人设助手', icon: 'fa-wand-magic-sparkles' },
 };
+const UNCATEGORIZED_GROUP = '__uncategorized__';
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const short = (value, n = 180) => { const s = String(value ?? '').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
 
@@ -17,7 +18,7 @@ class App {
     this.host = null;
     this.fileInput = null;
     this.visible = false;
-    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
+    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', personaGroups: [], personaMeta: {}, personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
   }
   mount() {
     if (this.root && this.root.isConnected) return this;
@@ -49,7 +50,7 @@ class App {
   }
   update(data = {}) {
     const s = data.state || {};
-    this.state = { ...this.state, ...data, ...s, activeTab: s.ui?.tab || data.activeTab || this.state.activeTab || 'current', gallerySheet: s.ui?.gallerySheet || data.gallerySheet || this.state.gallerySheet || 'avatars', selectedAssetId: s.ui?.selectedAssetId || data.selectedAssetId || this.state.selectedAssetId || '', editingPersonaId: s.ui?.editingPersonaId || data.editingPersonaId || this.state.editingPersonaId || '', personas: data.personas || [], gallery: s.gallery || [], nativeGallery: data.nativeGallery || [], drafts: s.drafts || [], assistantThreads: s.assistantThreads || data.assistantThreads || this.state.assistantThreads || {}, assistantActiveThreadKey: s.assistantActiveThreadKey || data.assistantActiveThreadKey || this.state.assistantActiveThreadKey || '', current: data.current || {}, target: data.target || {} };
+    this.state = { ...this.state, ...data, ...s, activeTab: s.ui?.tab || data.activeTab || this.state.activeTab || 'current', gallerySheet: s.ui?.gallerySheet || data.gallerySheet || this.state.gallerySheet || 'avatars', selectedAssetId: s.ui?.selectedAssetId || data.selectedAssetId || this.state.selectedAssetId || '', editingPersonaId: s.ui?.editingPersonaId || data.editingPersonaId || this.state.editingPersonaId || '', libraryGroup: s.ui?.libraryGroup || data.libraryGroup || this.state.libraryGroup || 'all', personaGroups: Array.isArray(s.personaGroups || data.personaGroups) ? (s.personaGroups || data.personaGroups) : this.state.personaGroups || [], personaMeta: s.personaMeta || data.personaMeta || this.state.personaMeta || {}, personas: data.personas || [], gallery: s.gallery || [], nativeGallery: data.nativeGallery || [], drafts: s.drafts || [], assistantThreads: s.assistantThreads || data.assistantThreads || this.state.assistantThreads || {}, assistantActiveThreadKey: s.assistantActiveThreadKey || data.assistantActiveThreadKey || this.state.assistantActiveThreadKey || '', current: data.current || {}, target: data.target || {} };
     if (!this.state.suggestions?.length && !this.state.aiSessionFresh) this.state.suggestions = this.state.drafts[0]?.candidates || [];
     if (this.root) this.render();
     return this;
@@ -82,10 +83,26 @@ class App {
       '<div class="ytps-section-title"><strong>绑定到：</strong></div>' +
       '<div class="ytps-binding-grid" role="group" aria-label="绑定到">' + rows.map(([scope, label]) => { const active = this.state.current?.scope === scope; return '<button class="ytps-choice ' + (active ? 'is-active' : '') + '" data-action="bind-current" data-scope="' + scope + '" data-mode="' + (active ? 'none' : 'bind') + '" aria-pressed="' + active + '" title="' + (active ? '再次点击解除绑定' : '绑定到' + label) + '">' + label + (active ? ' <i class="fa-solid fa-link" aria-hidden="true"></i>' : '') + '</button>'; }).join('') + '</div>';
   }
+  personaGroups() {
+    const groups = Array.isArray(this.state.personaGroups) ? this.state.personaGroups : [];
+    return [{ id: UNCATEGORIZED_GROUP, name: '默认' }, ...groups.filter(group => String(group?.id || '') && String(group.id) !== UNCATEGORIZED_GROUP).map(group => ({ id: String(group.id), name: String(group.name || '未命名分组') }))];
+  }
+  personaGroupId(persona) {
+    const id = String(persona?.id || '');
+    const wanted = this.state.personaMeta?.[id]?.groupId;
+    return this.personaGroups().some(group => String(group.id) === String(wanted)) ? String(wanted) : UNCATEGORIZED_GROUP;
+  }
+  personaGroupName(persona) { return this.personaGroups().find(group => String(group.id) === this.personaGroupId(persona))?.name || '默认'; }
   library() {
     const q = String(this.state.query || '').toLowerCase();
-    const list = this.state.personas.filter(p => !q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q));
-    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><button class="ytps-btn ytps-primary" data-action="new-persona-form"><i class="fa-solid fa-plus"></i> 新建人设</button><span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">没有匹配的人设。<br><button class="ytps-btn ytps-primary" data-action="new-persona-form">新建人设</button></div>');
+    const groups = this.personaGroups();
+    const requestedGroup = String(this.state.libraryGroup || 'all');
+    const selectedGroup = requestedGroup === 'all' || groups.some(group => String(group.id) === requestedGroup) ? requestedGroup : 'all';
+    const groupOptions = '<option value="all" ' + (selectedGroup === 'all' ? 'selected' : '') + '>全部</option>' + groups.map(group => '<option value="' + esc(group.id) + '" ' + (selectedGroup === String(group.id) ? 'selected' : '') + '>' + esc(group.name) + '</option>').join('');
+    const selectedCustomGroup = selectedGroup !== 'all' && selectedGroup !== UNCATEGORIZED_GROUP ? groups.find(group => String(group.id) === selectedGroup) : null;
+    const groupManage = selectedCustomGroup ? '<span class="ytps-group-manage" role="group" aria-label="管理分组"><button class="ytps-icon-btn ytps-group-manage-btn" data-action="rename-persona-group" data-id="' + esc(selectedCustomGroup.id) + '" title="重命名分组" aria-label="重命名分组"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn ytps-group-manage-btn ytps-danger" data-action="delete-persona-group" data-id="' + esc(selectedCustomGroup.id) + '" title="删除分组" aria-label="删除分组"><i class="fa-solid fa-trash"></i></button></span>' : '';
+    const list = this.state.personas.filter(p => (!q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q)) && (selectedGroup === 'all' || this.personaGroupId(p) === selectedGroup));
+    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><select class="ytps-input ytps-library-group" data-field="libraryGroup" aria-label="筛选人设分组">' + groupOptions + '</select>' + groupManage + '<span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span><button class="ytps-btn ytps-group-create" data-action="create-persona-group"><i class="fa-solid fa-folder-plus"></i> 新建分组</button></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">这个分组里还没有人设。</div>');
   }
   personaBindingLabel(p) {
     const bindings = this.state.bindings || {};
@@ -116,7 +133,11 @@ class App {
   personaRow(p) {
     const binding = this.personaBindingLabel(p);
     const note = p.title || '原生人设';
-    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + '"><div class="ytps-row-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '" alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + (p.isCurrent ? '<span class="ytps-chip is-current">当前</span>' : '') + '</div><small>' + esc(note) + '</small><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><button class="ytps-btn ytps-primary" data-action="use" data-id="' + esc(p.id) + '">设为当前</button><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></article>';
+    const groupOptions = this.personaGroups().map(group => '<option value="' + esc(group.id) + '" ' + (this.personaGroupId(p) === String(group.id) ? 'selected' : '') + '>' + esc(group.name) + '</option>').join('');
+    const useAction = p.isCurrent
+      ? '<span class="ytps-current-state" role="status" title="当前正在使用的人设">当前</span>'
+      : '<button class="ytps-btn ytps-primary" data-action="use" data-id="' + esc(p.id) + '">设为当前</button>';
+    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + '"><div class="ytps-row-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '" alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + '</div><div class="ytps-row-meta"><small>' + esc(note) + '</small><div class="ytps-row-primary">' + useAction + '</div></div><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><label class="ytps-persona-group"><select data-field="personaGroup" data-id="' + esc(p.id) + '" aria-label="移动' + esc(p.name) + '到分组">' + groupOptions + '</select></label><div class="ytps-row-tools"><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></div></article>';
   }
   editorPersona() {
     if (this.state.activeTab === 'create' || this.state.creatingPersona) return {};
@@ -237,6 +258,30 @@ class App {
     event.stopPropagation();
     const action = el.dataset.action;
     if (action === 'close') return this.call('close');
+    if (action === 'rename-persona-group') {
+      const id = String(el.dataset.id || '');
+      const group = this.personaGroups().find(item => String(item.id) === id);
+      if (!group) return;
+      const name = globalThis.prompt?.('重命名分组', group.name);
+      if (name === null || name === undefined) return;
+      try { await this.call('renamePersonaGroup', id, name); } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
+      return;
+    }
+    if (action === 'delete-persona-group') {
+      const id = String(el.dataset.id || '');
+      const group = this.personaGroups().find(item => String(item.id) === id);
+      if (!group) return;
+      const message = '删除分组“' + group.name + '”？其中的人设会移动到“默认”。';
+      if (typeof globalThis.confirm === 'function' && !globalThis.confirm(message)) return;
+      try { await this.call('deletePersonaGroup', id); } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
+      return;
+    }
+    if (action === 'create-persona-group') {
+      const name = globalThis.prompt?.('新建分组', '未命名分组');
+      if (!String(name || '').trim()) return;
+      try { await this.call('createPersonaGroup', name); } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
+      return;
+    }
     if (action === 'tab') {
       this.state.activeTab = el.dataset.tab;
       this.state.creatingPersona = this.state.activeTab === 'create';
@@ -386,6 +431,17 @@ class App {
   onChange(event) {
     const field = event.target.dataset?.field; if (!field) return;
     const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+    if (field === 'libraryGroup') {
+      this.state.libraryGroup = String(value || 'all');
+      this.state.ui = { ...(this.state.ui || {}), libraryGroup: this.state.libraryGroup };
+      this.render();
+      this.call('setLibraryGroup', this.state.libraryGroup).catch(() => {});
+      return;
+    }
+    if (field === 'personaGroup') {
+      this.call('setPersonaGroupForPersona', event.target.dataset.id, String(value || UNCATEGORIZED_GROUP)).catch(error => this.options.report?.(error.message || String(error), 'error'));
+      return;
+    }
     this.state[field] = value;
     if (field.startsWith('editor')) {
       const map = { editorName: 'name', editorNote: 'note', editorDescription: 'description', editorLorebook: 'lorebook' };

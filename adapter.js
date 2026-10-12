@@ -140,6 +140,41 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
   return { avatarId, created: !overwriteName && createPersona };
 }
 
+/**
+ * Store a gallery image in SillyTavern's server-side avatar directory without
+ * creating a persona.  Gallery metadata then travels with extension settings
+ * while the bytes use the same server path as native persona avatars.
+ */
+export async function uploadGalleryAsset(file, { assetId = '', context = getStContext() } = {}) {
+  if (!file || typeof file.arrayBuffer !== 'function') throw new Error('请选择一个图片文件。');
+  const utilsModule = await import('/scripts/utils.js').catch(() => ({}));
+  const scriptModule = await import('/scripts/script.js').catch(() => ({}));
+  const ensureImageFormatSupported = utilsModule.ensureImageFormatSupported;
+  const uploadFile = typeof ensureImageFormatSupported === 'function' ? await ensureImageFormatSupported(file) : file;
+  const mime = String(uploadFile.type || file.type || 'image/png').toLowerCase();
+  const ext = mime.includes('jpeg') || mime.includes('jpg') ? '.jpg'
+    : mime.includes('webp') ? '.webp'
+      : mime.includes('gif') ? '.gif'
+        : mime.includes('avif') ? '.avif' : '.png';
+  const base = String(assetId || file.name || `asset-${Date.now()}`)
+    .replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || `asset-${Date.now()}`;
+  const overwriteName = `ytps-${base}${ext}`;
+  const formData = new FormData();
+  formData.append('avatar', uploadFile, overwriteName);
+  formData.append('overwrite_name', overwriteName);
+  const getHeaders = scriptModule.getRequestHeaders || context?.getRequestHeaders || globalThis.getRequestHeaders;
+  const headers = typeof getHeaders === 'function' ? getHeaders({ omitContentType: true }) : {};
+  const response = await fetch('/api/avatars/upload', { method: 'POST', headers, cache: 'no-cache', body: formData });
+  if (!response.ok) throw new Error(`图库上传失败：${response.statusText}`);
+  const data = await response.json().catch(() => ({}));
+  const raw = String(data?.path || data?.file || overwriteName || '').trim();
+  if (!raw) throw new Error('酒馆没有返回图库文件名。');
+  const normalized = raw.replace(/^\/?User Avatars[\\/]/i, '');
+  const remoteUrl = /^(?:https?:|data:|blob:|\/)/i.test(raw) ? raw : '/User Avatars/' + encodeURIComponent(normalized);
+  await fetch(remoteUrl, { cache: 'reload' }).catch(() => {});
+  return { avatarId: raw, remoteUrl };
+}
+
 /** Create a persona directly from the extension workspace without opening the native drawer. */
 export async function createNativePersona({ name, title = '', description = '', position, depth, role, lorebook = '' } = {}, context = getStContext(), api = null) {
   const personaName = String(name || '').trim();
@@ -715,7 +750,7 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
   };
   const loadExtensionState = async (fallback = {}) => ({ ...fallback, ...getExtensionSettings(context(), namespace) });
   const saveExtensionState = async state => saveExtensionSettings(state, context(), namespace);
-  const normalizeState = state => ({ ...state, version: Math.max(Number(state?.version || 0), 3), personaMeta: state?.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {}, drafts: Array.isArray(state?.drafts) ? state.drafts : [], gallery: Array.isArray(state?.gallery) ? state.gallery : [], assistantThreads: state?.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {}, assistantActiveThreadKey: String(state?.assistantActiveThreadKey || ''), ui: { tab: 'current', ...(state?.ui || {}) } });
+  const normalizeState = state => ({ ...state, version: Math.max(Number(state?.version || 0), 3), personaMeta: state?.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {}, personaGroups: Array.isArray(state?.personaGroups) ? state.personaGroups.filter(group => group && typeof group === 'object' && String(group.id || '').trim() && String(group.name || '').trim()).map(group => ({ id: String(group.id), name: String(group.name).trim().slice(0, 40), createdAt: Number(group.createdAt || 0) || Date.now() })) : [], drafts: Array.isArray(state?.drafts) ? state.drafts : [], gallery: Array.isArray(state?.gallery) ? state.gallery : [], assistantThreads: state?.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {}, assistantActiveThreadKey: String(state?.assistantActiveThreadKey || ''), ui: { tab: 'current', libraryGroup: 'all', ...(state?.ui || {}) } });
   const nativePersonas = () => listNativePersonas(context(), native);
   const resolvePersona = ({ state, target: passedTarget } = {}) => { const ctx = context(); const nativeBindings = readPersonaBindings(ctx, namespace); const binding = resolveBinding({ ...nativeBindings, session: state?.sessionOverride ?? nativeBindings.session }, ctx); const all = listNativePersonas(ctx, native); const persona = all.find(item => String(item.id) === String(binding.personaId)) || (binding.scope === 'none' ? readNativePersona(ctx, native) : null); return { ...binding, persona, target: passedTarget || { cardKey: getCardFingerprint(ctx), chatKey: getChatId(ctx) || 'current-chat' }, all }; };
   const writeBinding = async ({ scope, mode, personaId = null }) => setNativeBinding(scope, mode === 'none' ? null : personaId, context(), await nativeApi());
@@ -729,6 +764,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

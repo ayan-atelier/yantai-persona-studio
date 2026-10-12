@@ -7,7 +7,9 @@
 (async () => {
   'use strict';
 
-  const VERSION = '0.2.2-dev18';
+  const { PERSONA_VERSION, createVersionManager } = await import(new URL('./versions.js', import.meta.url));
+  const { openVersionDialog } = await import(new URL('./version-ui.js', import.meta.url));
+  const VERSION = PERSONA_VERSION;
   const NS = 'yantai-persona-studio';
   const root = globalThis;
   const CONTROL_REGISTRY_KEY = Symbol.for('yantai.control.registry.v1');
@@ -21,6 +23,31 @@
     if (toast?.[type]) toast[type](message, '砚台 · 人设馆');
     else (type === 'error' ? console.error : console.log)('[砚台·人设馆]', message);
   };
+
+  function element(tag, className = '', text = '') {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text) el.textContent = text;
+    return el;
+  }
+  function button(text, className, click, title) {
+    const el = element('button', className, text); el.type = 'button';
+    if (title) { el.title = title; el.setAttribute('aria-label', title); }
+    if (click) el.addEventListener('click', click);
+    return el;
+  }
+  function dialog(title) {
+    const modal = document.createElement('dialog'); modal.className = 'ytps-version-dialog';
+    const head = element('header', 'ytps-version-head');
+    const heading = element('h2', '', title); const close = button('×', 'ytps-version-close', () => modal.close(), '关闭');
+    head.append(heading, close);
+    const body = element('div', 'ytps-version-body'); const notice = element('p', 'ytps-version-notice');
+    modal.append(head, body, notice); document.body.append(modal);
+    modal.addEventListener('close', () => modal.remove(), { once: true });
+    modal.addEventListener('click', event => { if (event.target === modal) modal.close(); });
+    try { modal.showModal(); } catch (_) { modal.setAttribute('open', ''); }
+    return { modal, body, notice };
+  }
 
   let adapter;
   let storage;
@@ -38,6 +65,9 @@
   let lastNativeOpen = null;
   let syncTimer = null;
   let controlModule = null;
+  let versionManager = null;
+  let gallerySync = null;
+  let gallerySyncDirty = true;
 
   function controlRegistry() {
     const existing = root[CONTROL_REGISTRY_KEY];
@@ -83,13 +113,22 @@
         state.enabled = Boolean(value);
         await save();
         if (!state.enabled) {
+          lastNativeOpen = null;
           editMode = false;
           app?.close();
           adapter?.setNativeTakeover?.(false);
           adapter?.setNativeEditMode?.(false);
+          adapter?.setNativePresentation?.(false);
         } else {
+          adapter?.setNativePresentation?.(true);
           await adapter?.installEntry?.();
+          // The native drawer may already be open when the user re-enables
+          // the module. Force a fresh state check so takeover resumes without
+          // requiring a close/reopen click.
+          lastNativeOpen = null;
+          await syncNativeDrawer();
         }
+        updateSettingsUi();
         root.dispatchEvent?.(new CustomEvent('yantai:control:updated'));
         return state.enabled;
       },
@@ -122,8 +161,11 @@
     stopObserver();
     if (syncTimer) clearTimeout(syncTimer);
     syncTimer = null;
+    versionManager?.dispose?.();
+    versionManager = null;
     adapter?.dispose?.();
     app?.dispose?.();
+    document.getElementById('ytps-settings')?.remove?.();
     unregisterControlModule();
     initialized = false;
     if (root[RUNTIME_KEY]?.dispose === dispose) delete root[RUNTIME_KEY];
@@ -149,16 +191,28 @@
   }
 
   function defaultState() {
-    return { version: 3, enabled: true, personaMeta: {}, drafts: [], gallery: [], assistantThreads: {}, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '' } };
+    // Persona folders belong to the extension organiser rather than the
+    // native persona store.  A missing groupId deliberately means “未分类”,
+    // so older settings remain compatible without a migration pass.
+    return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, assistantThreads: {}, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
   }
   async function loadState() {
     const saved = await adapter.loadExtensionState(defaultState());
     state = adapter.normalizeState({ ...defaultState(), ...saved });
+    state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {};
+    gallerySync = saved?.gallerySync || null;
+    gallerySyncDirty = !gallerySync;
+    if (gallerySync) await storage.importSync(gallerySync).catch(() => {});
     // Blob URLs are session-scoped. Rehydrate gallery entries from IndexedDB
     // so imported images remain visible after a reload or device reconnect.
     const persisted = await storage.listAssets().catch(() => []);
     state.gallery = storage.mergeGallery(state.gallery, persisted.map(item => ({ ...item, blob: undefined })));
+    state.gallery = state.gallery.filter(item => Number(state.galleryRemoved[item.id] || 0) <= Number(item.updatedAt || 0));
     state.gallery = await storage.hydrateGallery(state.gallery);
+    // Existing installs may contain local-only images from the old 8 MiB
+    // data-URL sync. Mark them for one-time server migration after the app is
+    // ready; the local Blob remains usable even if upload is unavailable.
+    if (gallerySync?.provider !== 'tavern-user-avatars' || state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) gallerySyncDirty = true;
     return state;
   }
   function activeTarget() {
@@ -212,8 +266,8 @@
     if (!answer.trim() && !proposalData.length) return;
     thread.turns = [...(Array.isArray(thread.turns) ? thread.turns : []), {
       user: String(user).slice(0, 2400),
-      assistant: answer.slice(0, 1000),
-      memory: memory.slice(0, 1000),
+      assistant: answer,
+      memory,
       proposals: proposalData,
       mode: String(result.mode || 'propose'),
       at: Date.now(),
@@ -251,12 +305,147 @@
     const contextSnapshot = await adapter.contextSnapshot();
     app.update({ state, target: activeTarget(), current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas: adapter.readNativePersonas(), nativeGallery: nativeGallery(), contextSnapshot });
   }
-  async function save() { await adapter.saveExtensionState(state); await refresh(); }
+  async function save() {
+    // Settings are shared through the host, so merge assistant turns with the
+    // latest persisted snapshot before writing. This prevents another device
+    // or tab from replacing an entire thread map with its older copy.
+    let latestGallerySync = null;
+    try {
+      const latest = adapter.normalizeState(await adapter.loadExtensionState(defaultState()));
+      const remote = latest.assistantThreads || {};
+      const local = state.assistantThreads || {};
+      // A clean local gallery must not overwrite a newer gallery synced by
+      // another device while we are saving an assistant turn. Adopt the
+      // remote snapshot before writing the merged settings back.
+      const remoteGallerySync = latest.gallerySync;
+      latestGallerySync = remoteGallerySync || null;
+      if (!gallerySyncDirty && remoteGallerySync && (!gallerySync || Number(remoteGallerySync.updatedAt || 0) > Number(gallerySync.updatedAt || 0))) {
+        gallerySync = remoteGallerySync;
+        await storage.importSync(gallerySync).catch(() => {});
+      }
+      if (Array.isArray(latest.gallery)) state.gallery = storage.mergeGallery(state.gallery, latest.gallery);
+      const remoteRemoved = latest.galleryRemoved && typeof latest.galleryRemoved === 'object' ? latest.galleryRemoved : {};
+      state.galleryRemoved = { ...(state.galleryRemoved || {}) };
+      for (const [id, at] of Object.entries(remoteRemoved)) {
+        const localItem = state.gallery.find(item => String(item?.id || '') === String(id));
+        // Re-importing the same file produces the same deterministic id. A
+        // newer local upload explicitly revives it and clears old tombstones.
+        if (localItem && Number(localItem.updatedAt || 0) > Number(at || 0)) delete state.galleryRemoved[id];
+        else state.galleryRemoved[id] = Math.max(Number(state.galleryRemoved[id] || 0), Number(at || 0));
+      }
+      state.gallery = state.gallery.filter(item => Number(state.galleryRemoved[item.id] || 0) <= Number(item.updatedAt || 0));
+      for (const [key, remoteThread] of Object.entries(remote)) {
+        const localThread = local[key];
+        if (!localThread) { local[key] = remoteThread; continue; }
+        const turns = [...(localThread.turns || []), ...(remoteThread.turns || [])];
+        const bySig = new Map();
+        for (const turn of turns) {
+          const sig = `${turn.at || 0}|${turn.user || ''}|${turn.assistant || turn.memory || ''}`;
+          bySig.set(sig, turn);
+        }
+        localThread.turns = [...bySig.values()].sort((a, b) => (a.at || 0) - (b.at || 0));
+        localThread.createdAt = Math.min(localThread.createdAt || Date.now(), remoteThread.createdAt || Date.now());
+        localThread.updatedAt = Math.max(localThread.updatedAt || 0, remoteThread.updatedAt || 0);
+      }
+      state.assistantThreads = local;
+    } catch (_) { /* retain local state when host settings are unavailable */ }
+    if (gallerySyncDirty || !gallerySync) {
+      // Publish image bytes through SillyTavern's server-side avatar store
+      // before writing settings. Settings then carry only metadata and a URL;
+      // IndexedDB remains the local/offline cache.
+      const hosted = await storage.publishAssets(state.gallery, async (blob, item) => adapter.uploadGalleryAsset?.(blob, { assetId: item.id }));
+      if (hosted.changed.length) {
+        state.gallery = storage.mergeGallery(state.gallery, hosted.changed);
+        gallerySyncDirty = true;
+      }
+      if (hosted.failed.length) report(`图库服务器同步失败 ${hosted.failed.length} 张，当前设备仍保留本地副本。`, 'warning');
+      // Keep the settings payload a compact manifest. Legacy data URLs are
+      // still accepted/imported, but new files use the server-backed path.
+      const nextGallerySync = await storage.exportSync({ removed: state.galleryRemoved, includeData: false }).catch(() => null);
+      if (nextGallerySync) {
+        if (latestGallerySync) {
+          // Prefer the hosted manifest, while retaining a legacy data-URL
+          // entry when its local upload failed or the current device has no
+          // Blob to retry. This keeps an old image recoverable instead of
+          // trading the 8 MiB migration for data loss.
+          const assets = new Map((latestGallerySync.assets || []).map(item => [item.id, item]));
+          for (const item of nextGallerySync.assets) {
+            const previous = assets.get(item.id);
+            if (!previous || Number(item.updatedAt || 0) >= Number(previous.updatedAt || 0)) assets.set(item.id, item);
+          }
+          const removed = { ...(latestGallerySync.removed || {}), ...(nextGallerySync.removed || {}) };
+          nextGallerySync.assets = [...assets.values()].filter(item => Number(removed[item.id] || 0) <= Number(item.updatedAt || 0));
+          nextGallerySync.removed = removed;
+        }
+        gallerySync = { ...nextGallerySync, version: 2, provider: 'tavern-user-avatars' }; gallerySyncDirty = false;
+      }
+    }
+    await adapter.saveExtensionState(gallerySync ? { ...state, gallerySync } : state); await refresh();
+  }
+
+  function showVersionManager() {
+    versionManager ||= createVersionManager({
+      settings: () => state,
+      save,
+      flush: save,
+      context: () => adapter.context(),
+      apiRoot: new URL('../../../../', import.meta.url),
+      moduleURL: import.meta.url,
+      currentVersion: VERSION,
+      beforeChange: async () => {
+        // Version switching changes the code currently driving the takeover.
+        // Return the native drawer to a stable state before mutating the install.
+        editMode = false;
+        lastNativeOpen = null;
+        app?.close();
+        adapter?.setNativeTakeover?.(false);
+        adapter?.setNativeEditMode?.(false);
+        adapter?.setNativePresentation?.(false);
+      },
+    });
+    openVersionDialog({ manager: versionManager, element, button, dialog, currentVersion: VERSION,
+      notify: message => report(message), refresh: async () => { await save(); location.reload(); } });
+  }
+
+  function updateSettingsUi() {
+    const enabled = state?.enabled !== false;
+    const check = document.querySelector('#ytps-settings input[data-setting="enabled"]');
+    if (check) check.checked = enabled;
+    const openButton = document.querySelector('#ytps-settings [data-action="open-persona"]');
+    if (openButton) openButton.disabled = !enabled;
+    const status = document.querySelector('#ytps-settings [data-role="status"]');
+    if (status) status.textContent = `${enabled ? '已启用' : '已关闭'} · V${VERSION}`;
+  }
+
+  function installSettingsEntry() {
+    const host = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
+    if (!host || document.getElementById('ytps-settings')) return;
+    const panel = element('div'); panel.id = 'ytps-settings';
+    const drawer = element('div', 'inline-drawer');
+    const header = element('div', 'inline-drawer-toggle inline-drawer-header');
+    const icon = element('div', 'inline-drawer-icon fa-solid fa-circle-chevron-down down'); icon.setAttribute('aria-hidden', 'true');
+    header.tabIndex = 0; header.setAttribute('role', 'button'); header.setAttribute('aria-expanded', 'false'); header.setAttribute('aria-controls', 'ytps-settings-content');
+    header.append(element('b', '', '砚台 · 人设馆'), icon);
+    header.addEventListener('click', () => header.setAttribute('aria-expanded', String(icon.classList.contains('down'))));
+    header.addEventListener('keydown', event => { if (['Enter', ' '].includes(event.key)) { event.preventDefault(); event.stopPropagation(); header.click(); } });
+    const content = element('div', 'inline-drawer-content'); content.id = 'ytps-settings-content';
+    const status = element('small', 'ytps-install-status', ''); status.dataset.role = 'status';
+    content.append(status, element('p', 'ytps-settings-help', '接管酒馆原生人设面板，关闭后可直接使用原生界面；人设、头像和图库文件不会被删除。'));
+    const label = element('label', 'checkbox_label'); const check = element('input'); check.type = 'checkbox'; check.dataset.setting = 'enabled';
+    check.addEventListener('change', () => { void controlModule?.setEnabled(check.checked).then(updateSettingsUi).catch(error => report(error.message, 'error')); });
+    label.append(check, element('span', '', '启用人设馆接管')); content.append(label);
+    const actions = element('div', 'ytps-settings-actions');
+    actions.append(button('打开人设馆', 'menu_button', () => open({ tab: 'current' }), '打开砚台人设馆'));
+    actions.lastElementChild.dataset.action = 'open-persona';
+    actions.append(button('版本与更新', 'menu_button ytps-version-open', showVersionManager));
+    content.append(actions);
+    drawer.append(header, content); panel.append(drawer); host.append(panel); updateSettingsUi();
+  }
 
   async function open({ ensureNative = true, tab = 'current' } = {}) {
     if (!initialized) await initialize();
     if (state.enabled === false) {
-      report('人设馆已关闭。可在「砚台总库」的模块开关中重新启用。', 'info');
+      report('人设馆已关闭。可在「扩展设置 → 砚台 · 人设馆」中重新启用。', 'info');
       return false;
     }
     // Opening the native smiley lands on the current view; explicit quick
@@ -289,6 +478,7 @@
       app?.close();
       adapter?.setNativeTakeover?.(false);
       adapter?.setNativeEditMode?.(false);
+      adapter?.setNativePresentation?.(false);
       return;
     }
     if (isOpen === lastNativeOpen && !editMode) return;
@@ -330,6 +520,79 @@
       },
       async setGallerySheet(sheet) { state.ui.gallerySheet = sheet === 'cards' ? 'cards' : 'avatars'; await save(); },
       async selectGalleryAsset(id) { state.ui.selectedAssetId = String(id || ''); await save(); },
+      async setLibraryGroup(groupId) {
+        const wanted = String(groupId || 'all');
+        const known = wanted === 'all' || wanted === '__uncategorized__' || state.personaGroups.some(group => String(group?.id || '') === wanted);
+        state.ui.libraryGroup = known ? wanted : 'all';
+        await save();
+      },
+      async createPersonaGroup(name) {
+        const label = String(name || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+        if (!label) return null;
+        state.personaGroups = Array.isArray(state.personaGroups) ? state.personaGroups : [];
+        const reserved = new Set(['全部', '全部分组', '未分类', '无分组', '默认']);
+        if (reserved.has(label.toLocaleLowerCase()) || state.personaGroups.some(group => String(group?.name || '').trim().toLocaleLowerCase() === label.toLocaleLowerCase())) {
+          throw new Error('已经有同名的人设文件夹。');
+        }
+        const id = `group_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+        const group = { id, name: label, createdAt: Date.now() };
+        state.personaGroups = [...state.personaGroups, group];
+        state.ui.libraryGroup = id;
+        await save();
+        return group;
+      },
+      async renamePersonaGroup(groupId, name) {
+        const id = String(groupId || '');
+        if (!id || id === 'all' || id === '__uncategorized__') throw new Error('这个分组不能重命名。');
+        state.personaGroups = Array.isArray(state.personaGroups) ? state.personaGroups : [];
+        const current = state.personaGroups.find(group => String(group?.id || '') === id);
+        if (!current) throw new Error('找不到这个分组。');
+        const label = String(name || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+        if (!label) throw new Error('分组名称不能为空。');
+        const reserved = new Set(['全部', '全部分组', '未分类', '无分组', '默认']);
+        const lower = label.toLocaleLowerCase();
+        if (reserved.has(lower)) throw new Error('这个名称是系统保留名称，请换一个。');
+        if (state.personaGroups.some(group => String(group?.id || '') !== id && String(group?.name || '').trim().toLocaleLowerCase() === lower)) {
+          throw new Error('已经有同名的人设分组。');
+        }
+        current.name = label;
+        await save();
+        return current;
+      },
+      async deletePersonaGroup(groupId) {
+        const id = String(groupId || '');
+        if (!id || id === 'all' || id === '__uncategorized__') throw new Error('这个分组不能删除。');
+        state.personaGroups = Array.isArray(state.personaGroups) ? state.personaGroups : [];
+        if (!state.personaGroups.some(group => String(group?.id || '') === id)) throw new Error('找不到这个分组。');
+        state.personaGroups = state.personaGroups.filter(group => String(group?.id || '') !== id);
+        const nextMeta = {};
+        for (const [personaId, meta] of Object.entries(state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {})) {
+          if (!meta || typeof meta !== 'object' || String(meta.groupId || '') !== id) { nextMeta[personaId] = meta; continue; }
+          const { groupId: _groupId, ...rest } = meta;
+          if (Object.keys(rest).length) nextMeta[personaId] = rest;
+        }
+        state.personaMeta = nextMeta;
+        if (String(state.ui?.libraryGroup || '') === id) state.ui.libraryGroup = '__uncategorized__';
+        await save();
+        return true;
+      },
+      async setPersonaGroupForPersona(personaId, groupId) {
+        const id = String(personaId || '');
+        if (!id) return false;
+        const wanted = String(groupId || '__uncategorized__');
+        if (wanted !== '__uncategorized__' && !state.personaGroups.some(group => String(group?.id || '') === wanted)) return false;
+        state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
+        const current = state.personaMeta[id] && typeof state.personaMeta[id] === 'object' ? state.personaMeta[id] : {};
+        if (wanted === '__uncategorized__') {
+          const { groupId: _groupId, ...rest } = current;
+          if (Object.keys(rest).length) state.personaMeta[id] = rest;
+          else delete state.personaMeta[id];
+        } else {
+          state.personaMeta[id] = { ...current, groupId: wanted };
+        }
+        await save();
+        return true;
+      },
       async setDefault(id) { await adapter.setDefault(id || null); await refresh(); },
       async updatePersona(id, patch) { const ok = await adapter.updatePersona?.(id, patch); if (ok) await refresh(); return ok; },
       async createPersona(input) {
@@ -390,8 +653,8 @@
         return false;
       },
       async openNativeEdit(id) { editMode = true; adapter.setNativeEditMode(true); app?.close(); await adapter.selectNativePersona(id); await adapter.focusNativePersona(id); report('已切换到酒馆原生编辑区；编辑完成后关闭并重新打开人设按钮即可回到砚台工作区。', 'info'); },
-      async addGalleryAssets(files, kind = null) { const added = await storage.importFiles(files, { kind }); state.gallery = storage.mergeGallery(state.gallery, added); await save(); return added; },
-      async removeGalleryAsset(id) { state.gallery = state.gallery.filter(item => item.id !== id); storage.releasePreview?.(id); await storage.remove(id); await save(); },
+      async addGalleryAssets(files, kind = null) { const added = await storage.importFiles(files, { kind }); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; for (const item of added) delete state.galleryRemoved[item.id]; state.gallery = storage.mergeGallery(state.gallery, added); gallerySyncDirty = true; await save(); return added; },
+      async removeGalleryAsset(id) { state.gallery = state.gallery.filter(item => item.id !== id); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; state.galleryRemoved[String(id)] = Date.now(); storage.releasePreview?.(id); await storage.remove(id); gallerySyncDirty = true; await save(); },
       async uploadGalleryAvatar(id, targetPersonaId = '') {
         const asset = await storage.getAsset(id);
         if (!asset?.blob) throw new Error('找不到这张图片的本地文件，请重新导入。');
@@ -461,14 +724,37 @@
       state: () => state,
     };
     app.options.actions = actions;
+    if (state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) {
+      await save().catch(error => report(`图库迁移失败：${error?.message || error}，当前设备副本未删除。`, 'warning'));
+    }
     adapter.on('CHAT_CHANGED', refresh);
     adapter.on('CHARACTER_CHANGED', refresh);
     adapter.on('PERSONA_CHANGED', refresh);
     adapter.on('PERSONA_UPDATED', refresh);
     adapter.on('PERSONA_CREATED', refresh);
     adapter.on('PERSONA_RENAMED', refresh);
-    adapter.on('PERSONA_DELETED', refresh);
-    await adapter.installEntry();
+    const personaDeleted = async payload => {
+      const deletedId = typeof payload === 'string'
+        ? payload
+        : payload?.avatarId ?? payload?.personaId ?? payload?.id ?? '';
+      await refresh();
+      if (!state.personaMeta || typeof state.personaMeta !== 'object') return;
+      const known = new Set(adapter.readNativePersonas().map(persona => String(persona?.id || '')));
+      const removed = deletedId
+        ? [String(deletedId)]
+        : Object.keys(state.personaMeta).filter(id => !known.has(id));
+      let changed = false;
+      for (const id of removed) {
+        if (!id || !Object.prototype.hasOwnProperty.call(state.personaMeta, id)) continue;
+        delete state.personaMeta[id];
+        changed = true;
+      }
+      if (changed) await adapter.saveExtensionState(state);
+    };
+    adapter.on('PERSONA_DELETED', personaDeleted);
+    if (state.enabled !== false) await adapter.installEntry();
+    adapter.setNativePresentation?.(state.enabled !== false);
+    installSettingsEntry();
     // Native drawers can be mounted lazily, especially on mobile and after a
     // theme reload. Keep a tiny, scoped observer so the takeover hook is not
     // lost when SillyTavern replaces the settings subtree.
@@ -480,7 +766,9 @@
           syncTimer = null;
           if (disposed) return;
           try {
-            await adapter.installEntry();
+            if (state.enabled !== false) await adapter.installEntry();
+            else adapter.setNativePresentation?.(false);
+            installSettingsEntry();
             await syncNativeDrawer();
           } catch (error) {
             console.error('[砚台·人设馆] drawer sync failed', error);
@@ -491,8 +779,8 @@
         if (!node || node.nodeType !== 1) return false;
         const element = /** @type {Element} */ (node);
         return Boolean(
-          element.matches?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu')
-          || element.querySelector?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu'),
+          element.matches?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu, #extensions_settings, #extensions_settings2')
+          || element.querySelector?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu, #extensions_settings, #extensions_settings2'),
         );
       };
       const attachPanelObserver = () => {

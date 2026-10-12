@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "extension": "yantai-persona-studio",
+  "latest": "1.0.0",
+  "releases": [
+    {
+      "version": "1.0.0",
+      "branch": "v1.0.0",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆首个正式版。包含人设分组、服务器图库同步、跨设备助手记录合并和原生界面开关。"
+    },
+    {
+      "version": "0.2.2-dev18",
+      "branch": "v0.2.2-dev18",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "人设馆当前开发版。版本切换会先备份人设馆设置；酒馆原生人设和图库文件保持不变。"
+    },
+    {
+      "version": "0.2.2-dev17",
+      "branch": "v0.2.2-dev17",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "人设馆上一开发版。回退只切换扩展程序，保留酒馆原生人设和图库文件。"
+    }
+  ]
+}

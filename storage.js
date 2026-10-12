@@ -99,6 +99,21 @@ async function digestFile(file) {
   return `${file.size}:${file.lastModified}:${file.name}`;
 }
 
+// Legacy JSON-safe records are still accepted so existing installs can
+// migrate. New gallery images are hosted by SillyTavern's server and settings
+// carry only a compact manifest; data URLs are a compatibility fallback.
+async function blobToDataUrl(blob) {
+  if (!blob) return '';
+  if (typeof FileReader !== 'undefined') return new Promise(resolve => { const r = new FileReader(); r.onload = () => resolve(String(r.result || '')); r.onerror = () => resolve(''); r.readAsDataURL(blob); });
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = ''; for (const b of bytes) binary += String.fromCharCode(b);
+  return `data:${blob.type || 'application/octet-stream'};base64,${btoa(binary)}`;
+}
+async function dataUrlToBlob(url, mime = '') {
+  if (!url || typeof fetch !== 'function') return null;
+  try { const response = await fetch(url); return await response.blob(); } catch (_) { return null; }
+}
+
 export function createStorage({ report = () => {} } = {}) {
   const previewUrls = new Map();
   const makePreview = (id, blob, fallback = '') => {
@@ -120,7 +135,10 @@ export function createStorage({ report = () => {} } = {}) {
       // Blob URLs are scoped to the origin that created them. Never carry a
       // stale blob: URL across a localhost/LAN address change; it renders as
       // a broken image and hides the fact that the original file is missing.
-      const fallback = item.url && !/^blob:/i.test(String(item.url)) ? item.url : '';
+      // Blob URLs are scoped to the current browser origin/session.  A
+      // server-backed gallery entry remains usable on another device, so use
+      // it before falling back to any legacy non-blob URL.
+      const fallback = item.remoteUrl || (item.url && !/^blob:/i.test(String(item.url)) ? item.url : '');
       result.push({ ...item, url: makePreview(item.id, blob, fallback) });
     }
     return result;
@@ -148,10 +166,92 @@ export function createStorage({ report = () => {} } = {}) {
     const byId = new Map((current || []).map(item => [item.id, item]));
     for (const item of added || []) {
       const previous = byId.get(item.id);
-      if (!previous || (item.updatedAt || 0) >= (previous.updatedAt || 0)) byId.set(item.id, item);
+      if (!previous) { byId.set(item.id, item); continue; }
+      const newer = (item.updatedAt || 0) >= (previous.updatedAt || 0) ? item : previous;
+      const older = newer === item ? previous : item;
+      // Metadata from another device may be newer while the local browser
+      // still owns the only Blob preview. Preserve both the hosted URL and a
+      // usable local URL instead of replacing one record wholesale.
+      byId.set(item.id, {
+        ...older,
+        ...newer,
+        remoteUrl: newer.remoteUrl || older.remoteUrl || '',
+        url: newer.url || older.url || '',
+      });
     }
     return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   };
+  // Publish local image bytes through a host-provided uploader.  The host
+  // keeps the actual file on its own server (like native persona avatars),
+  // while IndexedDB remains the fast local cache and offline fallback.
+  const publishAssets = async (items = [], uploader) => {
+    const changed = []; const failed = [];
+    if (typeof uploader !== 'function') return { changed, failed };
+    for (const item of items || []) {
+      if (!item?.id || item.remoteUrl) continue;
+      const stored = await getAsset(item.id).catch(() => null);
+      const blob = stored?.blob || item.blob;
+      if (!blob || typeof blob.arrayBuffer !== 'function') continue;
+      const mime = String(item.mime || stored?.mime || blob.type || '');
+      if (!/^image\//i.test(mime)) continue;
+      try {
+        const hosted = await uploader(blob, item);
+        const remoteUrl = String(hosted?.remoteUrl || hosted?.url || '').trim();
+        if (!remoteUrl) throw new Error('服务器没有返回图库地址');
+        const updated = { ...item, remoteUrl, url: remoteUrl, hostedAt: Date.now(), blob };
+        await putAsset(updated);
+        changed.push({ ...updated, blob: undefined });
+      } catch (error) {
+        failed.push({ item, error });
+      }
+    }
+    return { changed, failed };
+  };
   const clear = async () => { const items = await listAssets(); for (const item of items) { releasePreview(item.id); await deleteAsset(item.id); } };
-  return { openResourceStore, putAsset, getAsset, remove: deleteAsset, listAssets, importFiles, mergeGallery, hydrateGallery, releasePreview, clear, uid };
+  const exportSync = async ({ maxBytes = 8 * 1024 * 1024, removed = {}, includeData = true } = {}) => {
+    const items = await listAssets(); const assets = []; const skipped = []; let used = 0;
+    for (const item of items) {
+      // Hosted files are already shared through the Tavern server.  Keep only
+      // their small metadata in extension settings; never base64-encode them.
+      if (item.remoteUrl) {
+        assets.push({ ...item, blob: undefined, data: '', url: item.remoteUrl });
+        continue;
+      }
+      if (!includeData) {
+        skipped.push({ id: item.id, size: Number(item.size || 0) });
+        continue;
+      }
+      const data = await blobToDataUrl(item.blob); const bytes = data.length;
+      if (!data || used + bytes > maxBytes) { skipped.push({ id: item.id, size: Number(item.size || 0) }); continue; }
+      used += bytes; assets.push({ ...item, blob: undefined, data });
+    }
+    const liveById = new Map(items.map(item => [String(item.id), Number(item.updatedAt || 0)]));
+    const safeRemoved = {};
+    for (const [id, at] of Object.entries(removed || {})) {
+      if (!liveById.has(String(id)) || Number(at || 0) >= Number(liveById.get(String(id)) || 0)) safeRemoved[id] = Number(at || 0);
+    }
+    return { version: 1, updatedAt: Date.now(), assets, skipped, removed: safeRemoved };
+  };
+  const importSync = async (payload = {}) => {
+    const assets = Array.isArray(payload.assets) ? payload.assets : [];
+    const removed = payload.removed && typeof payload.removed === 'object' ? payload.removed : {};
+    const restored = [];
+    for (const id of Object.keys(removed)) {
+      // A stale tombstone from another device must not erase a newer local
+      // upload with the same deterministic asset id.
+      const existing = await getAsset(id).catch(() => null);
+      if (existing && Number(existing.updatedAt || 0) > Number(removed[id] || 0)) continue;
+      await deleteAsset(id).catch(() => {});
+    }
+    for (const item of assets) {
+      if (!item?.id || !item.data) continue;
+      if (Number(removed[item.id] || 0) >= Number(item.updatedAt || 0)) continue;
+      const existing = await getAsset(item.id).catch(() => null);
+      if (existing && Number(existing.updatedAt || 0) >= Number(item.updatedAt || 0)) continue;
+      const blob = await dataUrlToBlob(item.data, item.mime); if (!blob) continue;
+      await putAsset({ ...item, blob, url: undefined }); restored.push(item.id);
+    }
+    return restored;
+  };
+  return { openResourceStore, putAsset, getAsset, remove: deleteAsset, listAssets, importFiles, mergeGallery, hydrateGallery, publishAssets, releasePreview, clear, exportSync, importSync, uid };
 }
