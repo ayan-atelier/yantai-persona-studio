@@ -87,6 +87,30 @@ async function nativeApi() {
   return nativeModulePromise;
 }
 
+function avatarFileName(value) {
+  let raw = String(value || '').trim();
+  if (!raw) return '';
+  try { raw = decodeURIComponent(raw); } catch (_) { /* keep the original path */ }
+  raw = raw.split(/[?#]/, 1)[0].replace(/\\/g, '/');
+  const marker = raw.toLowerCase().lastIndexOf('/user avatars/');
+  if (marker >= 0) raw = raw.slice(marker + '/user avatars/'.length);
+  return raw.split('/').filter(Boolean).pop() || '';
+}
+
+async function nativeAvatarUrl(file, context = {}, native = null) {
+  const avatarId = avatarFileName(file);
+  if (!avatarId) return '';
+  try {
+    const url = await Promise.resolve(context?.getThumbnailUrl?.('persona', avatarId));
+    if (url) return String(url);
+  } catch (_) { /* use the stable thumbnail fallback below */ }
+  try {
+    const url = await Promise.resolve(native?.getUserAvatar?.(avatarId));
+    if (url) return String(url);
+  } catch (_) { /* use the stable thumbnail fallback below */ }
+  return '/thumbnail?type=persona&file=' + encodeURIComponent(avatarId);
+}
+
 /**
  * Upload an image through SillyTavern's own avatar endpoint.  Keeping this
  * here (rather than storing a blob URL only in the extension) means the image
@@ -169,10 +193,15 @@ export async function uploadGalleryAsset(file, { assetId = '', context = getStCo
   const data = await response.json().catch(() => ({}));
   const raw = String(data?.path || data?.file || overwriteName || '').trim();
   if (!raw) throw new Error('酒馆没有返回图库文件名。');
-  const normalized = raw.replace(/^\/?User Avatars[\\/]/i, '');
-  const remoteUrl = /^(?:https?:|data:|blob:|\/)/i.test(raw) ? raw : '/User Avatars/' + encodeURIComponent(normalized);
+  const native = await nativeApi();
+  const candidate = avatarFileName(raw);
+  // Some older servers return an API path instead of the stored filename.
+  // Keep the deterministic upload name in that case so thumbnail lookup does
+  // not accidentally target a route such as “/api/avatars/upload”.
+  const normalized = /\.(?:png|jpe?g|webp|gif|avif)$/i.test(candidate) ? candidate : avatarFileName(overwriteName);
+  const remoteUrl = await nativeAvatarUrl(normalized, context, native);
   await fetch(remoteUrl, { cache: 'reload' }).catch(() => {});
-  return { avatarId: raw, remoteUrl };
+  return { avatarId: raw, fileName: normalized, remoteUrl };
 }
 
 /** Create a persona directly from the extension workspace without opening the native drawer. */

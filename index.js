@@ -196,6 +196,15 @@
     // so older settings remain compatible without a migration pass.
     return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, assistantThreads: {}, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
   }
+  function mergeGalleryManifest(manifest) {
+    const assets = Array.isArray(manifest?.assets) ? manifest.assets.map(item => ({
+      ...item,
+      remoteUrl: String(item?.remoteUrl || item?.url || '').trim(),
+      url: String(item?.url || item?.remoteUrl || '').trim(),
+      blob: undefined,
+    })).filter(item => item.id) : [];
+    if (assets.length) state.gallery = storage.mergeGallery(state.gallery, assets);
+  }
   async function loadState() {
     const saved = await adapter.loadExtensionState(defaultState());
     state = adapter.normalizeState({ ...defaultState(), ...saved });
@@ -203,6 +212,10 @@
     gallerySync = saved?.gallerySync || null;
     gallerySyncDirty = !gallerySync;
     if (gallerySync) await storage.importSync(gallerySync).catch(() => {});
+    // Hosted manifests contain the cross-device URL even when this browser
+    // has no IndexedDB Blob. Merge them before hydration so a stale local
+    // blob URL cannot hide the server-backed preview.
+    mergeGalleryManifest(gallerySync);
     // Blob URLs are session-scoped. Rehydrate gallery entries from IndexedDB
     // so imported images remain visible after a reload or device reconnect.
     const persisted = await storage.listAssets().catch(() => []);
@@ -323,6 +336,7 @@
         gallerySync = remoteGallerySync;
         await storage.importSync(gallerySync).catch(() => {});
       }
+      mergeGalleryManifest(latestGallerySync || gallerySync);
       if (Array.isArray(latest.gallery)) state.gallery = storage.mergeGallery(state.gallery, latest.gallery);
       const remoteRemoved = latest.galleryRemoved && typeof latest.galleryRemoved === 'object' ? latest.galleryRemoved : {};
       state.galleryRemoved = { ...(state.galleryRemoved || {}) };

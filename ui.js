@@ -10,6 +10,26 @@ const TABS = {
 const UNCATEGORIZED_GROUP = '__uncategorized__';
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const short = (value, n = 180) => { const s = String(value ?? '').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
+function galleryFileName(url) {
+  let raw = String(url || '').trim();
+  if (!raw || /^(?:data|blob):/i.test(raw)) return '';
+  try {
+    const parsed = new URL(raw, globalThis.location?.href || 'http://localhost/');
+    const queryFile = parsed.searchParams.get('file');
+    if (queryFile) return queryFile;
+    raw = parsed.pathname || raw;
+  } catch (_) { /* parse the path below */ }
+  try { raw = decodeURIComponent(raw); } catch (_) { /* keep the original path */ }
+  raw = raw.split(/[?#]/, 1)[0].replace(/\\/g, '/');
+  const marker = raw.toLowerCase().lastIndexOf('/user avatars/');
+  if (marker >= 0) raw = raw.slice(marker + '/user avatars/'.length);
+  return raw.split('/').filter(Boolean).pop() || '';
+}
+function galleryFallbackUrl(url, type = 'persona') {
+  if (!url || /\/thumbnail(?:\?|$)/i.test(String(url))) return '';
+  const file = galleryFileName(url);
+  return file ? '/thumbnail?type=' + encodeURIComponent(type) + '&file=' + encodeURIComponent(file) : '';
+}
 
 class App {
   constructor(options = {}) {
@@ -32,6 +52,14 @@ class App {
     this.root.addEventListener('input', event => this.onInput(event));
     this.root.addEventListener('change', event => this.onChange(event));
     this.root.addEventListener('keydown', event => this.onKeyDown(event));
+    this.root.addEventListener('error', event => {
+      const image = event.target;
+      if (image?.tagName !== 'IMG' || image.dataset.ytpsFallbackTried !== undefined) return;
+      const fallback = image.dataset.fallbackSrc;
+      if (!fallback || image.src === fallback) return;
+      image.dataset.ytpsFallbackTried = '1';
+      image.src = fallback;
+    }, true);
     this.root.addEventListener('dragover', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.preventDefault(); z.classList.add('is-dragging'); } });
     this.root.addEventListener('dragleave', event => event.target.closest('.ytps-dropzone')?.classList.remove('is-dragging'));
     this.root.addEventListener('drop', event => { const z = event.target.closest('.ytps-dropzone'); if (!z) return; event.preventDefault(); z.classList.remove('is-dragging'); this.importFiles(event.dataTransfer.files); });
@@ -204,19 +232,21 @@ class App {
       await this.call('selectGalleryAsset', first.id);
     }
   }
-  previewAsset(url, name = '图库预览') {
+  previewAsset(url, name = '图库预览', fallback = '') {
     if (!url || !this.root) return;
     this.root.querySelector('.ytps-lightbox')?.remove?.();
     const box = document.createElement('div');
     box.className = 'ytps-lightbox';
-    box.innerHTML = '<button class="ytps-lightbox-close" data-action="lightbox-close" title="关闭"><i class="fa-solid fa-xmark"></i></button><figure><img src="' + esc(url) + '" alt=""><figcaption>' + esc(name) + '</figcaption></figure>';
+    box.innerHTML = '<button class="ytps-lightbox-close" data-action="lightbox-close" title="关闭"><i class="fa-solid fa-xmark"></i></button><figure><img src="' + esc(url) + '"' + (fallback ? ' data-fallback-src="' + esc(fallback) + '"' : '') + ' alt=""><figcaption>' + esc(name) + '</figcaption></figure>';
     this.root.appendChild(box);
   }
   assetCard(a) {
     const selected = this.state.selectedAssetId && String(this.state.selectedAssetId) === String(a.id);
     const isNative = a.source === 'native';
-    const preview = a.url ? '<button class="ytps-asset-preview" data-action="preview-asset" data-url="' + esc(a.url) + '" data-name="' + esc(a.name || '') + '" title="查看原图"><i class="fa-solid fa-expand"></i></button>' : '';
-    return '<article class="ytps-asset ' + (selected ? 'is-selected' : '') + ' ' + (isNative ? 'is-native' : '') + '"><button class="ytps-asset-select" data-action="select-asset" data-id="' + esc(a.id) + '" title="' + (isNative ? '选择此图' : '选用此图') + '">' + (selected ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-' + (isNative ? 'eye' : 'check') + '"></i>') + '</button>' + preview + '<div class="ytps-asset-thumb" data-action="select-asset" data-id="' + esc(a.id) + '" title="点击选择这张图">' + (a.url ? '<img src="' + esc(a.url) + '" alt="">' : '<i class="fa-solid ' + (a.kind === 'card' ? 'fa-address-card' : 'fa-image') + '"></i>') + '</div><div class="ytps-asset-meta"><b>' + esc(a.name) + '</b><small>' + (isNative ? '酒馆角色卡' : a.kind === 'card' ? '角色卡文件' : '头像素材') + '</small></div>' + (!isNative ? '<button class="ytps-remove" data-action="remove-asset" data-id="' + esc(a.id) + '" title="移除素材"><i class="fa-solid fa-xmark"></i></button>' : '') + '</article>';
+    const fallback = galleryFallbackUrl(a.url, isNative ? 'avatar' : 'persona');
+    const preview = a.url ? '<button class="ytps-asset-preview" data-action="preview-asset" data-url="' + esc(a.url) + '" data-fallback="' + esc(fallback) + '" data-name="' + esc(a.name || '') + '" title="查看原图"><i class="fa-solid fa-expand"></i></button>' : '';
+    const image = a.url ? '<img src="' + esc(a.url) + '"' + (fallback ? ' data-fallback-src="' + esc(fallback) + '"' : '') + ' alt="">' : '<i class="fa-solid ' + (a.kind === 'card' ? 'fa-address-card' : 'fa-image') + '"></i>';
+    return '<article class="ytps-asset ' + (selected ? 'is-selected' : '') + ' ' + (isNative ? 'is-native' : '') + '"><button class="ytps-asset-select" data-action="select-asset" data-id="' + esc(a.id) + '" title="' + (isNative ? '选择此图' : '选用此图') + '">' + (selected ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-' + (isNative ? 'eye' : 'check') + '"></i>') + '</button>' + preview + '<div class="ytps-asset-thumb" data-action="select-asset" data-id="' + esc(a.id) + '" title="点击选择这张图">' + image + '</div><div class="ytps-asset-meta"><b>' + esc(a.name) + '</b><small>' + (isNative ? '酒馆角色卡' : a.kind === 'card' ? '角色卡文件' : '头像素材') + '</small></div>' + (!isNative ? '<button class="ytps-remove" data-action="remove-asset" data-id="' + esc(a.id) + '" title="移除素材"><i class="fa-solid fa-xmark"></i></button>' : '') + '</article>';
   }
   assistantTurns() {
     const threads = this.state.assistantThreads && typeof this.state.assistantThreads === 'object' ? this.state.assistantThreads : {};
@@ -310,7 +340,7 @@ class App {
       }
       return result;
     }
-    if (action === 'preview-asset') { this.previewAsset(el.dataset.url, el.dataset.name || '图库预览'); return; }
+    if (action === 'preview-asset') { this.previewAsset(el.dataset.url, el.dataset.name || '图库预览', el.dataset.fallback || ''); return; }
     if (action === 'lightbox-close') { el.closest('.ytps-lightbox')?.remove?.(); return; }
     if (action === 'edit-persona' || action === 'open-editor') {
       this.state.creatingPersona = false;
