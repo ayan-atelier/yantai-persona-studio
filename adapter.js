@@ -110,6 +110,10 @@ async function nativeAvatarUrl(file, context = {}, native = null) {
   } catch (_) { /* use the stable thumbnail fallback below */ }
   return '/thumbnail?type=persona&file=' + encodeURIComponent(avatarId);
 }
+function originalAvatarUrl(file) {
+  const avatarId = avatarFileName(file);
+  return avatarId ? '/User Avatars/' + encodeURIComponent(avatarId) : '';
+}
 
 /**
  * Upload an image through SillyTavern's own avatar endpoint.  Keeping this
@@ -122,6 +126,7 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
   // instanceof check here. FormData and the native helpers only need the
   // standard Blob/File methods.
   if (!file || typeof file.arrayBuffer !== 'function') throw new Error('请选择一个图片文件。');
+  if (!overwriteName && createPersona === false) throw new Error('应用头像时必须指定已有的人设。');
   const [native, popupModule, utilsModule, scriptModule] = await Promise.all([
     nativeApi(),
     import('/scripts/popup.js').catch(() => ({})),
@@ -199,9 +204,11 @@ export async function uploadGalleryAsset(file, { assetId = '', context = getStCo
   // Keep the deterministic upload name in that case so thumbnail lookup does
   // not accidentally target a route such as “/api/avatars/upload”.
   const normalized = /\.(?:png|jpe?g|webp|gif|avif)$/i.test(candidate) ? candidate : avatarFileName(overwriteName);
-  const remoteUrl = await nativeAvatarUrl(normalized, context, native);
+  const remoteUrl = originalAvatarUrl(normalized);
+  const previewUrl = await nativeAvatarUrl(normalized, context, native);
   await fetch(remoteUrl, { cache: 'reload' }).catch(() => {});
-  return { avatarId: raw, fileName: normalized, remoteUrl };
+  await fetch(previewUrl, { cache: 'reload' }).catch(() => {});
+  return { avatarId: raw, fileName: normalized, remoteUrl, previewUrl };
 }
 
 /** Create a persona directly from the extension workspace without opening the native drawer. */

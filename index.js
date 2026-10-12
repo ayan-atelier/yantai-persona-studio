@@ -201,6 +201,7 @@
       ...item,
       remoteUrl: String(item?.remoteUrl || item?.url || '').trim(),
       url: String(item?.url || item?.remoteUrl || '').trim(),
+      previewUrl: String(item?.previewUrl || item?.thumbnailUrl || '').trim(),
       blob: undefined,
     })).filter(item => item.id) : [];
     if (assets.length) state.gallery = storage.mergeGallery(state.gallery, assets);
@@ -672,8 +673,10 @@
       async uploadGalleryAvatar(id, targetPersonaId = '') {
         const asset = await storage.getAsset(id);
         if (!asset?.blob) throw new Error('找不到这张图片的本地文件，请重新导入。');
-        const currentPersona = adapter.readNativePersona();
-        const overwriteName = String(targetPersonaId || currentPersona?.id || '');
+        // Applying an avatar is only valid from an existing editor target.
+        // Never fall back to the active persona: an empty target must fail
+        // safely instead of entering the native create-persona flow.
+        const overwriteName = String(targetPersonaId || '');
         if (!overwriteName) throw new Error('请先从已有的人设编辑页进入图库，再应用头像；图片已保留在图库中。');
         const personas = adapter.readNativePersonas?.() || [];
         if (personas.length && !personas.some(persona => String(persona?.id || '') === overwriteName)) throw new Error('找不到要应用头像的人设，请重新打开编辑页后再试。');

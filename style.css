@@ -206,7 +206,6 @@
 .ytps-editor-head { display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:12px; padding:2px 2px 5px; }
 .ytps-editor-head h2 { margin:3px 0 0; font-size:19px; }
 .ytps-editor-head p { margin:5px 0 0; }
-.ytps-editor-new { min-height:30px; padding:4px 10px; white-space:nowrap; }
 .ytps-create-fields { width:100%; }
 .ytps-create-result { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:9px 11px; border:1px solid var(--ytps-accent); border-radius:var(--ytps-radius); background:color-mix(in srgb, var(--ytps-accent) 10%, transparent); }
 .ytps-create-result > span { display:inline-flex; align-items:center; gap:6px; min-width:0; overflow-wrap:anywhere; }

@@ -114,6 +114,33 @@ async function dataUrlToBlob(url, mime = '') {
   try { const response = await fetch(url); return await response.blob(); } catch (_) { return null; }
 }
 
+function galleryFileName(value) {
+  let raw = String(value || '').trim();
+  if (!raw || /^(?:data|blob):/i.test(raw)) return '';
+  try {
+    const parsed = new URL(raw, globalThis.location?.href || 'http://localhost/');
+    raw = parsed.searchParams.get('file') || parsed.pathname || raw;
+  } catch (_) { /* parse the path below */ }
+  try { raw = decodeURIComponent(raw); } catch (_) { /* keep the original path */ }
+  raw = raw.split(/[?#]/, 1)[0].replace(/\\/g, '/');
+  const marker = raw.toLowerCase().lastIndexOf('/user avatars/');
+  if (marker >= 0) raw = raw.slice(marker + '/user avatars/'.length);
+  return raw.split('/').filter(Boolean).pop() || '';
+}
+function galleryOriginalUrl(value) {
+  if (!/\/thumbnail(?:\?|$)/i.test(String(value || ''))) return '';
+  const file = galleryFileName(value);
+  return file ? '/User Avatars/' + encodeURIComponent(file) : '';
+}
+function isThumbnailUrl(value) { return /\/thumbnail(?:\?|$)/i.test(String(value || '')); }
+function preferGalleryUrl(primary, secondary) {
+  const first = String(primary || '').trim();
+  const second = String(secondary || '').trim();
+  if (first && !isThumbnailUrl(first)) return first;
+  if (second && !isThumbnailUrl(second)) return second;
+  return first || second;
+}
+
 export function createStorage({ report = () => {} } = {}) {
   const previewUrls = new Map();
   const makePreview = (id, blob, fallback = '') => {
@@ -138,8 +165,12 @@ export function createStorage({ report = () => {} } = {}) {
       // Blob URLs are scoped to the current browser origin/session.  A
       // server-backed gallery entry remains usable on another device, so use
       // it before falling back to any legacy non-blob URL.
-      const fallback = item.remoteUrl || (item.url && !/^blob:/i.test(String(item.url)) ? item.url : '');
-      result.push({ ...item, url: makePreview(item.id, blob, fallback) });
+      const sourceRemote = String(item.remoteUrl || '').trim();
+      const sourceUrl = String(item.url || '').trim();
+      const remoteUrl = galleryOriginalUrl(sourceRemote) || galleryOriginalUrl(sourceUrl) || sourceRemote || (sourceUrl && !/^blob:/i.test(sourceUrl) ? sourceUrl : '');
+      const previewUrl = String(item.previewUrl || (isThumbnailUrl(sourceRemote) ? sourceRemote : isThumbnailUrl(sourceUrl) ? sourceUrl : '')).trim();
+      const fallback = remoteUrl || previewUrl;
+      result.push({ ...item, remoteUrl, previewUrl, url: makePreview(item.id, blob, fallback) });
     }
     return result;
   };
@@ -175,8 +206,9 @@ export function createStorage({ report = () => {} } = {}) {
       byId.set(item.id, {
         ...older,
         ...newer,
-        remoteUrl: newer.remoteUrl || older.remoteUrl || '',
-        url: newer.url || older.url || '',
+        remoteUrl: preferGalleryUrl(newer.remoteUrl, older.remoteUrl),
+        previewUrl: newer.previewUrl || older.previewUrl || '',
+        url: preferGalleryUrl(newer.url, older.url),
       });
     }
     return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
@@ -198,7 +230,8 @@ export function createStorage({ report = () => {} } = {}) {
         const hosted = await uploader(blob, item);
         const remoteUrl = String(hosted?.remoteUrl || hosted?.url || '').trim();
         if (!remoteUrl) throw new Error('服务器没有返回图库地址');
-        const updated = { ...item, remoteUrl, url: remoteUrl, hostedAt: Date.now(), blob };
+        const previewUrl = String(hosted?.previewUrl || hosted?.thumbnailUrl || '').trim();
+        const updated = { ...item, remoteUrl, previewUrl, url: remoteUrl, hostedAt: Date.now(), blob };
         await putAsset(updated);
         changed.push({ ...updated, blob: undefined });
       } catch (error) {
@@ -214,7 +247,7 @@ export function createStorage({ report = () => {} } = {}) {
       // Hosted files are already shared through the Tavern server.  Keep only
       // their small metadata in extension settings; never base64-encode them.
       if (item.remoteUrl) {
-        assets.push({ ...item, blob: undefined, data: '', url: item.remoteUrl });
+        assets.push({ ...item, blob: undefined, data: '', url: item.remoteUrl, previewUrl: item.previewUrl || '' });
         continue;
       }
       if (!includeData) {
