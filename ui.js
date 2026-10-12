@@ -27,6 +27,7 @@ function galleryFileName(url) {
 }
 function galleryFallbackUrl(url, type = 'persona') {
   if (!url || /\/thumbnail(?:\?|$)/i.test(String(url))) return '';
+  if (type !== 'avatar' && !/\/User(?:%20|\s)Avatars\//i.test(String(url))) return '';
   const file = galleryFileName(url);
   return file ? '/thumbnail?type=' + encodeURIComponent(type) + '&file=' + encodeURIComponent(file) : '';
 }

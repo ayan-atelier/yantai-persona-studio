@@ -199,7 +199,7 @@
   function mergeGalleryManifest(manifest) {
     const assets = Array.isArray(manifest?.assets) ? manifest.assets.map(item => ({
       ...item,
-      remoteUrl: String(item?.remoteUrl || item?.url || '').trim(),
+      remoteUrl: /^(?:blob|data):/i.test(String(item?.remoteUrl || item?.url || '').trim()) ? '' : String(item?.remoteUrl || item?.url || '').trim(),
       url: String(item?.url || item?.remoteUrl || '').trim(),
       previewUrl: String(item?.previewUrl || item?.thumbnailUrl || '').trim(),
       blob: undefined,
@@ -223,10 +223,10 @@
     state.gallery = storage.mergeGallery(state.gallery, persisted.map(item => ({ ...item, blob: undefined })));
     state.gallery = state.gallery.filter(item => Number(state.galleryRemoved[item.id] || 0) <= Number(item.updatedAt || 0));
     state.gallery = await storage.hydrateGallery(state.gallery);
-    // Existing installs may contain local-only images from the old 8 MiB
+    // Existing installs may contain local-only images from the old sync path
     // data-URL sync. Mark them for one-time server migration after the app is
     // ready; the local Blob remains usable even if upload is unavailable.
-    if (gallerySync?.provider !== 'tavern-user-avatars' || state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) gallerySyncDirty = true;
+    if (gallerySync?.provider !== 'tavern-user-images' || state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) gallerySyncDirty = true;
     return state;
   }
   function activeTarget() {
@@ -365,24 +365,32 @@
       state.assistantThreads = local;
     } catch (_) { /* retain local state when host settings are unavailable */ }
     if (gallerySyncDirty || !gallerySync) {
-      // Publish image bytes through SillyTavern's server-side avatar store
+      // Publish image bytes through SillyTavern's shared user image store
       // before writing settings. Settings then carry only metadata and a URL;
       // IndexedDB remains the local/offline cache.
       const hosted = await storage.publishAssets(state.gallery, async (blob, item) => adapter.uploadGalleryAsset?.(blob, { assetId: item.id }));
       if (hosted.changed.length) {
         state.gallery = storage.mergeGallery(state.gallery, hosted.changed);
+        // Releases before the API fix put gallery images in User Avatars.
+        // Remove only our deterministic ytps-* files after a successful move;
+        // native persona files are left untouched.
+        for (const item of hosted.changed) {
+          if (item?.legacyRemoteUrl) await Promise.resolve(adapter.removeLegacyGalleryAvatar?.(item.legacyRemoteUrl)).catch(() => {});
+        }
         gallerySyncDirty = true;
       }
       if (hosted.failed.length) report(`图库服务器同步失败 ${hosted.failed.length} 张，当前设备仍保留本地副本。`, 'warning');
       // Keep the settings payload a compact manifest. Legacy data URLs are
       // still accepted/imported, but new files use the server-backed path.
-      const nextGallerySync = await storage.exportSync({ removed: state.galleryRemoved, includeData: false }).catch(() => null);
+      // Keep the 500 MiB fallback for older Tavern builds where the image API
+      // is unavailable; hosted images still contribute only their manifest.
+      const nextGallerySync = await storage.exportSync({ removed: state.galleryRemoved, includeData: true, maxBytes: 500 * 1024 * 1024 }).catch(() => null);
       if (nextGallerySync) {
         if (latestGallerySync) {
           // Prefer the hosted manifest, while retaining a legacy data-URL
           // entry when its local upload failed or the current device has no
           // Blob to retry. This keeps an old image recoverable instead of
-          // trading the 8 MiB migration for data loss.
+          // trading the migration for data loss.
           const assets = new Map((latestGallerySync.assets || []).map(item => [item.id, item]));
           for (const item of nextGallerySync.assets) {
             const previous = assets.get(item.id);
@@ -392,7 +400,7 @@
           nextGallerySync.assets = [...assets.values()].filter(item => Number(removed[item.id] || 0) <= Number(item.updatedAt || 0));
           nextGallerySync.removed = removed;
         }
-        gallerySync = { ...nextGallerySync, version: 2, provider: 'tavern-user-avatars' }; gallerySyncDirty = false;
+        gallerySync = { ...nextGallerySync, version: 2, provider: 'tavern-user-images' }; gallerySyncDirty = false;
       }
     }
     await adapter.saveExtensionState(gallerySync ? { ...state, gallerySync } : state); await refresh();
@@ -669,7 +677,7 @@
       },
       async openNativeEdit(id) { editMode = true; adapter.setNativeEditMode(true); app?.close(); await adapter.selectNativePersona(id); await adapter.focusNativePersona(id); report('已切换到酒馆原生编辑区；编辑完成后关闭并重新打开人设按钮即可回到砚台工作区。', 'info'); },
       async addGalleryAssets(files, kind = null) { const added = await storage.importFiles(files, { kind }); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; for (const item of added) delete state.galleryRemoved[item.id]; state.gallery = storage.mergeGallery(state.gallery, added); gallerySyncDirty = true; await save(); return added; },
-      async removeGalleryAsset(id) { state.gallery = state.gallery.filter(item => item.id !== id); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; state.galleryRemoved[String(id)] = Date.now(); storage.releasePreview?.(id); await storage.remove(id); gallerySyncDirty = true; await save(); },
+      async removeGalleryAsset(id) { const removedItem = state.gallery.find(item => String(item?.id || '') === String(id)); await Promise.resolve(adapter.deleteGalleryAsset?.(removedItem?.remoteUrl)).catch(() => {}); state.gallery = state.gallery.filter(item => item.id !== id); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; state.galleryRemoved[String(id)] = Date.now(); storage.releasePreview?.(id); await storage.remove(id); gallerySyncDirty = true; await save(); },
       async uploadGalleryAvatar(id, targetPersonaId = '') {
         const asset = await storage.getAsset(id);
         if (!asset?.blob) throw new Error('找不到这张图片的本地文件，请重新导入。');

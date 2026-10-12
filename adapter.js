@@ -115,6 +115,18 @@ function originalAvatarUrl(file) {
   return avatarId ? '/User Avatars/' + encodeURIComponent(avatarId) : '';
 }
 
+function fileToBase64(file) {
+  return file.arrayBuffer().then(buffer => {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+    }
+    return btoa(binary);
+  });
+}
+
 /**
  * Upload an image through SillyTavern's own avatar endpoint.  Keeping this
  * here (rather than storing a blob URL only in the extension) means the image
@@ -162,53 +174,105 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
   } else {
     // Match changeUserAvatar(): refresh the native list before opening the
     // name/description prompt, then focus the newly-created persona.
-    await native?.getUserAvatars?.();
+    await native?.getUserAvatars?.(false);
     if (createPersona && typeof native?.createPersona === 'function') await native.createPersona(avatarId);
   }
-  await native?.getUserAvatars?.(true, avatarId);
+  // A rendered avatar-list refresh calls addMissingPersonas() in SillyTavern.
+  // The overwrite path already targets an existing persona, so only refresh
+  // the raw list here; this avoids turning an unrelated gallery file into a
+  // new [Unnamed Persona].
+  await native?.getUserAvatars?.(false, avatarId);
   return { avatarId, created: !overwriteName && createPersona };
 }
 
 /**
- * Store a gallery image in SillyTavern's server-side avatar directory without
- * creating a persona.  Gallery metadata then travels with extension settings
- * while the bytes use the same server path as native persona avatars.
+ * Store a gallery image in SillyTavern's per-user image directory.  The
+ * avatar endpoint must never be used here: getUserAvatars() treats every file
+ * in User Avatars as a persona and silently creates [Unnamed Persona] records.
+ * The image endpoint is shared across clients but is not enumerated by the
+ * persona manager.
  */
 export async function uploadGalleryAsset(file, { assetId = '', context = getStContext() } = {}) {
   if (!file || typeof file.arrayBuffer !== 'function') throw new Error('请选择一个图片文件。');
   const utilsModule = await import('/scripts/utils.js').catch(() => ({}));
   const scriptModule = await import('/scripts/script.js').catch(() => ({}));
   const ensureImageFormatSupported = utilsModule.ensureImageFormatSupported;
-  const uploadFile = typeof ensureImageFormatSupported === 'function' ? await ensureImageFormatSupported(file) : file;
-  const mime = String(uploadFile.type || file.type || 'image/png').toLowerCase();
+  const convertImageFile = utilsModule.convertImageFile;
+  let uploadFile = typeof ensureImageFormatSupported === 'function' ? await ensureImageFormatSupported(file) : file;
+  let mime = String(uploadFile.type || file.type || 'image/png').toLowerCase();
+  if (!/^image\/(?:png|jpe?g|webp|gif|bmp|jfif)$/i.test(mime)) {
+    if (typeof convertImageFile !== 'function') throw new Error('酒馆当前版本不支持这种图片格式，请改用 PNG、JPG、WEBP、GIF 或 BMP。');
+    uploadFile = await convertImageFile(uploadFile, 'image/png');
+    mime = 'image/png';
+  }
   const ext = mime.includes('jpeg') || mime.includes('jpg') ? '.jpg'
     : mime.includes('webp') ? '.webp'
       : mime.includes('gif') ? '.gif'
-        : mime.includes('avif') ? '.avif' : '.png';
+        : mime.includes('bmp') ? '.bmp'
+          : mime.includes('jfif') ? '.jfif' : '.png';
   const base = String(assetId || file.name || `asset-${Date.now()}`)
     .replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || `asset-${Date.now()}`;
   const overwriteName = `ytps-${base}${ext}`;
-  const formData = new FormData();
-  formData.append('avatar', uploadFile, overwriteName);
-  formData.append('overwrite_name', overwriteName);
+  const encoded = await fileToBase64(uploadFile);
   const getHeaders = scriptModule.getRequestHeaders || context?.getRequestHeaders || globalThis.getRequestHeaders;
-  const headers = typeof getHeaders === 'function' ? getHeaders({ omitContentType: true }) : {};
-  const response = await fetch('/api/avatars/upload', { method: 'POST', headers, cache: 'no-cache', body: formData });
+  const headers = typeof getHeaders === 'function' ? getHeaders() : {};
+  headers['Content-Type'] = 'application/json';
+  const response = await fetch('/api/images/upload', {
+    method: 'POST', headers, cache: 'no-cache',
+    body: JSON.stringify({ image: encoded, format: ext.slice(1), filename: overwriteName }),
+  });
   if (!response.ok) throw new Error(`图库上传失败：${response.statusText}`);
-  const data = await response.json().catch(() => ({}));
-  const raw = String(data?.path || data?.file || overwriteName || '').trim();
-  if (!raw) throw new Error('酒馆没有返回图库文件名。');
-  const native = await nativeApi();
-  const candidate = avatarFileName(raw);
-  // Some older servers return an API path instead of the stored filename.
-  // Keep the deterministic upload name in that case so thumbnail lookup does
-  // not accidentally target a route such as “/api/avatars/upload”.
-  const normalized = /\.(?:png|jpe?g|webp|gif|avif)$/i.test(candidate) ? candidate : avatarFileName(overwriteName);
-  const remoteUrl = originalAvatarUrl(normalized);
-  const previewUrl = await nativeAvatarUrl(normalized, context, native);
+  const result = await response.json().catch(() => ({}));
+  const returnedPath = String(result?.path || `/user/images/${encodeURIComponent(overwriteName)}`).trim();
+  const remoteUrl = returnedPath.startsWith('/') ? returnedPath : '/' + returnedPath;
+  if (!remoteUrl) throw new Error('酒馆没有返回图库文件地址。');
   await fetch(remoteUrl, { cache: 'reload' }).catch(() => {});
-  await fetch(previewUrl, { cache: 'reload' }).catch(() => {});
-  return { avatarId: raw, fileName: normalized, remoteUrl, previewUrl };
+  return { avatarId: overwriteName, fileName: overwriteName, remoteUrl };
+}
+
+/** Delete a server-backed gallery image without touching persona settings. */
+export async function deleteGalleryAsset(remoteUrl, { context = getStContext() } = {}) {
+  const value = String(remoteUrl || '').trim();
+  if (!/^\/?user\/images\//i.test(value)) return false;
+  const scriptModule = await import('/scripts/script.js').catch(() => ({}));
+  const getHeaders = scriptModule.getRequestHeaders || context?.getRequestHeaders || globalThis.getRequestHeaders;
+  const headers = typeof getHeaders === 'function' ? getHeaders() : {};
+  headers['Content-Type'] = 'application/json';
+  const response = await fetch('/api/images/delete', {
+    method: 'POST', headers, cache: 'no-cache', body: JSON.stringify({ path: value.replace(/^\//, '') }),
+  });
+  return response.ok;
+}
+
+/** Remove a legacy gallery file that was accidentally uploaded as an avatar. */
+export async function removeLegacyGalleryAvatar(file, { context = getStContext() } = {}) {
+  const avatar = avatarFileName(file);
+  if (!avatar || !/^ytps-/i.test(avatar)) return false;
+  const settings = powerSettings(context);
+  const personaName = settings.personas?.[avatar];
+  const current = currentNativeId(context);
+  const defaultId = settings.default_persona ?? settings.defaultPersona ?? null;
+  // Never remove a file that has become a real/current/default persona.  An
+  // unregistered file, or the exact silent placeholder created by ST's
+  // addMissingPersonas(), is safe to clean after its gallery copy is moved.
+  if (String(current || '') === avatar || String(defaultId || '') === avatar) return false;
+  if (personaName && personaName !== '[Unnamed Persona]') return false;
+  const scriptModule = await import('/scripts/script.js').catch(() => ({}));
+  const getHeaders = scriptModule.getRequestHeaders || context?.getRequestHeaders || globalThis.getRequestHeaders;
+  const headers = typeof getHeaders === 'function' ? getHeaders() : {};
+  headers['Content-Type'] = 'application/json';
+  const response = await fetch('/api/avatars/delete', {
+    method: 'POST', headers, cache: 'no-cache', body: JSON.stringify({ avatar }),
+  });
+  if (!response.ok) return false;
+  if (personaName === '[Unnamed Persona]') {
+    delete settings.personas[avatar];
+    if (settings.persona_descriptions) delete settings.persona_descriptions[avatar];
+    const saver = context.saveSettingsDebounced ?? context.saveSettings;
+    if (typeof saver === 'function') await Promise.resolve(saver.call(context));
+    await emitNativeEvent(context, 'PERSONA_DELETED', avatar);
+  }
+  return true;
 }
 
 /** Create a persona directly from the extension workspace without opening the native drawer. */
@@ -237,7 +301,7 @@ export async function createNativePersona({ name, title = '', description = '', 
     const saver = context.saveSettingsDebounced ?? context.saveSettings;
     if (typeof saver === 'function') await Promise.resolve(saver.call(context));
   }
-  await native?.getUserAvatars?.(true, avatarId);
+  await native?.getUserAvatars?.(false, avatarId);
   await emitNativeEvent(context, 'PERSONA_CREATED', { avatarId, name: personaName, description: descriptor.description, title: descriptor.title });
   return { id: avatarId, avatarId, name: personaName };
 }
@@ -369,7 +433,7 @@ export async function updateNativePersona(id, patch = {}, context = getStContext
   if (typeof saver === 'function') await Promise.resolve(saver.call(context));
   await emitNativeEvent(context, 'PERSONA_UPDATED', avatarId);
   const native = api || await nativeApi();
-  await native?.getUserAvatars?.(true, avatarId);
+  await native?.getUserAvatars?.(false, avatarId);
   return true;
 }
 
@@ -451,7 +515,7 @@ export async function duplicateNativePersona(id, context = getStContext(), api =
     const saver = context.saveSettingsDebounced ?? context.saveSettings;
     if (typeof saver === 'function') await Promise.resolve(saver.call(context));
   }
-  await native?.getUserAvatars?.(true, newAvatarId);
+  await native?.getUserAvatars?.(false, newAvatarId);
   await emitNativeEvent(context, 'PERSONA_CREATED', { avatarId: newAvatarId, name: personaName, description: descriptor.description || '', title: descriptor.title || '', duplicatedFromAvatarId: avatarId });
   const toast = globalThis.toastr?.success;
   if (typeof toast === 'function') toast.call(globalThis.toastr, `人设“${personaName}”已成功复制`, '砚台 · 人设馆');
@@ -800,6 +864,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

@@ -133,9 +133,11 @@ function galleryOriginalUrl(value) {
   return file ? '/User Avatars/' + encodeURIComponent(file) : '';
 }
 function isThumbnailUrl(value) { return /\/thumbnail(?:\?|$)/i.test(String(value || '')); }
+function isLegacyAvatarUrl(value) { return /\/User(?:%20|\s)Avatars\//i.test(String(value || '')); }
+function isEphemeralUrl(value) { return /^(?:blob|data):/i.test(String(value || '').trim()); }
 function preferGalleryUrl(primary, secondary) {
-  const first = String(primary || '').trim();
-  const second = String(secondary || '').trim();
+  const first = isEphemeralUrl(primary) ? '' : String(primary || '').trim();
+  const second = isEphemeralUrl(secondary) ? '' : String(secondary || '').trim();
   if (first && !isThumbnailUrl(first)) return first;
   if (second && !isThumbnailUrl(second)) return second;
   return first || second;
@@ -167,7 +169,7 @@ export function createStorage({ report = () => {} } = {}) {
       // it before falling back to any legacy non-blob URL.
       const sourceRemote = String(item.remoteUrl || '').trim();
       const sourceUrl = String(item.url || '').trim();
-      const remoteUrl = galleryOriginalUrl(sourceRemote) || galleryOriginalUrl(sourceUrl) || sourceRemote || (sourceUrl && !/^blob:/i.test(sourceUrl) ? sourceUrl : '');
+      const remoteUrl = galleryOriginalUrl(sourceRemote) || galleryOriginalUrl(sourceUrl) || (isEphemeralUrl(sourceRemote) ? '' : sourceRemote) || (isEphemeralUrl(sourceUrl) ? '' : sourceUrl);
       const previewUrl = String(item.previewUrl || (isThumbnailUrl(sourceRemote) ? sourceRemote : isThumbnailUrl(sourceUrl) ? sourceUrl : '')).trim();
       const fallback = remoteUrl || previewUrl;
       result.push({ ...item, remoteUrl, previewUrl, url: makePreview(item.id, blob, fallback) });
@@ -213,16 +215,25 @@ export function createStorage({ report = () => {} } = {}) {
     }
     return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   };
-  // Publish local image bytes through a host-provided uploader.  The host
-  // keeps the actual file on its own server (like native persona avatars),
-  // while IndexedDB remains the fast local cache and offline fallback.
+  // Publish local image bytes through a host-provided uploader.  Legacy
+  // releases stored gallery images in User Avatars; retry those entries too so
+  // they can move to the dedicated image directory and stop polluting the
+  // native persona list.
   const publishAssets = async (items = [], uploader) => {
     const changed = []; const failed = [];
     if (typeof uploader !== 'function') return { changed, failed };
     for (const item of items || []) {
-      if (!item?.id || item.remoteUrl) continue;
+      if (!item?.id) continue;
+      const legacyRemoteUrl = String(item.remoteUrl || '').trim();
+      if (legacyRemoteUrl && !isLegacyAvatarUrl(legacyRemoteUrl)) continue;
       const stored = await getAsset(item.id).catch(() => null);
-      const blob = stored?.blob || item.blob;
+      let blob = stored?.blob || item.blob;
+      if (!blob && legacyRemoteUrl && typeof fetch === 'function') {
+        try {
+          const response = await fetch(legacyRemoteUrl, { cache: 'no-cache' });
+          if (response.ok) blob = await response.blob();
+        } catch (_) { /* leave the old URL in place when the server is offline */ }
+      }
       if (!blob || typeof blob.arrayBuffer !== 'function') continue;
       const mime = String(item.mime || stored?.mime || blob.type || '');
       if (!/^image\//i.test(mime)) continue;
@@ -231,7 +242,7 @@ export function createStorage({ report = () => {} } = {}) {
         const remoteUrl = String(hosted?.remoteUrl || hosted?.url || '').trim();
         if (!remoteUrl) throw new Error('服务器没有返回图库地址');
         const previewUrl = String(hosted?.previewUrl || hosted?.thumbnailUrl || '').trim();
-        const updated = { ...item, remoteUrl, previewUrl, url: remoteUrl, hostedAt: Date.now(), blob };
+        const updated = { ...item, remoteUrl, previewUrl, url: remoteUrl, hostedAt: Date.now(), blob, legacyRemoteUrl: legacyRemoteUrl || '' };
         await putAsset(updated);
         changed.push({ ...updated, blob: undefined });
       } catch (error) {
@@ -241,7 +252,11 @@ export function createStorage({ report = () => {} } = {}) {
     return { changed, failed };
   };
   const clear = async () => { const items = await listAssets(); for (const item of items) { releasePreview(item.id); await deleteAsset(item.id); } };
-  const exportSync = async ({ maxBytes = 8 * 1024 * 1024, removed = {}, includeData = true } = {}) => {
+  // The server-backed image store is the normal path.  Keep a generous
+  // 500 MiB data-URL fallback for older Tavern builds or a temporarily
+  // unavailable image endpoint, instead of silently imposing the old 8 MiB
+  // ceiling on a gallery that may contain full-resolution images.
+  const exportSync = async ({ maxBytes = 500 * 1024 * 1024, removed = {}, includeData = true } = {}) => {
     const items = await listAssets(); const assets = []; const skipped = []; let used = 0;
     for (const item of items) {
       // Hosted files are already shared through the Tavern server.  Keep only
