@@ -101,7 +101,10 @@ class App {
     const groupOptions = '<option value="all" ' + (selectedGroup === 'all' ? 'selected' : '') + '>全部</option>' + groups.map(group => '<option value="' + esc(group.id) + '" ' + (selectedGroup === String(group.id) ? 'selected' : '') + '>' + esc(group.name) + '</option>').join('');
     const selectedCustomGroup = selectedGroup !== 'all' && selectedGroup !== UNCATEGORIZED_GROUP ? groups.find(group => String(group.id) === selectedGroup) : null;
     const groupManage = selectedCustomGroup ? '<span class="ytps-group-manage" role="group" aria-label="管理分组"><button class="ytps-icon-btn ytps-group-manage-btn" data-action="rename-persona-group" data-id="' + esc(selectedCustomGroup.id) + '" title="重命名分组" aria-label="重命名分组"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn ytps-group-manage-btn ytps-danger" data-action="delete-persona-group" data-id="' + esc(selectedCustomGroup.id) + '" title="删除分组" aria-label="删除分组"><i class="fa-solid fa-trash"></i></button></span>' : '';
-    const list = this.state.personas.filter(p => (!q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q)) && (selectedGroup === 'all' || this.personaGroupId(p) === selectedGroup));
+    // SillyTavern keeps native persona entries in insertion order, so the
+    // oldest persona is first and the newest is last. Reverse the filtered
+    // result so recent personas are immediately visible at the top.
+    const list = this.state.personas.filter(p => (!q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q)) && (selectedGroup === 'all' || this.personaGroupId(p) === selectedGroup)).slice().reverse();
     return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><select class="ytps-input ytps-library-group" data-field="libraryGroup" aria-label="筛选人设分组">' + groupOptions + '</select>' + groupManage + '<span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span><button class="ytps-btn ytps-group-create" data-action="create-persona-group"><i class="fa-solid fa-folder-plus"></i> 新建分组</button></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">这个分组里还没有人设。</div>');
   }
   personaBindingLabel(p) {
