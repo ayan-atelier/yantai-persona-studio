@@ -660,7 +660,12 @@
         if (!asset?.blob) throw new Error('找不到这张图片的本地文件，请重新导入。');
         const currentPersona = adapter.readNativePersona();
         const overwriteName = String(targetPersonaId || currentPersona?.id || '');
-        const result = await adapter.uploadNativeAvatar(asset.blob, { resizePrompt: true, overwriteName, createPersona: !overwriteName });
+        if (!overwriteName) throw new Error('请先从已有的人设编辑页进入图库，再应用头像；图片已保留在图库中。');
+        const personas = adapter.readNativePersonas?.() || [];
+        if (personas.length && !personas.some(persona => String(persona?.id || '') === overwriteName)) throw new Error('找不到要应用头像的人设，请重新打开编辑页后再试。');
+        // Gallery application always overwrites an existing persona avatar.
+        // It must never fall through to the native “create persona” branch.
+        const result = await adapter.uploadNativeAvatar(asset.blob, { resizePrompt: true, overwriteName, createPersona: false });
         if (!result?.cancelled) await refresh();
         return result;
       },
