@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.0",
+  "latest": "1.0.1",
   "releases": [
+    {
+      "version": "1.0.1",
+      "branch": "v1.0.1",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆修复版。优化手机端编辑页布局，修复跨设备图库头像裁切应用，并明确新建人设的保存提示。"
+    },
     {
       "version": "1.0.0",
       "branch": "v1.0.0",
