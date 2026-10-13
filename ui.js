@@ -332,14 +332,22 @@ class App {
     if (action === 'remove-asset') return this.call('removeGalleryAsset', el.dataset.id);
     if (action === 'select-asset') { this.state.selectedAssetId = el.dataset.id || ''; this.render(); return this.call('selectGalleryAsset', el.dataset.id); }
     if (action === 'upload-gallery-avatar') {
-      const result = await this.call('uploadGalleryAvatar', el.dataset.id, this.state.editingPersonaId || '');
-      if (!result?.cancelled) {
-        this.state.selectedAssetId = '';
-        this.state.activeTab = 'editor';
-        await this.call('setTab', 'editor');
-        this.render();
+      try {
+        const result = await this.call('uploadGalleryAvatar', el.dataset.id, this.state.editingPersonaId || '');
+        if (!result?.cancelled) {
+          this.state.selectedAssetId = '';
+          this.state.activeTab = 'editor';
+          await this.call('setTab', 'editor');
+          this.render();
+        }
+        return result;
+      } catch (error) {
+        // Remote gallery assets can fail to load (for example after a device
+        // switch). Keep the gallery open and surface the actionable error
+        // instead of leaving the click handler as an unhandled rejection.
+        this.options.report?.(error.message || String(error), 'error');
+        return;
       }
-      return result;
     }
     if (action === 'preview-asset') { this.previewAsset(el.dataset.url, el.dataset.name || '图库预览', el.dataset.fallback || ''); return; }
     if (action === 'lightbox-close') { el.closest('.ytps-lightbox')?.remove?.(); return; }
