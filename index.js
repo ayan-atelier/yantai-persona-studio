@@ -679,8 +679,35 @@
       async addGalleryAssets(files, kind = null) { const added = await storage.importFiles(files, { kind }); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; for (const item of added) delete state.galleryRemoved[item.id]; state.gallery = storage.mergeGallery(state.gallery, added); gallerySyncDirty = true; await save(); return added; },
       async removeGalleryAsset(id) { const removedItem = state.gallery.find(item => String(item?.id || '') === String(id)); await Promise.resolve(adapter.deleteGalleryAsset?.(removedItem?.remoteUrl)).catch(() => {}); state.gallery = state.gallery.filter(item => item.id !== id); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; state.galleryRemoved[String(id)] = Date.now(); storage.releasePreview?.(id); await storage.remove(id); gallerySyncDirty = true; await save(); },
       async uploadGalleryAvatar(id, targetPersonaId = '') {
-        const asset = await storage.getAsset(id);
-        if (!asset?.blob) throw new Error('找不到这张图片的本地文件，请重新导入。');
+        const asset = await storage.getAsset(id).catch(() => null);
+        let blob = asset?.blob;
+        // The IndexedDB Blob is device-local.  A gallery manifest can still
+        // point at the shared SillyTavern image endpoint after another device
+        // imported the image, so recover the original bytes before opening the
+        // native crop dialog instead of asking the user to import it again.
+        if (!blob || typeof blob.arrayBuffer !== 'function') {
+          const item = state.gallery.find(entry => String(entry?.id || '') === String(id));
+          const sources = [asset?.remoteUrl, item?.remoteUrl, asset?.url, item?.url]
+            .map(value => String(value || '').trim())
+            .filter(Boolean);
+          for (const source of sources) {
+            // A blob URL belongs to the browser session that created it and
+            // cannot be resolved on another device. Data URLs remain valid as
+            // a compatibility fallback for older, local-only manifests.
+            if (/^blob:/i.test(source) || typeof fetch !== 'function') continue;
+            const url = /^user\/images\//i.test(source) ? '/' + source : source;
+            try {
+              const response = await fetch(url, { cache: 'no-cache' });
+              if (!response.ok) continue;
+              const recovered = await response.blob();
+              if (recovered && typeof recovered.arrayBuffer === 'function') {
+                blob = recovered;
+                break;
+              }
+            } catch (_) { /* try the next manifest URL */ }
+          }
+        }
+        if (!blob || typeof blob.arrayBuffer !== 'function') throw new Error('找不到这张图片的可用原图，请重新导入。');
         // Applying an avatar is only valid from an existing editor target.
         // Never fall back to the active persona: an empty target must fail
         // safely instead of entering the native create-persona flow.
@@ -690,7 +717,7 @@
         if (personas.length && !personas.some(persona => String(persona?.id || '') === overwriteName)) throw new Error('找不到要应用头像的人设，请重新打开编辑页后再试。');
         // Gallery application always overwrites an existing persona avatar.
         // It must never fall through to the native “create persona” branch.
-        const result = await adapter.uploadNativeAvatar(asset.blob, { resizePrompt: true, overwriteName, createPersona: false });
+        const result = await adapter.uploadNativeAvatar(blob, { resizePrompt: true, overwriteName, createPersona: false });
         if (!result?.cancelled) await refresh();
         return result;
       },
