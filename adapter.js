@@ -56,12 +56,220 @@ export function resolveBinding(bindings = {}, context = getStContext()) {
 }
 
 export function getExtensionSettings(context = getStContext(), extensionId = EXTENSION_ID) { return context?.extensionSettings?.[extensionId] ?? {}; }
-export async function saveExtensionSettings(patch = {}, context = getStContext(), extensionId = EXTENSION_ID) {
+
+// Assistant records used to be keyed by the current user name.  That value is
+// not stable between a phone and a desktop browser, so keep a device-neutral
+// prefix and migrate the old four-part keys when settings are read.
+export const ASSISTANT_THREAD_KEY_VERSION = 'v2';
+const RECOVERY_STORAGE_KEY = 'yantai-persona-studio.recovery.v1';
+const SETTINGS_GET_PATH = '/api/settings/get';
+const SETTINGS_SAVE_PATH = '/api/settings/save';
+
+function keyPart(value, fallback = '') {
+  const text = String(value ?? fallback).trim();
+  return (text || fallback).replace(/[|\s]+/g, '_');
+}
+export function assistantThreadBaseKey(cardKey = 'no-card', chatKey = 'no-chat', session = '') {
+  return [ASSISTANT_THREAD_KEY_VERSION, keyPart(cardKey, 'no-card'), keyPart(chatKey, 'no-chat'), keyPart(session)].join('|');
+}
+export function canonicalAssistantThreadKey(value) {
+  const key = String(value || '');
+  if (!key) return '';
+  const parts = key.split('|');
+  if (parts[0] === ASSISTANT_THREAD_KEY_VERSION) return key;
+  // v1: identity|card|chat|session[|new_timestamp].  Identity is deliberately
+  // dropped; card/chat/session still keep the thread scoped to its target.
+  if (parts.length >= 4) {
+    const base = assistantThreadBaseKey(parts[1], parts[2], parts[3]);
+    return parts.length > 4 ? `${base}|${parts.slice(4).join('|')}` : base;
+  }
+  return key;
+}
+
+function turnSignature(turn = {}) {
+  return JSON.stringify([
+    turn?.at || 0,
+    String(turn?.user || ''),
+    String(turn?.assistant || ''),
+    String(turn?.memory || ''),
+    String(turn?.mode || ''),
+    Array.isArray(turn?.proposals) ? turn.proposals : [],
+  ]);
+}
+function cloneThread(thread, id) {
+  const turns = Array.isArray(thread?.turns) ? thread.turns.map(turn => ({ ...turn })) : [];
+  return {
+    ...(thread && typeof thread === 'object' ? thread : {}),
+    id,
+    turns,
+    createdAt: Number(thread?.createdAt || 0) || Date.now(),
+    updatedAt: Number(thread?.updatedAt || 0) || Number(thread?.createdAt || 0) || Date.now(),
+  };
+}
+export function mergeAssistantThreads(...maps) {
+  const merged = {};
+  for (const source of maps) {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) continue;
+    for (const [rawKey, rawThread] of Object.entries(source)) {
+      if (!rawThread || typeof rawThread !== 'object') continue;
+      const key = canonicalAssistantThreadKey(rawKey) || canonicalAssistantThreadKey(rawThread.id) || String(rawKey);
+      const incoming = cloneThread(rawThread, key);
+      const current = merged[key];
+      if (!current) {
+        merged[key] = incoming;
+        continue;
+      }
+      const turns = [...current.turns, ...incoming.turns];
+      const bySignature = new Map();
+      for (const turn of turns) bySignature.set(turnSignature(turn), turn);
+      current.turns = [...bySignature.values()].sort((a, b) => Number(a?.at || 0) - Number(b?.at || 0));
+      current.createdAt = Math.min(Number(current.createdAt || Date.now()), Number(incoming.createdAt || Date.now()));
+      current.updatedAt = Math.max(Number(current.updatedAt || 0), Number(incoming.updatedAt || 0));
+      if (!current.title && incoming.title) current.title = incoming.title;
+    }
+  }
+  return merged;
+}
+
+function mergeById(remote = [], local = []) {
+  const values = new Map();
+  for (const item of Array.isArray(remote) ? remote : []) {
+    const id = String(item?.id || '');
+    if (id) values.set(id, { ...item });
+  }
+  for (const item of Array.isArray(local) ? local : []) {
+    const id = String(item?.id || '');
+    if (!id) continue;
+    const old = values.get(id);
+    if (!old || Number(item?.updatedAt || 0) > Number(old?.updatedAt || 0)) values.set(id, { ...old, ...item });
+  }
+  return [...values.values()];
+}
+function mergeGallerySync(remote, local) {
+  if (!remote || typeof remote !== 'object') return local;
+  if (!local || typeof local !== 'object') return remote;
+  const assets = mergeById(remote.assets, local.assets);
+  const removed = { ...(remote.removed || {}) };
+  for (const [id, at] of Object.entries(local.removed || {})) removed[id] = Math.max(Number(removed[id] || 0), Number(at || 0));
+  return { ...remote, ...local, assets, removed, updatedAt: Math.max(Number(remote.updatedAt || 0), Number(local.updatedAt || 0)) };
+}
+export function mergeExtensionState(remote = {}, local = {}) {
+  const remoteState = remote && typeof remote === 'object' ? remote : {};
+  const localState = local && typeof local === 'object' ? local : {};
+  const merged = { ...remoteState, ...localState };
+  if (remoteState.versionBackup || localState.versionBackup) {
+    const remoteBackupAt = Date.parse(remoteState.versionBackup?.savedAt || '') || 0;
+    const localBackupAt = Date.parse(localState.versionBackup?.savedAt || '') || 0;
+    merged.versionBackup = localBackupAt > remoteBackupAt ? localState.versionBackup : remoteState.versionBackup;
+  }
+  merged.personaMeta = { ...(remoteState.personaMeta || {}), ...(localState.personaMeta || {}) };
+  merged.personaGroups = mergeById(remoteState.personaGroups, localState.personaGroups);
+  merged.drafts = mergeById(remoteState.drafts, localState.drafts).sort((a, b) => Number(b?.updatedAt || b?.createdAt || 0) - Number(a?.updatedAt || a?.createdAt || 0));
+  merged.gallery = mergeById(remoteState.gallery, localState.gallery);
+  merged.galleryRemoved = { ...(remoteState.galleryRemoved || {}) };
+  for (const [id, at] of Object.entries(localState.galleryRemoved || {})) merged.galleryRemoved[id] = Math.max(Number(merged.galleryRemoved[id] || 0), Number(at || 0));
+  merged.gallerySync = mergeGallerySync(remoteState.gallerySync, localState.gallerySync);
+  merged.assistantThreads = mergeAssistantThreads(remoteState.assistantThreads, localState.assistantThreads);
+  const localActive = canonicalAssistantThreadKey(localState.assistantActiveThreadKey);
+  const remoteActive = canonicalAssistantThreadKey(remoteState.assistantActiveThreadKey);
+  const activeCandidates = [localActive, remoteActive].filter(Boolean);
+  const freshCandidates = activeCandidates.filter(key => /\|new_[^|]+$/.test(key) && merged.assistantThreads[key])
+    .sort((a, b) => Number(merged.assistantThreads[b]?.updatedAt || 0) - Number(merged.assistantThreads[a]?.updatedAt || 0))[0] || '';
+  const newestTurnAt = Object.values(merged.assistantThreads)
+    .filter(thread => Array.isArray(thread?.turns) && thread.turns.length)
+    .reduce((latest, thread) => Math.max(latest, Number(thread?.updatedAt || 0)), 0);
+  const explicitNewAt = Number(localState.assistantActiveThreadChangedAt || 0);
+  const freshThread = freshCandidates && (!merged.assistantThreads[freshCandidates]?.turns?.length
+    ? explicitNewAt > newestTurnAt ? freshCandidates : ''
+    : freshCandidates);
+  const nonEmpty = activeCandidates.find(key => merged.assistantThreads[key]?.turns?.length);
+  const latest = Object.entries(merged.assistantThreads)
+    .filter(([, thread]) => Array.isArray(thread?.turns) && thread.turns.length)
+    .sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0))[0]?.[0] || '';
+  merged.assistantActiveThreadKey = freshThread || latest || nonEmpty || localActive || remoteActive || '';
+  merged.ui = { ...(remoteState.ui || {}), ...(localState.ui || {}) };
+  return merged;
+}
+
+function requestHeaders(context = {}) {
+  const getter = context?.getRequestHeaders || globalThis.getRequestHeaders;
+  try {
+    const value = typeof getter === 'function' ? getter() : {};
+    const headers = value && typeof value === 'object' ? { ...value } : {};
+    if (!Object.keys(headers).some(key => key.toLowerCase() === 'content-type')) headers['Content-Type'] = 'application/json';
+    return headers;
+  } catch (_) { return {}; }
+}
+async function readRemoteSettings(context = {}) {
+  const request = globalThis.fetch;
+  if (typeof request !== 'function') throw new Error('当前酒馆没有可用的网络接口。');
+  const response = await request(SETTINGS_GET_PATH, { method: 'POST', headers: requestHeaders(context), body: JSON.stringify({}), cache: 'no-cache' });
+  if (!response?.ok) throw new Error(`读取酒馆设置失败（${response?.status || '网络错误'}）。`);
+  const data = await response.json();
+  if (data?.result === 'file not find') throw new Error('酒馆尚未返回设置快照。');
+  const rawSettings = data?.settings ?? (data?.extension_settings || data?.extensionSettings ? data : null);
+  if (!rawSettings) throw new Error('酒馆尚未返回设置快照。');
+  const settings = typeof rawSettings === 'string' ? JSON.parse(rawSettings) : rawSettings;
+  if (!settings || typeof settings !== 'object') throw new Error('酒馆设置快照格式无效。');
+  return settings;
+}
+export async function fetchRemoteExtensionState(context = {}, extensionId = EXTENSION_ID) {
+  const settings = await readRemoteSettings(context);
+  return settings?.extension_settings?.[extensionId] ?? settings?.extensionSettings?.[extensionId] ?? {};
+}
+function recoveryStorage(root = globalThis) {
+  try { return root?.localStorage || null; } catch (_) { return null; }
+}
+function recoverySnapshot(state = {}) {
+  const copy = JSON.parse(JSON.stringify(state || {}, (key, value) => key === 'blob' || key === 'data' ? undefined : value));
+  return { savedAt: Date.now(), state: copy };
+}
+export function writeRecoveryBackup(state = {}, root = globalThis) {
+  const storage = recoveryStorage(root);
+  if (!storage) return false;
+  try { storage.setItem(RECOVERY_STORAGE_KEY, JSON.stringify(recoverySnapshot(state))); return true; } catch (_) { return false; }
+}
+export function readRecoveryBackup(root = globalThis) {
+  const storage = recoveryStorage(root);
+  if (!storage) return null;
+  try {
+    const value = JSON.parse(storage.getItem(RECOVERY_STORAGE_KEY) || 'null');
+    return value?.state && typeof value.state === 'object' ? value : null;
+  } catch (_) { return null; }
+}
+function remoteStateSnapshot(state = {}) {
+  const copy = { ...(state && typeof state === 'object' ? state : {}) };
+  // Image bytes belong in the shared image endpoint or the gallery sync
+  // manifest. Do not duplicate data URLs/Blob placeholders in full settings;
+  // that can make a normal tab save exceed the host settings payload limit.
+  if (Array.isArray(copy.gallery)) copy.gallery = copy.gallery.map(item => {
+    if (!item || typeof item !== 'object') return item;
+    const { blob, data, ...metadata } = item;
+    return metadata;
+  });
+  return copy;
+}
+async function saveRemoteSettings(state, context = {}, extensionId = EXTENSION_ID) {
+  // Keep a device-local copy before any network operation.  This is the last
+  // line of recovery if a mobile tab is still open but its server write fails.
+  writeRecoveryBackup(state);
+  const remote = await readRemoteSettings(context);
+  const remoteExtension = remote?.extension_settings?.[extensionId] ?? remote?.extensionSettings?.[extensionId] ?? {};
+  const mergedExtension = mergeExtensionState(remoteExtension, remoteStateSnapshot(state));
+  writeRecoveryBackup(mergedExtension);
+  const payload = { ...remote, extension_settings: { ...(remote.extension_settings || {}), [extensionId]: mergedExtension } };
+  if (remote.extensionSettings) payload.extensionSettings = { ...remote.extensionSettings, [extensionId]: mergedExtension };
+  const request = globalThis.fetch;
+  const response = await request(SETTINGS_SAVE_PATH, { method: 'POST', headers: requestHeaders(context), body: JSON.stringify(payload), cache: 'no-cache' });
+  if (!response?.ok) throw new Error(`保存酒馆设置失败（${response?.status || '网络错误'}）。`);
   const settings = context.extensionSettings ?? (context.extensionSettings = {});
-  settings[extensionId] = { ...(settings[extensionId] ?? {}), ...patch };
-  const saver = context.saveSettingsDebounced ?? context.saveSettings;
-  if (typeof saver === 'function') await Promise.resolve(saver.call(context));
-  return settings[extensionId];
+  settings[extensionId] = mergedExtension;
+  writeRecoveryBackup(mergedExtension);
+  return mergedExtension;
+}
+export async function saveExtensionSettings(patch = {}, context = getStContext(), extensionId = EXTENSION_ID) {
+  const local = { ...getExtensionSettings(context, extensionId), ...(patch || {}) };
+  return saveRemoteSettings(local, context, extensionId);
 }
 export function getChatMetadata(context = getStContext()) { return context?.chatMetadata ?? context?.chat_metadata ?? {}; }
 export async function saveChatMetadata(patch = {}, context = getStContext()) {
@@ -246,33 +454,11 @@ export async function deleteGalleryAsset(remoteUrl, { context = getStContext() }
 
 /** Remove a legacy gallery file that was accidentally uploaded as an avatar. */
 export async function removeLegacyGalleryAvatar(file, { context = getStContext() } = {}) {
-  const avatar = avatarFileName(file);
-  if (!avatar || !/^ytps-/i.test(avatar)) return false;
-  const settings = powerSettings(context);
-  const personaName = settings.personas?.[avatar];
-  const current = currentNativeId(context);
-  const defaultId = settings.default_persona ?? settings.defaultPersona ?? null;
-  // Never remove a file that has become a real/current/default persona.  An
-  // unregistered file, or the exact silent placeholder created by ST's
-  // addMissingPersonas(), is safe to clean after its gallery copy is moved.
-  if (String(current || '') === avatar || String(defaultId || '') === avatar) return false;
-  if (personaName && personaName !== '[Unnamed Persona]') return false;
-  const scriptModule = await import('/scripts/script.js').catch(() => ({}));
-  const getHeaders = scriptModule.getRequestHeaders || context?.getRequestHeaders || globalThis.getRequestHeaders;
-  const headers = typeof getHeaders === 'function' ? getHeaders() : {};
-  headers['Content-Type'] = 'application/json';
-  const response = await fetch('/api/avatars/delete', {
-    method: 'POST', headers, cache: 'no-cache', body: JSON.stringify({ avatar }),
-  });
-  if (!response.ok) return false;
-  if (personaName === '[Unnamed Persona]') {
-    delete settings.personas[avatar];
-    if (settings.persona_descriptions) delete settings.persona_descriptions[avatar];
-    const saver = context.saveSettingsDebounced ?? context.saveSettings;
-    if (typeof saver === 'function') await Promise.resolve(saver.call(context));
-    await emitNativeEvent(context, 'PERSONA_DELETED', avatar);
-  }
-  return true;
+  // Legacy cleanup is intentionally disabled while settings may be stale on a
+  // second device.  Deleting a file from User Avatars can delete a persona
+  // that was created or edited on the phone.  A later maintenance pass can
+  // remove these files after a server-side persona list has been confirmed.
+  return false;
 }
 
 /** Create a persona directly from the extension workspace without opening the native drawer. */
@@ -810,6 +996,13 @@ export async function snapshot(context = getStContext()) {
 export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', report = () => {} } = {}) {
   const context = () => getStContext(); const listeners = new Map(); const hookedButtons = new Set(); const ownedQuickEntries = new Set(); let native = null;
   const loadNativeApi = async () => { if (!native) native = await nativeApi(); return native; };
+  const refreshNativePersonas = async () => {
+    const api = await loadNativeApi();
+    // `false` is deliberate: the rendering path's default can register
+    // unlisted avatar files as [Unnamed Persona] entries.
+    await api?.getUserAvatars?.(false);
+    return api;
+  };
   const on = (name, fn) => {
     const ctx = context(); const source = ctx.eventSource; const types = ctx.eventTypes || ctx.event_types || {}; const type = types[name] || name;
     if (!source?.on || typeof fn !== 'function') return;
@@ -848,9 +1041,47 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     const block = document.querySelector('#persona-management-block');
     block?.classList.remove('ytps-takeover', 'ytps-native-edit');
   };
-  const loadExtensionState = async (fallback = {}) => ({ ...fallback, ...getExtensionSettings(context(), namespace) });
+  const recoveryMerge = (state, backup) => {
+    const backupThreads = backup?.state?.assistantThreads;
+    if (!backupThreads || typeof backupThreads !== 'object') return state;
+    const current = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
+    const newer = {};
+    for (const [rawKey, thread] of Object.entries(backupThreads)) {
+      const key = canonicalAssistantThreadKey(rawKey);
+      const existing = current[key];
+      if (!existing || Number(thread?.updatedAt || 0) > Number(existing?.updatedAt || 0)) newer[key] = thread;
+    }
+    if (Object.keys(newer).length) {
+      state.assistantThreads = mergeAssistantThreads(current, newer);
+      const newest = Object.entries(state.assistantThreads)
+        .filter(([, item]) => Array.isArray(item?.turns) && item.turns.length)
+        .sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0))[0]?.[0];
+      if (newest) state.assistantActiveThreadKey = newest;
+    }
+    return state;
+  };
+  const loadExtensionState = async (fallback = {}) => {
+    const ctx = context();
+    const local = { ...fallback, ...getExtensionSettings(ctx, namespace) };
+    let remote = {};
+    try { remote = await fetchRemoteExtensionState(ctx, namespace); } catch (_) { /* offline startup: do not write until a fresh read succeeds */ }
+    const merged = mergeExtensionState(remote, local);
+    // Version switching in older builds stored a full extension snapshot. If
+    // the current map was overwritten, use that snapshot as another guarded
+    // source of assistant turns; newer explicit clears still win by timestamp.
+    recoveryMerge(merged, { state: merged.versionBackup?.settings });
+    recoveryMerge(merged, readRecoveryBackup());
+    writeRecoveryBackup(merged);
+    const settings = ctx.extensionSettings ?? (ctx.extensionSettings = {});
+    settings[namespace] = merged;
+    return merged;
+  };
   const saveExtensionState = async state => saveExtensionSettings(state, context(), namespace);
-  const normalizeState = state => ({ ...state, version: Math.max(Number(state?.version || 0), 3), personaMeta: state?.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {}, personaGroups: Array.isArray(state?.personaGroups) ? state.personaGroups.filter(group => group && typeof group === 'object' && String(group.id || '').trim() && String(group.name || '').trim()).map(group => ({ id: String(group.id), name: String(group.name).trim().slice(0, 40), createdAt: Number(group.createdAt || 0) || Date.now() })) : [], drafts: Array.isArray(state?.drafts) ? state.drafts : [], gallery: Array.isArray(state?.gallery) ? state.gallery : [], assistantThreads: state?.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {}, assistantActiveThreadKey: String(state?.assistantActiveThreadKey || ''), ui: { tab: 'current', libraryGroup: 'all', ...(state?.ui || {}) } });
+  const normalizeState = state => {
+    const value = state && typeof state === 'object' ? state : {};
+    const threads = mergeAssistantThreads(value.assistantThreads);
+    return { ...value, version: Math.max(Number(value.version || 0), 3), personaMeta: value.personaMeta && typeof value.personaMeta === 'object' ? value.personaMeta : {}, personaGroups: Array.isArray(value.personaGroups) ? value.personaGroups.filter(group => group && typeof group === 'object' && String(group.id || '').trim() && String(group.name || '').trim()).map(group => ({ id: String(group.id), name: String(group.name).trim().slice(0, 40), createdAt: Number(group.createdAt || 0) || Date.now() })) : [], drafts: Array.isArray(value.drafts) ? value.drafts : [], gallery: Array.isArray(value.gallery) ? value.gallery : [], assistantThreads: threads, assistantActiveThreadKey: canonicalAssistantThreadKey(value.assistantActiveThreadKey) || '', ui: { tab: 'current', libraryGroup: 'all', ...(value.ui || {}) } };
+  };
   const nativePersonas = () => listNativePersonas(context(), native);
   const resolvePersona = ({ state, target: passedTarget } = {}) => { const ctx = context(); const nativeBindings = readPersonaBindings(ctx, namespace); const binding = resolveBinding({ ...nativeBindings, session: state?.sessionOverride ?? nativeBindings.session }, ctx); const all = listNativePersonas(ctx, native); const persona = all.find(item => String(item.id) === String(binding.personaId)) || (binding.scope === 'none' ? readNativePersona(ctx, native) : null); return { ...binding, persona, target: passedTarget || { cardKey: getCardFingerprint(ctx), chatKey: getChatId(ctx) || 'current-chat' }, all }; };
   const writeBinding = async ({ scope, mode, personaId = null }) => setNativeBinding(scope, mode === 'none' ? null : personaId, context(), await nativeApi());
@@ -864,6 +1095,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, refreshNativePersonas, loadExtensionState, saveExtensionState, normalizeState, assistantThreadBaseKey, canonicalAssistantThreadKey, mergeAssistantThreads, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

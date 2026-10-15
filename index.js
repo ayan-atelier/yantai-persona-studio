@@ -233,13 +233,11 @@
     const ctx = adapter.context();
     return { chatId: adapter.chatKey(ctx), cardKey: adapter.cardFingerprint(ctx), character: adapter.currentCharacter(ctx), chatTitle: adapter.chatTitle(ctx) };
   }
-  function assistantIdentity() {
-    const ctx = adapter.context() || {};
-    const user = ctx.user || ctx.currentUser || ctx.userProfile || {};
-    return String(ctx.userId ?? ctx.user_id ?? user.id ?? ctx.userName ?? ctx.user_name ?? user.name ?? user.username ?? 'local-session');
-  }
   function assistantThreadKey(target = activeTarget()) {
-    return [assistantIdentity(), target.cardKey || 'no-card', target.chatId || 'no-chat', state?.sessionOverride || ''].map(value => String(value).replace(/[|\s]+/g, '_')).join('|');
+    // The thread belongs to the card/chat/session, not to the browser user
+    // identity.  adapter.normalizeState migrates the old identity-prefixed
+    // keys when the extension starts.
+    return adapter.assistantThreadBaseKey(target.cardKey || 'no-card', target.chatId || 'no-chat', state?.sessionOverride || '');
   }
   function ensureAssistantThread(key = assistantThreadKey()) {
     state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
@@ -319,7 +317,8 @@
     const contextSnapshot = await adapter.contextSnapshot();
     app.update({ state, target: activeTarget(), current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas: adapter.readNativePersonas(), nativeGallery: nativeGallery(), contextSnapshot });
   }
-  async function save() {
+  let saveQueue = Promise.resolve();
+  async function persistState() {
     // Settings are shared through the host, so merge assistant turns with the
     // latest persisted snapshot before writing. This prevents another device
     // or tab from replacing an entire thread map with its older copy.
@@ -371,12 +370,9 @@
       const hosted = await storage.publishAssets(state.gallery, async (blob, item) => adapter.uploadGalleryAsset?.(blob, { assetId: item.id }));
       if (hosted.changed.length) {
         state.gallery = storage.mergeGallery(state.gallery, hosted.changed);
-        // Releases before the API fix put gallery images in User Avatars.
-        // Remove only our deterministic ytps-* files after a successful move;
-        // native persona files are left untouched.
-        for (const item of hosted.changed) {
-          if (item?.legacyRemoteUrl) await Promise.resolve(adapter.removeLegacyGalleryAvatar?.(item.legacyRemoteUrl)).catch(() => {});
-        }
+        // Legacy gallery files remain in User Avatars until a server-side
+        // persona list confirms they are not in use.  Deleting them here can
+        // remove a persona created on another device from a stale browser.
         gallerySyncDirty = true;
       }
       if (hosted.failed.length) report(`图库服务器同步失败 ${hosted.failed.length} 张，当前设备仍保留本地副本。`, 'warning');
@@ -403,7 +399,17 @@
         gallerySync = { ...nextGallerySync, version: 2, provider: 'tavern-user-images' }; gallerySyncDirty = false;
       }
     }
-    await adapter.saveExtensionState(gallerySync ? { ...state, gallerySync } : state); await refresh();
+    const persisted = await adapter.saveExtensionState(gallerySync ? { ...state, gallerySync } : state);
+    state = adapter.normalizeState({ ...state, ...persisted });
+    await refresh();
+  }
+  // Serialize writes from tab changes, gallery migration, and Milo replies.
+  // Without a queue, two local saves could read the same remote snapshot and
+  // let the slower stale request win after the newer one.
+  function save() {
+    const next = saveQueue.then(persistState, persistState);
+    saveQueue = next.catch(() => {});
+    return next;
   }
 
   function showVersionManager() {
@@ -526,6 +532,9 @@
     initialized = true;
     await loadModules();
     await loadState();
+    // Refresh the native persona list from the server without invoking the
+    // rendering helper that can register stray avatar files as new personas.
+    await adapter.refreshNativePersonas?.().catch(() => {});
     registerControlModule();
     app = ui.createApp({ version: VERSION, adapter, storage, actions: {}, report, getState: () => ({ state, target: activeTarget(), current: resolved() }) });
     const actions = {
@@ -755,6 +764,7 @@
         const target = activeTarget();
         const key = assistantThreadKey(target) + '|new_' + Date.now().toString(36);
         state.assistantActiveThreadKey = key;
+        state.assistantActiveThreadChangedAt = Date.now();
         state.assistantThreads[key] = { id: key, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
         await save();
         return state.assistantThreads[key];
@@ -781,9 +791,9 @@
       state: () => state,
     };
     app.options.actions = actions;
-    if (state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) {
-      await save().catch(error => report(`图库迁移失败：${error?.message || error}，当前设备副本未删除。`, 'warning'));
-    }
+    // Do not auto-save a gallery migration during startup.  Older versions
+    // could reach this branch with a stale full settings snapshot and overwrite
+    // a phone's newly-created persona before the user touched the extension.
     adapter.on('CHAT_CHANGED', refresh);
     adapter.on('CHARACTER_CHANGED', refresh);
     adapter.on('PERSONA_CHANGED', refresh);
