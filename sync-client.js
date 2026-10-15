@@ -261,6 +261,7 @@ export function createSyncClient({
   storage = globalThis.localStorage,
   deviceStorageKey = DEVICE_STORAGE_KEY,
   requestIdFactory = () => randomId('request-'),
+  getRequestHeaders = null,
   headers: extraHeaders = {},
   clientVersion = '',
 } = {}) {
@@ -269,14 +270,19 @@ export function createSyncClient({
   const stateEndpoint = /\/state\/?$/.test(String(endpoint)) ? String(endpoint).replace(/\/$/, '') : route(root, 'state');
   let revision = null;
 
-  const makeHeaders = (requestId = '') => ({
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    'X-Yantai-Device-Id': resolvedDeviceId,
-    ...(clientVersion ? { 'X-Yantai-Client-Version': String(clientVersion) } : {}),
-    ...(requestId ? { 'X-Yantai-Request-Id': requestId } : {}),
-    ...extraHeaders,
-  });
+  const makeHeaders = (requestId = '') => {
+    let hostHeaders = {};
+    try { if (typeof getRequestHeaders === 'function') hostHeaders = getRequestHeaders({ omitContentType: false }) || {}; } catch (_) { /* caller headers are optional */ }
+    return {
+      ...hostHeaders,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'X-Yantai-Device-Id': resolvedDeviceId,
+      ...(clientVersion ? { 'X-Yantai-Client-Version': String(clientVersion) } : {}),
+      ...(requestId ? { 'X-Yantai-Request-Id': requestId } : {}),
+      ...extraHeaders,
+    };
+  };
 
   const request = async (url, { method = 'GET', body, baseRevision = null, requestId = '', signal, headers = {}, backup = false } = {}) => {
     const mergedHeaders = { ...makeHeaders(requestId), ...headers };
