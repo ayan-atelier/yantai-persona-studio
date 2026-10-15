@@ -36,6 +36,32 @@ export function characterFingerprint(character = {}, context = {}) {
   return 'card_' + fnv1a(source);
 }
 export function getCardFingerprint(context = getStContext()) { return characterFingerprint(getCurrentCharacter(context), context); }
+// Prefer the native card/avatar file id. The full content fingerprint changes
+// whenever a card is edited and therefore is only a legacy migration alias.
+export function getStableCardKey(context = getStContext()) {
+  const id = getCharacterId(context);
+  return id ? 'card_id_' + encodeURIComponent(String(id)) : getCardFingerprint(context);
+}
+
+/**
+ * Stable identity for a persona-assistant conversation. It deliberately uses
+ * only the current card and chat, so a phone and a desktop open the same
+ * conversation instead of creating device-specific silos. UI selection is
+ * kept local to each browser; this key is only for shared records.
+ */
+export function personaTargetKey(target = {}) {
+  const clean = value => String(value ?? '').trim().replace(/[|\s]+/g, '_') || 'none';
+  return [clean(target.cardKey || target.cardFingerprint || 'no-card'), clean(target.chatId || target.chatKey || 'no-chat')].join('|');
+}
+
+export function threadMatchesTarget(thread = {}, target = {}) {
+  if (!thread || typeof thread !== 'object') return false;
+  const record = thread.target && typeof thread.target === 'object' ? thread.target : thread;
+  const card = record.cardKey || record.cardFingerprint;
+  const chat = record.chatId || record.chatKey;
+  if (card || chat) return personaTargetKey({ cardKey: card, chatId: chat }) === personaTargetKey(target);
+  return false;
+}
 
 function normalizeBinding(value) {
   if (!value) return null;
@@ -245,7 +271,7 @@ export async function deleteGalleryAsset(remoteUrl, { context = getStContext() }
 }
 
 /** Remove a legacy gallery file that was accidentally uploaded as an avatar. */
-export async function removeLegacyGalleryAvatar(file, { context = getStContext() } = {}) {
+export async function removeLegacyGalleryAvatar(file, { context = getStContext(), cleanupSettings = false } = {}) {
   const avatar = avatarFileName(file);
   if (!avatar || !/^ytps-/i.test(avatar)) return false;
   const settings = powerSettings(context);
@@ -265,7 +291,12 @@ export async function removeLegacyGalleryAvatar(file, { context = getStContext()
     method: 'POST', headers, cache: 'no-cache', body: JSON.stringify({ avatar }),
   });
   if (!response.ok) return false;
-  if (personaName === '[Unnamed Persona]') {
+  // Removing the image is safe and independent.  Removing the placeholder
+  // entry from power_user/settings.json requires a full settings write, which
+  // can race another device.  Keep that cleanup opt-in for an explicit,
+  // user-controlled maintenance action; normal gallery migration must never
+  // trigger it.
+  if (cleanupSettings && personaName === '[Unnamed Persona]') {
     delete settings.personas[avatar];
     if (settings.persona_descriptions) delete settings.persona_descriptions[avatar];
     const saver = context.saveSettingsDebounced ?? context.saveSettings;
@@ -864,6 +895,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getCardFingerprint(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async () => snapshot(context()), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
-export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };
+export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext, getStableCardKey };

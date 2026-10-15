@@ -68,6 +68,34 @@
   let versionManager = null;
   let gallerySync = null;
   let gallerySyncDirty = true;
+  let syncClient = null;
+  let syncRevision = null;
+  let syncStatus = 'checking';
+  let syncRemoteState = null;
+  // The selected assistant thread is a browser-local navigation choice. It
+  // must never be persisted in shared settings, otherwise opening the plugin
+  // on another device can switch that device into the wrong page. Keep the
+  // choice in localStorage so a reload on the same device does not hide a
+  // freshly-created thread.
+  const LOCAL_THREAD_STORAGE_BASE = `${NS}.assistant-thread.v1`;
+  function threadStorage() { try { return root.sessionStorage || root.localStorage; } catch (_) { return null; } }
+  function storageScope() {
+    let context = null;
+    try { context = root.SillyTavern?.getContext?.() || null; } catch (_) { /* use the origin fallback */ }
+    const user = context?.user?.profile || context?.user || context?.currentUser || {};
+    const identity = user?.handle || user?.username || user?.id || context?.userId || root.location?.origin || 'local';
+    return encodeURIComponent(String(identity)).replace(/%/g, '_').slice(0, 120) || 'local';
+  }
+  function scopedStorageKey(base) { return `${base}.${storageScope()}`; }
+  function readLocalAssistantThreadKey() {
+    try { return String(threadStorage()?.getItem(scopedStorageKey(LOCAL_THREAD_STORAGE_BASE)) || ''); } catch (_) { return ''; }
+  }
+  function writeLocalAssistantThreadKey(value) {
+    try { if (value) threadStorage()?.setItem(scopedStorageKey(LOCAL_THREAD_STORAGE_BASE), String(value)); else threadStorage()?.removeItem(scopedStorageKey(LOCAL_THREAD_STORAGE_BASE)); } catch (_) { /* private mode or quota */ }
+  }
+  let localAssistantThreadKey = readLocalAssistantThreadKey();
+  let assistantGenerationToken = 0;
+  let refreshSequence = 0;
 
   function controlRegistry() {
     const existing = root[CONTROL_REGISTRY_KEY];
@@ -96,14 +124,16 @@
         return {
           installed: true,
           enabled: state?.enabled !== false,
-          health: missingPreview ? 'degraded' : 'ok',
+          health: missingPreview || ['unavailable', 'error', 'conflict', 'needs-migration'].includes(syncStatus) ? 'degraded' : 'ok',
           sources: [
-            { kind: 'host-settings', namespace: NS, scope: 'host', portable: 'partial', readable: true, writable: true },
+            { kind: 'persona-sync-server', namespace: NS, scope: 'server', portable: 'yes', readable: syncStatus !== 'unavailable', writable: syncStatus === 'ready' },
+            { kind: 'host-settings-legacy', namespace: NS, scope: 'host', portable: 'backup-only', readable: true, writable: false },
             { kind: 'indexeddb', namespace: 'yantai-persona-studio/assets', scope: 'device', portable: 'no', readable: true, writable: true, count: gallery.length, missingCount: missingPreview },
           ],
           checks: [
             { id: 'gallery-preview', label: '图库预览', status: missingPreview ? 'degraded' : 'ok', detail: missingPreview ? `${missingPreview} 项只有元数据，当前设备没有可用预览` : `本设备可预览 ${previewCount} 项` },
             { id: 'assistant-history', label: 'Milo 记录', status: 'ok', detail: `${Object.keys(threads).length} 个对话线程保存在人设馆设置中` },
+            { id: 'sync', label: '安全同步', status: syncStatus === 'ready' ? 'ok' : 'degraded', detail: syncStatus === 'ready' ? `服务端版本 ${syncRevision || '0'}` : syncStatus === 'needs-migration' ? '等待明确迁移旧版记录' : syncStatus === 'conflict' ? '存在待处理冲突，已停止覆盖' : '同步服务未连接' },
             { id: 'context', label: '当前酒馆上下文', status: ctx ? 'ok' : 'unknown', detail: root.location?.origin || '当前来源未知' },
           ],
         };
@@ -111,7 +141,8 @@
       open(options = {}) { return open(options); },
       async setEnabled(value) {
         state.enabled = Boolean(value);
-        await save();
+        writeLocalSettings({ enabled: state.enabled });
+        await refresh();
         if (!state.enabled) {
           lastNativeOpen = null;
           editMode = false;
@@ -132,6 +163,7 @@
         root.dispatchEvent?.(new CustomEvent('yantai:control:updated'));
         return state.enabled;
       },
+      async migrateToSafeSync() { const result = await migrateToSafeSync(); updateSettingsUi(); return result; },
     };
     registry.modules.set(NS, controlModule);
     root.dispatchEvent?.(new CustomEvent('yantai:control:updated'));
@@ -143,6 +175,32 @@
     root.dispatchEvent?.(new CustomEvent('yantai:control:updated'));
     controlModule = null;
   }
+
+  const localSettingBase = 'yantai-persona-studio.local-settings.v1';
+  function localSettingKey() { return scopedStorageKey(localSettingBase); }
+  function readLocalSettings() {
+    try {
+      const value = JSON.parse(globalThis.localStorage?.getItem(localSettingKey()) || '{}');
+      return value && typeof value === 'object' ? value : {};
+    } catch (_) { return {}; }
+  }
+  function writeLocalSettings(patch = {}) {
+    try {
+      const current = readLocalSettings();
+      globalThis.localStorage?.setItem(localSettingKey(), JSON.stringify({ ...current, ...patch }));
+    } catch (_) { /* private mode or quota */ }
+  }
+  function pendingStateKey() { return scopedStorageKey('yantai-persona-studio.pending-sync.v1'); }
+  function queuePendingState(value) {
+    try { globalThis.localStorage?.setItem(pendingStateKey(), JSON.stringify(value)); } catch (_) { /* keep the in-memory copy */ }
+  }
+  function readPendingState() {
+    try {
+      const value = JSON.parse(globalThis.localStorage?.getItem(pendingStateKey()) || 'null');
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    } catch (_) { return null; }
+  }
+  function clearPendingState() { try { globalThis.localStorage?.removeItem(pendingStateKey()); } catch (_) {} }
 
   function stopObserver() {
     observer?.disconnect?.();
@@ -175,11 +233,12 @@
 
   async function loadModules() {
     const base = new URL('.', import.meta.url);
-    const [adapterModule, storageModule, uiModule, aiModule] = await Promise.all([
+    const [adapterModule, storageModule, uiModule, aiModule, syncModule] = await Promise.all([
       import(new URL('./adapter.js', base)),
       import(new URL('./storage.js', base)),
       import(new URL('./ui.js', base)),
       import(new URL('./ai.js', base)),
+      import(new URL('./sync-client.js', base)),
     ]);
     adapter = adapterModule.createAdapter({ namespace: NS, version: VERSION, report });
     // Load the real native persona module once so the current selection and
@@ -188,6 +247,9 @@
     storage = storageModule.createStorage({ namespace: NS, report });
     ui = uiModule;
     ai = aiModule.createAiHelper({ namespace: NS, version: VERSION, adapter, report });
+    const context = adapter.context();
+    const getter = context?.getRequestHeaders || globalThis.getRequestHeaders;
+    syncClient = syncModule.createSyncClient({ getRequestHeaders: typeof getter === 'function' ? getter.bind(context) : null, clientVersion: VERSION });
   }
 
   function defaultState() {
@@ -195,6 +257,98 @@
     // native persona store.  A missing groupId deliberately means “未分类”,
     // so older settings remain compatible without a migration pass.
     return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, assistantThreads: {}, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
+  }
+
+  function sharedState(source = state) {
+    const value = source && typeof source === 'object' ? source : {};
+    const { ui: _ui, assistantActiveThreadKey: _active, sessionOverride: _session, enabled: _enabled, ...shared } = value;
+    if (shared.gallerySync && typeof shared.gallerySync === 'object') {
+      const gallerySync = { ...shared.gallerySync };
+      if (Array.isArray(gallerySync.assets)) {
+        gallerySync.assets = gallerySync.assets.map(item => {
+          const copy = { ...item };
+          for (const key of ['data', 'blob', 'base64', 'url', 'remoteUrl', 'previewUrl', 'thumbnailUrl']) {
+            if (/^(?:data:|blob:)/i.test(String(copy[key] || ''))) delete copy[key];
+          }
+          return copy;
+        });
+      }
+      shared.gallerySync = gallerySync;
+    }
+    if (Array.isArray(shared.gallery)) {
+      const fields = ['id', 'kind', 'name', 'mime', 'size', 'hash', 'createdAt', 'updatedAt', 'remoteUrl', 'previewUrl', 'thumbnailUrl', 'source', 'avatarId'];
+      shared.gallery = shared.gallery.map(item => {
+        const copy = {};
+        for (const field of fields) if (item?.[field] !== undefined) copy[field] = item[field];
+        for (const field of ['url', 'remoteUrl', 'previewUrl', 'thumbnailUrl']) {
+          if (/^(?:data:|blob:)/i.test(String(copy[field] || ''))) delete copy[field];
+        }
+        return copy;
+      }).filter(item => item.id);
+    }
+    return { ...shared, version: Math.max(Number(shared.version || 0), 3) };
+  }
+  function hasSharedData(value = state) {
+    const shared = sharedState(value);
+    return Object.keys(shared.personaMeta || {}).length > 0
+      || Array.isArray(shared.personaGroups) && shared.personaGroups.length > 0
+      || Array.isArray(shared.gallery) && shared.gallery.length > 0
+      || Object.values(shared.assistantThreads || {}).some(thread => Array.isArray(thread?.turns) && thread.turns.length > 0)
+      || Array.isArray(shared.drafts) && shared.drafts.length > 0
+      || Boolean(shared.gallerySync);
+  }
+  function mergeSharedState(remote = {}, local = {}) {
+    const result = { ...local, ...remote };
+    result.personaMeta = { ...(local.personaMeta || {}), ...(remote.personaMeta || {}) };
+    const groups = new Map();
+    for (const group of [...(local.personaGroups || []), ...(remote.personaGroups || [])]) {
+      if (!group?.id) continue;
+      const previous = groups.get(String(group.id));
+      if (!previous || Number(group.createdAt || 0) >= Number(previous.createdAt || 0)) groups.set(String(group.id), group);
+    }
+    result.personaGroups = [...groups.values()];
+    result.gallery = storage?.mergeGallery ? storage.mergeGallery(remote.gallery || [], local.gallery || []) : [...(remote.gallery || []), ...(local.gallery || [])];
+    result.galleryRemoved = {};
+    for (const source of [local.galleryRemoved, remote.galleryRemoved]) {
+      for (const [id, at] of Object.entries(source || {})) {
+        result.galleryRemoved[id] = Math.max(Number(result.galleryRemoved[id] || 0), Number(at || 0));
+      }
+    }
+    const threads = {};
+    for (const [key, incoming] of Object.entries({ ...(remote.assistantThreads || {}), ...(local.assistantThreads || {}) })) {
+      const previous = threads[key];
+      if (!previous) { threads[key] = { ...incoming, turns: Array.isArray(incoming?.turns) ? [...incoming.turns] : [] }; continue; }
+      const byId = new Map();
+      for (const turn of [...(previous.turns || []), ...(incoming?.turns || [])]) {
+        const id = String(turn?.turnId || `${turn?.at || 0}|${turn?.user || ''}|${turn?.assistant || turn?.memory || ''}`);
+        if (!byId.has(id)) byId.set(id, turn);
+      }
+      threads[key] = { ...previous, ...incoming, target: incoming?.target || previous.target, turns: [...byId.values()].sort((a, b) => Number(a?.at || 0) - Number(b?.at || 0)), updatedAt: Math.max(Number(previous.updatedAt || 0), Number(incoming?.updatedAt || 0)) };
+    }
+    result.assistantThreads = threads;
+    const drafts = new Map();
+    for (const draft of [...(remote.drafts || []), ...(local.drafts || [])]) if (draft?.id && !drafts.has(String(draft.id))) drafts.set(String(draft.id), draft);
+    result.drafts = [...drafts.values()].slice(0, 20);
+    const remoteManifest = remote.gallerySync && typeof remote.gallerySync === 'object' ? remote.gallerySync : null;
+    const localManifest = local.gallerySync && typeof local.gallerySync === 'object' ? local.gallerySync : null;
+    if (remoteManifest || localManifest) {
+      const assets = new Map();
+      for (const item of [...(localManifest?.assets || []), ...(remoteManifest?.assets || [])]) {
+        if (!item?.id) continue;
+        const previous = assets.get(String(item.id));
+        if (!previous || Number(item.updatedAt || 0) >= Number(previous.updatedAt || 0)) assets.set(String(item.id), item);
+      }
+      const removed = {};
+      for (const source of [localManifest?.removed, remoteManifest?.removed]) {
+        for (const [id, at] of Object.entries(source || {})) removed[id] = Math.max(Number(removed[id] || 0), Number(at || 0));
+      }
+      result.gallerySync = {
+        ...(localManifest || {}), ...(remoteManifest || {}),
+        version: Math.max(Number(localManifest?.version || 0), Number(remoteManifest?.version || 0), 2),
+        assets: [...assets.values()], removed,
+      };
+    } else result.gallerySync = null;
+    return result;
   }
   function mergeGalleryManifest(manifest) {
     const assets = Array.isArray(manifest?.assets) ? manifest.assets.map(item => ({
@@ -209,8 +363,24 @@
   async function loadState() {
     const saved = await adapter.loadExtensionState(defaultState());
     state = adapter.normalizeState({ ...defaultState(), ...saved });
+    const pending = readPendingState();
+    if (pending) {
+      state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(pending, sharedState(state)) });
+      report('发现上次未确认的本机同步副本，已先保留在当前页面，等待安全同步确认。', 'warning');
+    }
+    // Older builds exposed a single aiTurns array. Move it into the exact
+    // current target thread once so the strict UI filter does not discard
+    // recoverable history or show it under another card/chat.
+    if (Array.isArray(state.aiTurns) && state.aiTurns.length && !Object.keys(state.assistantThreads || {}).length) {
+      const target = activeTarget();
+      const key = assistantThreadKey(target);
+      state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: state.aiTurns.slice() };
+      delete state.aiTurns;
+    }
+    const localSettings = readLocalSettings();
+    if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
     state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {};
-    gallerySync = saved?.gallerySync || null;
+    gallerySync = state.gallerySync || saved?.gallerySync || null;
     gallerySyncDirty = !gallerySync;
     if (gallerySync) await storage.importSync(gallerySync).catch(() => {});
     // Hosted manifests contain the cross-device URL even when this browser
@@ -227,37 +397,115 @@
     // data-URL sync. Mark them for one-time server migration after the app is
     // ready; the local Blob remains usable even if upload is unavailable.
     if (gallerySync?.provider !== 'tavern-user-images' || state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) gallerySyncDirty = true;
+    syncStatus = 'unavailable';
+    syncRevision = null;
+    syncRemoteState = null;
+    if (syncClient) {
+      try {
+        const remote = await syncClient.getState();
+        syncRevision = remote.revision || '0';
+        syncRemoteState = remote.state || {};
+        if (syncRevision !== '0' || hasSharedData(syncRemoteState)) {
+          if (pending) {
+            // A queued local candidate means this browser has changes that
+            // were never acknowledged by the server. Keep that candidate in
+            // view and stop; silently selecting the remote document here
+            // would make the phone's last edits appear to vanish.
+            syncStatus = 'conflict';
+            report('远端已有新版本，而本机还有未确认的修改；已停止自动合并，请在设置中确认合并。', 'warning');
+          } else {
+            state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(syncRemoteState, sharedState(state)) });
+            gallerySync = state.gallerySync || gallerySync;
+            if (gallerySync) await storage.importSync(gallerySync).catch(() => {});
+            mergeGalleryManifest(gallerySync);
+            syncStatus = 'ready';
+          }
+        } else if (hasSharedData(state)) {
+          // A new server document must never silently replace a legacy local
+          // document. The settings panel exposes an explicit migration action.
+          syncStatus = 'needs-migration';
+        } else {
+          syncStatus = 'ready';
+        }
+      } catch (error) {
+        syncStatus = error?.code === 'SYNC_UNAVAILABLE' ? 'unavailable' : 'error';
+        if (syncStatus !== 'unavailable') report(`安全同步读取失败：${error?.message || error}`, 'warning');
+      }
+    }
     return state;
   }
   function activeTarget() {
     const ctx = adapter.context();
-    return { chatId: adapter.chatKey(ctx), cardKey: adapter.cardFingerprint(ctx), character: adapter.currentCharacter(ctx), chatTitle: adapter.chatTitle(ctx) };
-  }
-  function assistantIdentity() {
-    const ctx = adapter.context() || {};
-    const user = ctx.user || ctx.currentUser || ctx.userProfile || {};
-    return String(ctx.userId ?? ctx.user_id ?? user.id ?? ctx.userName ?? ctx.user_name ?? user.name ?? user.username ?? 'local-session');
+    return { chatId: adapter.chatKey(ctx), cardKey: adapter.cardKey(ctx), legacyCardKey: adapter.cardFingerprint(ctx), character: adapter.currentCharacter(ctx), chatTitle: adapter.chatTitle(ctx) };
   }
   function assistantThreadKey(target = activeTarget()) {
-    return [assistantIdentity(), target.cardKey || 'no-card', target.chatId || 'no-chat', state?.sessionOverride || ''].map(value => String(value).replace(/[|\s]+/g, '_')).join('|');
+    // Do not include a browser/user identity here. ST installs commonly use
+    // the same local account on a phone and desktop, and the target itself is
+    // the portable conversation identity.
+    const key = adapter?.targetKey
+      ? adapter.targetKey({ cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' })
+      : [target.cardKey || 'no-card', target.chatId || 'no-chat'].map(value => String(value).replace(/[|\s]+/g, '_')).join('|');
+    const session = String(state?.sessionOverride || '').trim().replace(/[|\s]+/g, '_');
+    return session ? `${key}|session_${session}` : key;
   }
-  function ensureAssistantThread(key = assistantThreadKey()) {
+  function targetKey(target = activeTarget()) { return assistantThreadKey({ ...target, cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }).replace(/\|session_[^|]+$/, ''); }
+  function makeTurnId() {
+    try { if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID(); } catch (_) { /* use the fallback below */ }
+    return `turn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+  function findCompatibleThread(target, key) {
     state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
-    const current = state.assistantThreads[key];
-    if (current && Array.isArray(current.turns)) return current;
-    const thread = { id: key, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
+    const exact = state.assistantThreads[key];
+    if (exact && Array.isArray(exact.turns)) return exact;
+    const wanted = adapter?.targetKey ? adapter.targetKey(target) : targetKey(target);
+    const legacyWanted = adapter?.targetKey ? adapter.targetKey({ cardKey: target.legacyCardKey || target.cardKey, chatId: target.chatId }) : wanted;
+    const candidates = Object.entries(state.assistantThreads).filter(([candidateKey, item]) => {
+      if (!item || !Array.isArray(item.turns)) return false;
+      if (adapter?.threadMatchesTarget?.(item, target)) return true;
+      // Legacy v1.0.1 keys were identity|card|chat|session. Their target
+      // metadata was absent, so match only the final portable segments.
+      const parts = String(candidateKey).split('|');
+      if (parts.length < 3) return false;
+      return parts.slice(-3, -1).join('|') === wanted
+        || parts.slice(-3, -1).join('|') === legacyWanted
+        || parts.slice(-2).join('|') === wanted;
+    }).sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0));
+    const source = candidates[0]?.[1];
+    if (!source) return null;
+    const migrated = { ...source, id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, turns: Array.isArray(source.turns) ? source.turns.slice() : [] };
+    state.assistantThreads[key] = migrated;
+    return migrated;
+  }
+  function ensureAssistantThread(key = assistantThreadKey(), target = activeTarget()) {
+    state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
+    const current = findCompatibleThread(target, key);
+    if (current) {
+      current.target = current.target && typeof current.target === 'object' ? current.target : { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' };
+      current.id = key;
+      return current;
+    }
+    const thread = { id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
     state.assistantThreads[key] = thread;
     return thread;
   }
   function activeAssistantThread(target = activeTarget()) {
     const baseKey = assistantThreadKey(target);
-    const activeKey = String(state.assistantActiveThreadKey || '');
-    // A manually opened session gets a suffix. Keep using it until the
-    // target changes; otherwise the next request would silently jump back to
-    // the previous card/chat thread.
+    const activeKey = String(localAssistantThreadKey || '');
+    // A manually opened session is local to this browser. Never trust the
+    // shared assistantActiveThreadKey from settings as a page selector.
     const key = activeKey.startsWith(baseKey + '|new_') ? activeKey : baseKey;
-    state.assistantActiveThreadKey = key;
-    return ensureAssistantThread(key);
+    localAssistantThreadKey = key;
+    writeLocalAssistantThreadKey(localAssistantThreadKey);
+    return ensureAssistantThread(key, target);
+  }
+  function generationIsCurrent(target, token, thread) {
+    if (token !== assistantGenerationToken) return false;
+    if (targetKey(activeTarget()) !== targetKey(target)) return false;
+    // Session overrides and the local “new thread” selector are also page
+    // identity. A response must not land in an older thread after either one
+    // changes, even when card/chat stayed the same.
+    if (String(localAssistantThreadKey || '') !== String(thread?.id || '')) return false;
+    return thread === state.assistantThreads?.[thread?.id];
   }
   function appendAssistantTurn(thread, user, result) {
     if (!thread || !String(user || '').trim() || !result || result.error) return;
@@ -279,6 +527,7 @@
     const memory = [answer, ...proposalData.map(item => [item.title, item.concept].filter(Boolean).join('：')).filter(Boolean)].filter(Boolean).join('\n');
     if (!answer.trim() && !proposalData.length) return;
     thread.turns = [...(Array.isArray(thread.turns) ? thread.turns : []), {
+      turnId: makeTurnId(),
       user: String(user).slice(0, 2400),
       assistant: answer,
       memory,
@@ -316,55 +565,98 @@
   function resolved() { return adapter.resolvePersona({ state, target: activeTarget() }); }
   async function refresh() {
     if (!app) return;
+    const sequence = ++refreshSequence;
+    const target = activeTarget();
+    const targetIdentity = targetKey(target);
+    const baseKey = assistantThreadKey(target);
+    if (!String(localAssistantThreadKey || '').startsWith(baseKey + '|new_')) { localAssistantThreadKey = baseKey; writeLocalAssistantThreadKey(localAssistantThreadKey); }
+    // Hydrate/migrate only the thread belonging to this exact target. This
+    // lets existing v1.0.1 history appear without ever selecting a different
+    // card/chat's newest thread.
+    ensureAssistantThread(localAssistantThreadKey, target);
+    // Keep the in-memory field aligned for the view layer, while
+    // sharedState() strips it before any server write. It is a local
+    // navigation pointer, never portable data.
+    state.assistantActiveThreadKey = localAssistantThreadKey;
     const contextSnapshot = await adapter.contextSnapshot();
-    app.update({ state, target: activeTarget(), current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas: adapter.readNativePersonas(), nativeGallery: nativeGallery(), contextSnapshot });
+    if (sequence !== refreshSequence || targetKey(activeTarget()) !== targetIdentity || !app) return;
+    app.update({ state, target, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas: adapter.readNativePersonas(), nativeGallery: nativeGallery(), contextSnapshot });
   }
-  async function save() {
-    // Settings are shared through the host, so merge assistant turns with the
-    // latest persisted snapshot before writing. This prevents another device
-    // or tab from replacing an entire thread map with its older copy.
-    let latestGallerySync = null;
+  async function persistSharedState() {
+    const candidate = sharedState(state);
+    if (!syncClient || syncStatus === 'unavailable' || syncStatus === 'error' || syncStatus === 'conflict') {
+      queuePendingState(candidate);
+      report(syncStatus === 'conflict'
+        ? '安全同步存在冲突，已停止继续写入；请先重新读取并合并本机副本。'
+        : '安全同步服务未连接，本次修改只保留在当前页面；请先安装并启用人设同步服务端插件。', 'warning');
+      return false;
+    }
+    if (syncStatus === 'needs-migration') {
+      queuePendingState(candidate);
+      report('检测到旧版人设馆记录。请先在扩展设置中点击“迁移到安全同步”，当前修改不会覆盖旧数据。', 'warning');
+      return false;
+    }
     try {
-      const latest = adapter.normalizeState(await adapter.loadExtensionState(defaultState()));
-      const remote = latest.assistantThreads || {};
-      const local = state.assistantThreads || {};
-      // A clean local gallery must not overwrite a newer gallery synced by
-      // another device while we are saving an assistant turn. Adopt the
-      // remote snapshot before writing the merged settings back.
-      const remoteGallerySync = latest.gallerySync;
-      latestGallerySync = remoteGallerySync || null;
-      if (!gallerySyncDirty && remoteGallerySync && (!gallerySync || Number(remoteGallerySync.updatedAt || 0) > Number(gallerySync.updatedAt || 0))) {
-        gallerySync = remoteGallerySync;
-        await storage.importSync(gallerySync).catch(() => {});
+      const result = await syncClient.putState(candidate, { baseRevision: syncRevision });
+      syncRevision = result.revision;
+      syncStatus = 'ready';
+      syncRemoteState = candidate;
+      clearPendingState();
+      return true;
+    } catch (error) {
+      queuePendingState(candidate);
+      if (error?.code === 'REVISION_MISMATCH') {
+        syncStatus = 'conflict';
+        report('发现另一台设备刚刚修改了人设馆数据。为防止互相覆盖，本次修改已保留在本机，未覆盖远端；请重新读取后再合并。', 'warning');
+      } else {
+        syncStatus = error?.code === 'SYNC_UNAVAILABLE' ? 'unavailable' : 'error';
+        report(`安全同步失败：${error?.message || error}。本次修改已保留在本机，未写入远端。`, 'warning');
       }
-      mergeGalleryManifest(latestGallerySync || gallerySync);
-      if (Array.isArray(latest.gallery)) state.gallery = storage.mergeGallery(state.gallery, latest.gallery);
-      const remoteRemoved = latest.galleryRemoved && typeof latest.galleryRemoved === 'object' ? latest.galleryRemoved : {};
-      state.galleryRemoved = { ...(state.galleryRemoved || {}) };
-      for (const [id, at] of Object.entries(remoteRemoved)) {
-        const localItem = state.gallery.find(item => String(item?.id || '') === String(id));
-        // Re-importing the same file produces the same deterministic id. A
-        // newer local upload explicitly revives it and clears old tombstones.
-        if (localItem && Number(localItem.updatedAt || 0) > Number(at || 0)) delete state.galleryRemoved[id];
-        else state.galleryRemoved[id] = Math.max(Number(state.galleryRemoved[id] || 0), Number(at || 0));
-      }
-      state.gallery = state.gallery.filter(item => Number(state.galleryRemoved[item.id] || 0) <= Number(item.updatedAt || 0));
-      for (const [key, remoteThread] of Object.entries(remote)) {
-        const localThread = local[key];
-        if (!localThread) { local[key] = remoteThread; continue; }
-        const turns = [...(localThread.turns || []), ...(remoteThread.turns || [])];
-        const bySig = new Map();
-        for (const turn of turns) {
-          const sig = `${turn.at || 0}|${turn.user || ''}|${turn.assistant || turn.memory || ''}`;
-          bySig.set(sig, turn);
-        }
-        localThread.turns = [...bySig.values()].sort((a, b) => (a.at || 0) - (b.at || 0));
-        localThread.createdAt = Math.min(localThread.createdAt || Date.now(), remoteThread.createdAt || Date.now());
-        localThread.updatedAt = Math.max(localThread.updatedAt || 0, remoteThread.updatedAt || 0);
-      }
-      state.assistantThreads = local;
-    } catch (_) { /* retain local state when host settings are unavailable */ }
-    if (gallerySyncDirty || !gallerySync) {
+      return false;
+    }
+  }
+
+  async function makeTavernSnapshot() {
+    const context = adapter.context();
+    const getter = context?.getRequestHeaders || globalThis.getRequestHeaders;
+    const headers = typeof getter === 'function' ? (getter.call(context, { omitContentType: false }) || {}) : {};
+    const response = await fetch('/api/settings/make-snapshot', { method: 'POST', headers, cache: 'no-store', credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`酒馆设置快照失败（HTTP ${response.status}）`);
+  }
+
+  async function migrateToSafeSync() {
+    if (!syncClient) throw new Error('当前没有加载安全同步客户端。');
+    const remote = await syncClient.getState();
+    if (remote.revision !== '0' || hasSharedData(remote.state)) {
+      syncRevision = remote.revision;
+      syncRemoteState = remote.state;
+      // This button is the explicit conflict decision. Keep the local queued
+      // candidate's metadata as the winner while still unioning groups,
+      // gallery records, turns and drafts with the remote document.
+      state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(sharedState(state), remote.state) });
+      syncStatus = 'ready';
+      const persisted = await persistSharedState();
+      await refresh();
+      if (persisted) report('已确认合并本机副本与远端记录，合并结果已写入安全同步。', 'info');
+      updateSettingsUi();
+      return persisted;
+    }
+    await makeTavernSnapshot();
+    const result = await syncClient.putState(sharedState(state), { baseRevision: remote.revision });
+    syncRevision = result.revision;
+    syncRemoteState = result.state;
+    syncStatus = 'ready';
+    clearPendingState();
+    report('已完成安全同步迁移；旧版酒馆设置仍保留为备份。', 'info');
+    updateSettingsUi();
+    return true;
+  }
+
+  async function saveImpl() {
+    // Gallery bytes still go through SillyTavern's image API. The gallery
+    // manifest and all other extension data go to the independent CAS store;
+    // this function deliberately never calls saveSettingsDebounced.
+    if ((gallerySyncDirty || !gallerySync) && syncStatus === 'ready') {
       // Publish image bytes through SillyTavern's shared user image store
       // before writing settings. Settings then carry only metadata and a URL;
       // IndexedDB remains the local/offline cache.
@@ -373,7 +665,8 @@
         state.gallery = storage.mergeGallery(state.gallery, hosted.changed);
         // Releases before the API fix put gallery images in User Avatars.
         // Remove only our deterministic ytps-* files after a successful move;
-        // native persona files are left untouched.
+        // native persona files are left untouched. The adapter deliberately
+        // does not save the global settings file during this cleanup.
         for (const item of hosted.changed) {
           if (item?.legacyRemoteUrl) await Promise.resolve(adapter.removeLegacyGalleryAvatar?.(item.legacyRemoteUrl)).catch(() => {});
         }
@@ -384,8 +677,12 @@
       // still accepted/imported, but new files use the server-backed path.
       // Keep the 500 MiB fallback for older Tavern builds where the image API
       // is unavailable; hosted images still contribute only their manifest.
-      const nextGallerySync = await storage.exportSync({ removed: state.galleryRemoved, includeData: true, maxBytes: 500 * 1024 * 1024 }).catch(() => null);
+      // The dedicated state document is intentionally small. Image bytes stay
+      // in SillyTavern's user image store or this browser's IndexedDB; only a
+      // hosted manifest is allowed into the CAS document.
+      const nextGallerySync = await storage.exportSync({ removed: state.galleryRemoved, includeData: false, maxBytes: 3 * 1024 * 1024 }).catch(() => null);
       if (nextGallerySync) {
+        const latestGallerySync = syncRemoteState?.gallerySync || gallerySync;
         if (latestGallerySync) {
           // Prefer the hosted manifest, while retaining a legacy data-URL
           // entry when its local upload failed or the current device has no
@@ -403,7 +700,15 @@
         gallerySync = { ...nextGallerySync, version: 2, provider: 'tavern-user-images' }; gallerySyncDirty = false;
       }
     }
-    await adapter.saveExtensionState(gallerySync ? { ...state, gallerySync } : state); await refresh();
+    state.gallerySync = gallerySync;
+    await persistSharedState();
+    await refresh();
+  }
+  let saveChain = Promise.resolve();
+  function save() {
+    const run = saveChain.then(() => saveImpl(), () => saveImpl());
+    saveChain = run.catch(() => {});
+    return run;
   }
 
   function showVersionManager() {
@@ -437,7 +742,13 @@
     const openButton = document.querySelector('#ytps-settings [data-action="open-persona"]');
     if (openButton) openButton.disabled = !enabled;
     const status = document.querySelector('#ytps-settings [data-role="status"]');
-    if (status) status.textContent = `${enabled ? '已启用' : '已关闭'} · V${VERSION}`;
+    if (status) {
+      const syncLabel = syncStatus === 'ready' ? '安全同步已启用' : syncStatus === 'needs-migration' ? '等待迁移旧记录' : syncStatus === 'conflict' ? '同步冲突已停止覆盖' : syncStatus === 'checking' ? '正在检查同步服务' : '同步服务未连接';
+      status.textContent = `${enabled ? '已启用' : '已关闭'} · V${VERSION} · ${syncLabel}`;
+    }
+    const migrate = document.querySelector('#ytps-settings [data-action="migrate-sync"]');
+    if (migrate) migrate.hidden = !['needs-migration', 'ready', 'conflict'].includes(syncStatus);
+    if (migrate) migrate.textContent = syncStatus === 'needs-migration' ? '备份并迁移旧记录' : syncStatus === 'conflict' ? '重新读取并合并本机副本' : '重新读取安全同步';
   }
 
   function installSettingsEntry() {
@@ -453,13 +764,16 @@
     header.addEventListener('keydown', event => { if (['Enter', ' '].includes(event.key)) { event.preventDefault(); event.stopPropagation(); header.click(); } });
     const content = element('div', 'inline-drawer-content'); content.id = 'ytps-settings-content';
     const status = element('small', 'ytps-install-status', ''); status.dataset.role = 'status';
-    content.append(status, element('p', 'ytps-settings-help', '接管酒馆原生人设面板，关闭后可直接使用原生界面；人设、头像和图库文件不会被删除。'));
+    content.append(status, element('p', 'ytps-settings-help', '分组、图库清单和小助手记录通过独立同步文件保存；页面选项只保留在当前设备。酒馆原生人设和绑定仍由酒馆设置管理。没有同步服务时不会静默写回酒馆整包设置。'));
     const label = element('label', 'checkbox_label'); const check = element('input'); check.type = 'checkbox'; check.dataset.setting = 'enabled';
     check.addEventListener('change', () => { void controlModule?.setEnabled(check.checked).then(updateSettingsUi).catch(error => report(error.message, 'error')); });
     label.append(check, element('span', '', '启用人设馆接管')); content.append(label);
     const actions = element('div', 'ytps-settings-actions');
     actions.append(button('打开人设馆', 'menu_button', () => open({ tab: 'current' }), '打开砚台人设馆'));
     actions.lastElementChild.dataset.action = 'open-persona';
+    const migrate = button('备份并迁移旧记录', 'menu_button', () => { void Promise.resolve(controlModule?.migrateToSafeSync?.()).catch(error => report(error.message || String(error), 'error')); });
+    migrate.dataset.action = 'migrate-sync';
+    actions.append(migrate);
     actions.append(button('版本与更新', 'menu_button ytps-version-open', showVersionManager));
     content.append(actions);
     drawer.append(header, content); panel.append(drawer); host.append(panel); updateSettingsUi();
@@ -475,6 +789,7 @@
     // entries may request the gallery or another workspace tab.
     const allowedTabs = new Set(['current', 'library', 'editor', 'create', 'gallery', 'assistant']);
     state.ui.tab = allowedTabs.has(tab) ? tab : 'current';
+    app?.setLocalUi?.({ tab: state.ui.tab });
     app?.update?.({ state });
     const nativePanel = ensureNative ? await adapter.openNativePersonaPanel() : ([...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null) || document.querySelector('#persona-management-block'));
     if (!ensureNative && !adapter.isNativePersonaPanelOpen()) {
@@ -532,22 +847,22 @@
       open,
       close: () => { editMode = false; app?.close(); adapter.setNativeTakeover(false); adapter.setNativeEditMode(false); },
       refresh,
-      async setTab(tab) { state.ui.tab = tab; await save(); },
+      async setTab(tab) { state.ui = { ...(state.ui || {}), tab }; app?.setLocalUi?.({ tab }); },
       async setEditingPersona(id) {
         state.ui = { ...(state.ui || {}), tab: 'editor', editingPersonaId: String(id || '') };
-        await save();
+        app?.setLocalUi?.({ tab: 'editor', editingPersonaId: String(id || '') });
       },
       async startNewPersona() {
         state.ui = { ...(state.ui || {}), tab: 'create', editingPersonaId: '' };
-        await save();
+        app?.setLocalUi?.({ tab: 'create', editingPersonaId: '' });
       },
-      async setGallerySheet(sheet) { state.ui.gallerySheet = sheet === 'cards' ? 'cards' : 'avatars'; await save(); },
-      async selectGalleryAsset(id) { state.ui.selectedAssetId = String(id || ''); await save(); },
+      async setGallerySheet(sheet) { const value = sheet === 'cards' ? 'cards' : 'avatars'; state.ui = { ...(state.ui || {}), gallerySheet: value }; app?.setLocalUi?.({ gallerySheet: value }); },
+      async selectGalleryAsset(id) { const value = String(id || ''); state.ui = { ...(state.ui || {}), selectedAssetId: value }; app?.setLocalUi?.({ selectedAssetId: value }); },
       async setLibraryGroup(groupId) {
         const wanted = String(groupId || 'all');
         const known = wanted === 'all' || wanted === '__uncategorized__' || state.personaGroups.some(group => String(group?.id || '') === wanted);
         state.ui.libraryGroup = known ? wanted : 'all';
-        await save();
+        app?.setLocalUi?.({ libraryGroup: state.ui.libraryGroup });
       },
       async createPersonaGroup(name) {
         const label = String(name || '').trim().replace(/\s+/g, ' ').slice(0, 40);
@@ -723,28 +1038,33 @@
       },
       async createDraft(input) {
         const target = activeTarget();
+        const token = ++assistantGenerationToken;
         const snapshot = await adapter.contextSnapshot();
         const source = assistantContext(input, snapshot);
         const thread = activeAssistantThread(target);
         const result = await ai.generateDirections({ input, target, state, context: source, history: thread.turns, thread, mode: 'propose' });
+        if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(thread, input?.request || '', result);
-        if (result?.draft) state.drafts = [result.draft, ...state.drafts].slice(0, 20);
+        if (result?.draft) state.drafts = [{ ...result.draft, targetKey: targetKey(target), target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' } }, ...state.drafts].slice(0, 20);
         await save();
         return result;
       },
       async assistantChat(input = {}) {
         const target = activeTarget();
+        const token = ++assistantGenerationToken;
         const snapshot = await adapter.contextSnapshot();
         const source = assistantContext(input, snapshot);
         const thread = activeAssistantThread(target);
         const fn = ai.continueChat || ai.chat || ai.generateChat;
         if (typeof fn !== 'function') throw new Error('当前版本尚未加载小助手对话接口，请刷新酒馆后重试。');
         const result = await fn({ input, target, state, context: source, history: thread.turns, thread, mode: 'chat' });
+        if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(thread, input?.request || '', result);
         await save();
         return result;
       },
       async clearAssistantThread() {
+        assistantGenerationToken += 1;
         const thread = activeAssistantThread(activeTarget());
         thread.turns = [];
         thread.updatedAt = Date.now();
@@ -752,23 +1072,30 @@
         return thread;
       },
       async newAssistantThread() {
+        assistantGenerationToken += 1;
         const target = activeTarget();
         const key = assistantThreadKey(target) + '|new_' + Date.now().toString(36);
-        state.assistantActiveThreadKey = key;
-        state.assistantThreads[key] = { id: key, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
-        await save();
-        return state.assistantThreads[key];
+        localAssistantThreadKey = key;
+        writeLocalAssistantThreadKey(localAssistantThreadKey);
+        state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
+        state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
+        // An empty thread is a local navigation event. It is not written as a
+        // shared active selector; the first actual turn is shared normally.
+        await refresh();
+        return { ...state.assistantThreads[key], activeThreadKey: key };
       },
       async reviseDraft(draftId, instruction) {
-        const draft = state.drafts.find(item => item.id === draftId);
-        if (!draft) return;
         const target = activeTarget();
+        const draft = state.drafts.find(item => item.id === draftId && (!item.targetKey || item.targetKey === targetKey(target)));
+        if (!draft) return;
+        const token = ++assistantGenerationToken;
         const thread = activeAssistantThread(target);
         const snapshot = await adapter.contextSnapshot();
         const source = assistantContext({ includeCard: true }, snapshot);
         const result = await ai.reviseDraft({ draft, instruction, target, state, context: source, history: thread.turns, thread, mode: 'revision' });
+        if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(thread, instruction, result);
-        if (result?.draft) { state.drafts = [result.draft, ...state.drafts.filter(item => item.id !== draftId)].slice(0, 20); await save(); }
+        if (result?.draft) { state.drafts = [{ ...result.draft, targetKey: targetKey(target), target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' } }, ...state.drafts.filter(item => item.id !== draftId)].slice(0, 20); await save(); }
         return result;
       },
       async saveCandidate(draftId, candidate) {
@@ -782,7 +1109,7 @@
     };
     app.options.actions = actions;
     if (state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) {
-      await save().catch(error => report(`图库迁移失败：${error?.message || error}，当前设备副本未删除。`, 'warning'));
+      report('发现尚未上传到酒馆图库的本地图片；为避免打开电脑时产生写入，已暂不自动迁移，请在确认安全同步后执行一次明确保存。', 'info');
     }
     adapter.on('CHAT_CHANGED', refresh);
     adapter.on('CHARACTER_CHANGED', refresh);
@@ -806,7 +1133,7 @@
         delete state.personaMeta[id];
         changed = true;
       }
-      if (changed) await adapter.saveExtensionState(state);
+      if (changed) await save();
     };
     adapter.on('PERSONA_DELETED', personaDeleted);
     if (state.enabled !== false) await adapter.installEntry();
