@@ -30,6 +30,9 @@ export function stableStringify(value) {
       const result = JSON.stringify(input);
       return result === undefined ? 'null' : result;
     }
+    // Match JSON.stringify for standard JSON-like values such as Date while
+    // still sorting keys on ordinary objects.
+    if (typeof input.toJSON === 'function') return encode(input.toJSON());
     if (seen.has(input)) throw new TypeError('同步数据不能包含循环引用。');
     seen.add(input);
     let result;
