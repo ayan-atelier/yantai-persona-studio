@@ -25,24 +25,28 @@ let volatileDeviceId = '';
  */
 export function stableStringify(value) {
   const seen = new WeakSet();
-  const encode = input => {
+  const encode = (input, inArray = false) => {
     if (input === null || typeof input !== 'object') {
       const result = JSON.stringify(input);
-      return result === undefined ? 'null' : result;
+      return result === undefined ? (inArray ? 'null' : undefined) : result;
     }
     // Match JSON.stringify for standard JSON-like values such as Date while
     // still sorting keys on ordinary objects.
-    if (typeof input.toJSON === 'function') return encode(input.toJSON());
+    if (typeof input.toJSON === 'function') return encode(input.toJSON(), inArray);
     if (seen.has(input)) throw new TypeError('同步数据不能包含循环引用。');
     seen.add(input);
     let result;
     if (Array.isArray(input)) {
-      result = '[' + input.map(item => encode(item)).join(',') + ']';
+      result = '[' + input.map(item => encode(item, true)).join(',') + ']';
     } else {
       const entries = Object.keys(input)
         .filter(key => input[key] !== undefined)
         .sort()
-        .map(key => JSON.stringify(key) + ':' + encode(input[key]));
+        .map(key => {
+          const encoded = encode(input[key]);
+          return encoded === undefined ? '' : JSON.stringify(key) + ':' + encoded;
+        })
+        .filter(Boolean);
       result = '{' + entries.join(',') + '}';
     }
     seen.delete(input);

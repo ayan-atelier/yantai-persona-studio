@@ -16,6 +16,7 @@ function storage() {
 
 test('stableStringify sorts object keys and preserves array order', () => {
   assert.equal(stableStringify({ z: 1, a: { y: 2, x: 3 }, list: [2, 1] }), '{"a":{"x":3,"y":2},"list":[2,1],"z":1}');
+  assert.equal(stableStringify({ omitted: undefined, fn: () => {}, list: [undefined, () => {}] }), '{"list":[null,null]}');
 });
 
 test('device id is stable in the provided storage', () => {
