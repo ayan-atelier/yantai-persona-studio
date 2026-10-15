@@ -252,11 +252,7 @@ class App {
   assistantTurns() {
     const threads = this.state.assistantThreads && typeof this.state.assistantThreads === 'object' ? this.state.assistantThreads : {};
     const active = threads[this.state.assistantActiveThreadKey];
-    if (Array.isArray(active?.turns) && active.turns.length) return active.turns;
-    // An explicitly opened `new_` thread is intentionally blank.  For the
-    // ordinary base key, an empty active thread can be a stale desktop key;
-    // show the newest non-empty thread so migrated phone history is visible.
-    if (Array.isArray(active?.turns) && /\|new_[^|]+$/.test(String(this.state.assistantActiveThreadKey || ''))) return active.turns;
+    if (Array.isArray(active?.turns)) return active.turns;
     if (Array.isArray(this.state.aiTurns)) return this.state.aiTurns;
     const fallback = Object.values(threads).filter(item => Array.isArray(item?.turns)).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))[0];
     return Array.isArray(fallback?.turns) ? fallback.turns : [];

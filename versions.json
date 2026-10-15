@@ -1,15 +1,8 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.2",
+  "latest": "1.0.1",
   "releases": [
-    {
-      "version": "1.0.2",
-      "branch": "v1.0.2",
-      "settings_schema": 3,
-      "minimum_client_version": "1.16.0",
-      "notes": "修复手机与电脑之间的人设助手记录合并；保存前读取酒馆最新完整设置，避免旧电脑快照覆盖手机人设；新增本地恢复备份，并暂停启动时自动清理旧图库头像文件。"
-    },
     {
       "version": "1.0.1",
       "branch": "v1.0.1",
