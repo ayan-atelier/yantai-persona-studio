@@ -71,6 +71,11 @@
   let syncClient = null;
   let syncRevision = null;
   let syncStatus = 'checking';
+  // The server plugin is the strongest sync provider.  When it is not
+  // installed, SillyTavern still persists this extension's namespace through
+  // extensionSettings + saveSettingsDebounced, so ordinary installs can sync
+  // without copying a second plugin.  This fallback has no server CAS.
+  let syncMode = 'checking';
   let syncRemoteState = null;
   // The selected assistant thread is a browser-local navigation choice. It
   // must never be persisted in shared settings, otherwise opening the plugin
@@ -126,14 +131,14 @@
           enabled: state?.enabled !== false,
           health: missingPreview || ['unavailable', 'error', 'conflict', 'needs-migration'].includes(syncStatus) ? 'degraded' : 'ok',
           sources: [
-            { kind: 'persona-sync-server', namespace: NS, scope: 'server', portable: 'yes', readable: syncStatus !== 'unavailable', writable: syncStatus === 'ready' },
-            { kind: 'host-settings-legacy', namespace: NS, scope: 'host', portable: 'backup-only', readable: true, writable: false },
+            { kind: 'persona-sync-server', namespace: NS, scope: 'server', portable: 'yes', readable: syncMode === 'server', writable: syncMode === 'server' && syncStatus === 'ready' },
+            { kind: 'host-settings-sync', namespace: NS, scope: 'host', portable: 'yes', readable: true, writable: syncMode === 'host' },
             { kind: 'indexeddb', namespace: 'yantai-persona-studio/assets', scope: 'device', portable: 'no', readable: true, writable: true, count: gallery.length, missingCount: missingPreview },
           ],
           checks: [
             { id: 'gallery-preview', label: '图库预览', status: missingPreview ? 'degraded' : 'ok', detail: missingPreview ? `${missingPreview} 项只有元数据，当前设备没有可用预览` : `本设备可预览 ${previewCount} 项` },
             { id: 'assistant-history', label: 'Milo 记录', status: 'ok', detail: `${Object.keys(threads).length} 个对话线程保存在人设馆设置中` },
-            { id: 'sync', label: '安全同步', status: syncStatus === 'ready' ? 'ok' : 'degraded', detail: syncStatus === 'ready' ? `服务端版本 ${syncRevision || '0'}` : syncStatus === 'needs-migration' ? '等待明确迁移旧版记录' : syncStatus === 'conflict' ? '存在待处理冲突，已停止覆盖' : '同步服务未连接' },
+            { id: 'sync', label: '数据同步', status: syncStatus === 'ready' || syncStatus === 'host-ready' ? 'ok' : 'degraded', detail: syncMode === 'server' && syncStatus === 'ready' ? `安全同步服务端版本 ${syncRevision || '0'}` : syncMode === 'host' ? '通过酒馆扩展设置同步（保护有限，无需额外插件）' : syncStatus === 'needs-migration' ? '等待明确迁移旧版记录' : syncStatus === 'conflict' ? '存在待处理冲突，已停止覆盖' : '同步服务未连接' },
             { id: 'context', label: '当前酒馆上下文', status: ctx ? 'ok' : 'unknown', detail: root.location?.origin || '当前来源未知' },
           ],
         };
@@ -397,12 +402,14 @@
     // data-URL sync. Mark them for one-time server migration after the app is
     // ready; the local Blob remains usable even if upload is unavailable.
     if (gallerySync?.provider !== 'tavern-user-images' || state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) gallerySyncDirty = true;
+    syncMode = 'checking';
     syncStatus = 'unavailable';
     syncRevision = null;
     syncRemoteState = null;
     if (syncClient) {
       try {
         const remote = await syncClient.getState();
+        syncMode = 'server';
         syncRevision = remote.revision || '0';
         syncRemoteState = remote.state || {};
         if (syncRevision !== '0' || hasSharedData(syncRemoteState)) {
@@ -428,9 +435,27 @@
           syncStatus = 'ready';
         }
       } catch (error) {
-        syncStatus = error?.code === 'SYNC_UNAVAILABLE' ? 'unavailable' : 'error';
-        if (syncStatus !== 'unavailable') report(`安全同步读取失败：${error?.message || error}`, 'warning');
+        if (error?.code === 'SYNC_UNAVAILABLE') {
+          // A normal install does not contain a Node server plugin. Fall back
+          // to the extension's own namespace in SillyTavern settings so the
+          // GitHub extension remains one-click installable.
+          syncMode = 'host';
+          syncRevision = 'host';
+          syncRemoteState = sharedState(saved);
+          syncStatus = 'host-ready';
+        } else {
+          syncMode = 'host';
+          syncRevision = 'host';
+          syncRemoteState = sharedState(saved);
+          syncStatus = 'host-ready';
+          report(`安全同步服务暂不可用，已切换到酒馆设置兼容同步：${error?.message || error}`, 'warning');
+        }
       }
+    } else {
+      syncMode = 'host';
+      syncRevision = 'host';
+      syncRemoteState = sharedState(saved);
+      syncStatus = 'host-ready';
     }
     return state;
   }
@@ -582,13 +607,75 @@
     if (sequence !== refreshSequence || targetKey(activeTarget()) !== targetIdentity || !app) return;
     app.update({ state, target, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas: adapter.readNativePersonas(), nativeGallery: nativeGallery(), contextSnapshot });
   }
+  async function persistHostSharedState(candidate) {
+    const context = adapter?.context?.();
+    if (!context || typeof context !== 'object') throw new Error('酒馆上下文不可用，无法保存人设馆设置。');
+    const settings = context.extensionSettings && typeof context.extensionSettings === 'object'
+      ? context.extensionSettings
+      : (context.extensionSettings = {});
+    let currentNamespace = settings[NS] && typeof settings[NS] === 'object' ? settings[NS] : {};
+    // Another browser may have changed the namespace since this page loaded.
+    // Read the current settings document for merging, then still write via
+    // SillyTavern's own debounced saver so unrelated settings are not replaced
+    // by a raw full-file request.
+    try {
+      const getter = context.getRequestHeaders || globalThis.getRequestHeaders;
+      const headers = typeof getter === 'function' ? (getter.call(context, { omitContentType: false }) || {}) : {};
+      const response = await fetch('/api/settings/get', { method: 'POST', headers, cache: 'no-store', credentials: 'same-origin' });
+      if (response.ok) {
+        const payload = await response.json();
+        const raw = typeof payload?.settings === 'string' ? JSON.parse(payload.settings) : payload?.settings;
+        const extensions = raw?.extension_settings || raw?.extensionSettings;
+        if (extensions?.[NS] && typeof extensions[NS] === 'object') {
+          currentNamespace = extensions[NS];
+          settings[NS] = { ...currentNamespace };
+        }
+      }
+    } catch (_) { /* older Tavern builds may not expose the read endpoint */ }
+    const current = adapter.normalizeState({ ...defaultState(), ...currentNamespace });
+    // Merge against the latest namespace visible to this page, preserving
+    // unrelated extension settings. The candidate is the local winner for
+    // fields changed on this device; assistant turns and gallery records are
+    // unioned by mergeSharedState(). This is a compatibility provider without
+    // the server plugin's compare-and-swap guarantee.
+    // Keep the compatibility payload shared-only. Do not let normalizeState's
+    // defaults (enabled/ui/current thread) overwrite browser-local choices in
+    // the host namespace.
+    const merged = mergeSharedState(candidate, sharedState(current));
+    settings[NS] = { ...currentNamespace, ...merged };
+    const saver = context.saveSettingsDebounced;
+    if (typeof saver !== 'function') throw new Error('当前酒馆没有可用的设置保存入口。');
+    await Promise.resolve(saver.call(context));
+    state = adapter.normalizeState({
+      ...defaultState(), ...state, ...merged,
+      enabled: state.enabled,
+      ui: state.ui,
+      assistantActiveThreadKey: state.assistantActiveThreadKey,
+    });
+    syncRemoteState = sharedState(merged);
+    syncRevision = 'host';
+    syncMode = 'host';
+    syncStatus = 'host-ready';
+    clearPendingState();
+    return true;
+  }
   async function persistSharedState() {
     const candidate = sharedState(state);
+    if (syncMode === 'host') {
+      try {
+        return await persistHostSharedState(candidate);
+      } catch (error) {
+        queuePendingState(candidate);
+        syncStatus = 'error';
+        report(`酒馆设置兼容同步失败：${error?.message || error}。本次修改已保留在本机。`, 'warning');
+        return false;
+      }
+    }
     if (!syncClient || syncStatus === 'unavailable' || syncStatus === 'error' || syncStatus === 'conflict') {
       queuePendingState(candidate);
       report(syncStatus === 'conflict'
         ? '安全同步存在冲突，已停止继续写入；请先重新读取并合并本机副本。'
-        : '安全同步服务未连接，本次修改只保留在当前页面；请先安装并启用人设同步服务端插件。', 'warning');
+        : '同步服务未连接，本次修改只保留在当前页面。', 'warning');
       return false;
     }
     if (syncStatus === 'needs-migration') {
@@ -625,6 +712,12 @@
   }
 
   async function migrateToSafeSync() {
+    if (syncMode === 'host') {
+      const persisted = await persistHostSharedState(sharedState(state));
+      await refresh();
+      updateSettingsUi();
+      return persisted;
+    }
     if (!syncClient) throw new Error('当前没有加载安全同步客户端。');
     const remote = await syncClient.getState();
     if (remote.revision !== '0' || hasSharedData(remote.state)) {
@@ -654,9 +747,10 @@
 
   async function saveImpl() {
     // Gallery bytes still go through SillyTavern's image API. The gallery
-    // manifest and all other extension data go to the independent CAS store;
-    // this function deliberately never calls saveSettingsDebounced.
-    if ((gallerySyncDirty || !gallerySync) && syncStatus === 'ready') {
+    // manifest and all other extension data go to the independent CAS store
+    // when available, or the extension namespace through Tavern's own saver
+    // in compatibility mode.
+    if ((gallerySyncDirty || !gallerySync) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       // Publish image bytes through SillyTavern's shared user image store
       // before writing settings. Settings then carry only metadata and a URL;
       // IndexedDB remains the local/offline cache.
@@ -743,11 +837,11 @@
     if (openButton) openButton.disabled = !enabled;
     const status = document.querySelector('#ytps-settings [data-role="status"]');
     if (status) {
-      const syncLabel = syncStatus === 'ready' ? '安全同步已启用' : syncStatus === 'needs-migration' ? '等待迁移旧记录' : syncStatus === 'conflict' ? '同步冲突已停止覆盖' : syncStatus === 'checking' ? '正在检查同步服务' : '同步服务未连接';
+      const syncLabel = syncStatus === 'ready' ? '安全同步已启用' : syncStatus === 'host-ready' ? '兼容同步已启用（保护有限）' : syncStatus === 'needs-migration' ? '等待迁移旧记录' : syncStatus === 'conflict' ? '同步冲突已停止覆盖' : syncStatus === 'checking' ? '正在检查同步服务' : syncStatus === 'error' ? '同步保存失败' : '同步服务未连接';
       status.textContent = `${enabled ? '已启用' : '已关闭'} · V${VERSION} · ${syncLabel}`;
     }
     const migrate = document.querySelector('#ytps-settings [data-action="migrate-sync"]');
-    if (migrate) migrate.hidden = !['needs-migration', 'ready', 'conflict'].includes(syncStatus);
+    if (migrate) migrate.hidden = syncMode !== 'server' || !['needs-migration', 'ready', 'conflict'].includes(syncStatus);
     if (migrate) migrate.textContent = syncStatus === 'needs-migration' ? '备份并迁移旧记录' : syncStatus === 'conflict' ? '重新读取并合并本机副本' : '重新读取安全同步';
   }
 
@@ -764,7 +858,7 @@
     header.addEventListener('keydown', event => { if (['Enter', ' '].includes(event.key)) { event.preventDefault(); event.stopPropagation(); header.click(); } });
     const content = element('div', 'inline-drawer-content'); content.id = 'ytps-settings-content';
     const status = element('small', 'ytps-install-status', ''); status.dataset.role = 'status';
-    content.append(status, element('p', 'ytps-settings-help', '分组、图库清单和小助手记录通过独立同步文件保存；页面选项只保留在当前设备。酒馆原生人设和绑定仍由酒馆设置管理。没有同步服务时不会静默写回酒馆整包设置。'));
+    content.append(status, element('p', 'ytps-settings-help', '分组、图库清单和小助手记录会随同一个酒馆实例的设置同步；页面选项只保留在当前设备。酒馆原生人设和绑定仍由酒馆设置管理。安装可选的同步服务端插件后可获得版本校验和冲突保护。'));
     const label = element('label', 'checkbox_label'); const check = element('input'); check.type = 'checkbox'; check.dataset.setting = 'enabled';
     check.addEventListener('change', () => { void controlModule?.setEnabled(check.checked).then(updateSettingsUi).catch(error => report(error.message, 'error')); });
     label.append(check, element('span', '', '启用人设馆接管')); content.append(label);
