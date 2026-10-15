@@ -125,6 +125,26 @@ test('remote settings reader accepts the raw settings response shape', async () 
   }
 });
 
+test('failed remote read refuses the stale host save path', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldTavern = globalThis.SillyTavern;
+  let hostSaveCalls = 0;
+  const context = {
+    extensionSettings: { 'yantai-persona-studio': { assistantThreads: {} } },
+    saveSettingsDebounced: () => { hostSaveCalls += 1; },
+  };
+  globalThis.SillyTavern = { getContext: () => context };
+  globalThis.fetch = async () => ({ ok: false, status: 503, json: async () => ({}) });
+  try {
+    const adapter = createAdapter({ namespace: 'yantai-persona-studio' });
+    await assert.rejects(() => adapter.saveExtensionState({ assistantThreads: {} }), /读取酒馆设置失败/);
+    assert.equal(hostSaveCalls, 0);
+  } finally {
+    globalThis.fetch = oldFetch;
+    globalThis.SillyTavern = oldTavern;
+  }
+});
+
 test('load can recover assistant turns from the previous version snapshot', async () => {
   const oldFetch = globalThis.fetch;
   const oldTavern = globalThis.SillyTavern;
