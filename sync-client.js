@@ -390,4 +390,3 @@ export function createSyncClient({
     checksumState,
   };
 }
-

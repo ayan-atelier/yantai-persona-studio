@@ -95,4 +95,3 @@ test('invalid server state is rejected before it reaches the caller', () => {
   assert.throws(() => normalizeEnvelope({ state: [] }), /JSON 对象/);
   assert.throws(() => normalizeEnvelope({ schemaVersion: 9, state: {} }), error => error.code === 'UNSUPPORTED_SCHEMA');
 });
-
