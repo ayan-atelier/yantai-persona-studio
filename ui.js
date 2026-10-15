@@ -8,6 +8,19 @@ const TABS = {
   assistant: { label: '人设助手', icon: 'fa-wand-magic-sparkles' },
 };
 const UNCATEGORIZED_GROUP = '__uncategorized__';
+const LOCAL_UI_STORAGE_KEY = 'yantai-persona-studio.ui.v1';
+function uiStorage() { try { return globalThis.sessionStorage || globalThis.localStorage; } catch (_) { return null; } }
+function readLocalUi() {
+  const fallback = { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' };
+  try {
+    const raw = uiStorage()?.getItem(LOCAL_UI_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return { ...fallback, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+  } catch (_) { return fallback; }
+}
+function writeLocalUi(value) {
+  try { uiStorage()?.setItem(LOCAL_UI_STORAGE_KEY, JSON.stringify(value)); } catch (_) { /* private mode or quota */ }
+}
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const short = (value, n = 180) => { const s = String(value ?? '').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
 function galleryFileName(url) {
@@ -39,7 +52,25 @@ class App {
     this.host = null;
     this.fileInput = null;
     this.visible = false;
+    this.localUi = readLocalUi();
     this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', personaGroups: [], personaMeta: {}, personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
+  }
+  setLocalUi(patch = {}) {
+    this.localUi = { ...this.localUi, ...patch };
+    writeLocalUi(this.localUi);
+    this.state = { ...this.state, ...this.localUi };
+    return this.localUi;
+  }
+  currentTargetKey(target = this.state.target || {}) {
+    const clean = value => String(value ?? '').trim().replace(/[|\s]+/g, '_') || 'none';
+    return [clean(target.cardKey || target.cardFingerprint || 'no-card'), clean(target.chatId || target.chatKey || 'no-chat')].join('|');
+  }
+  threadMatchesCurrentTarget(thread) {
+    if (!thread || typeof thread !== 'object') return false;
+    const record = thread.target && typeof thread.target === 'object' ? thread.target : thread;
+    const card = record.cardKey || record.cardFingerprint;
+    const chat = record.chatId || record.chatKey;
+    return Boolean(card || chat) && this.currentTargetKey({ cardKey: card, chatId: chat }) === this.currentTargetKey();
   }
   mount() {
     if (this.root && this.root.isConnected) return this;
@@ -79,7 +110,29 @@ class App {
   }
   update(data = {}) {
     const s = data.state || {};
-    this.state = { ...this.state, ...data, ...s, activeTab: s.ui?.tab || data.activeTab || this.state.activeTab || 'current', gallerySheet: s.ui?.gallerySheet || data.gallerySheet || this.state.gallerySheet || 'avatars', selectedAssetId: s.ui?.selectedAssetId || data.selectedAssetId || this.state.selectedAssetId || '', editingPersonaId: s.ui?.editingPersonaId || data.editingPersonaId || this.state.editingPersonaId || '', libraryGroup: s.ui?.libraryGroup || data.libraryGroup || this.state.libraryGroup || 'all', personaGroups: Array.isArray(s.personaGroups || data.personaGroups) ? (s.personaGroups || data.personaGroups) : this.state.personaGroups || [], personaMeta: s.personaMeta || data.personaMeta || this.state.personaMeta || {}, personas: data.personas || [], gallery: s.gallery || [], nativeGallery: data.nativeGallery || [], drafts: s.drafts || [], assistantThreads: s.assistantThreads || data.assistantThreads || this.state.assistantThreads || {}, assistantActiveThreadKey: s.assistantActiveThreadKey || data.assistantActiveThreadKey || this.state.assistantActiveThreadKey || '', current: data.current || {}, target: data.target || {} };
+    const local = this.localUi || readLocalUi();
+    this.localUi = local;
+    const personas = data.personas || [];
+    const editingPersonaId = local.editingPersonaId && personas.length && !personas.some(item => String(item?.id || '') === String(local.editingPersonaId)) ? '' : local.editingPersonaId;
+    if (editingPersonaId !== local.editingPersonaId) this.setLocalUi({ editingPersonaId });
+    this.state = {
+      ...this.state, ...data, ...s,
+      activeTab: local.tab || 'current',
+      gallerySheet: local.gallerySheet === 'cards' ? 'cards' : 'avatars',
+      selectedAssetId: local.selectedAssetId || '',
+      editingPersonaId,
+      libraryGroup: local.libraryGroup || 'all',
+      personaGroups: Array.isArray(s.personaGroups || data.personaGroups) ? (s.personaGroups || data.personaGroups) : this.state.personaGroups || [],
+      personaMeta: s.personaMeta || data.personaMeta || this.state.personaMeta || {},
+      personas,
+      gallery: s.gallery || [],
+      nativeGallery: data.nativeGallery || [],
+      drafts: s.drafts || [],
+      assistantThreads: s.assistantThreads || data.assistantThreads || this.state.assistantThreads || {},
+      assistantActiveThreadKey: s.assistantActiveThreadKey || data.assistantActiveThreadKey || this.state.assistantActiveThreadKey || '',
+      current: data.current || s.current || {},
+      target: data.target || s.target || {},
+    };
     if (!this.state.suggestions?.length && !this.state.aiSessionFresh) this.state.suggestions = this.state.drafts[0]?.candidates || [];
     if (this.root) this.render();
     return this;
@@ -252,10 +305,10 @@ class App {
   assistantTurns() {
     const threads = this.state.assistantThreads && typeof this.state.assistantThreads === 'object' ? this.state.assistantThreads : {};
     const active = threads[this.state.assistantActiveThreadKey];
-    if (Array.isArray(active?.turns)) return active.turns;
-    if (Array.isArray(this.state.aiTurns)) return this.state.aiTurns;
-    const fallback = Object.values(threads).filter(item => Array.isArray(item?.turns)).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))[0];
-    return Array.isArray(fallback?.turns) ? fallback.turns : [];
+    // Never fall back to the newest thread. A newest thread can belong to a
+    // different card/chat and made the mobile page appear to switch personas.
+    if (!active || !this.threadMatchesCurrentTarget(active)) return [];
+    return Array.isArray(active.turns) ? active.turns : [];
   }
   assistantRound(turn, index, proposal = '') {
     const user = String(turn?.user || '').trim();
@@ -281,7 +334,8 @@ class App {
   }
   assistant() {
     const turns = this.assistantTurns();
-    const draft = this.state.drafts?.[0];
+    const currentTarget = this.currentTargetKey();
+    const draft = (this.state.drafts || []).find(item => item?.targetKey && item.targetKey === currentTarget);
     const suggestions = this.state.suggestions?.length ? this.state.suggestions : (draft?.candidates || []);
     const latestAnswer = String(turns[turns.length - 1]?.assistant || '');
     const latestTurn = turns[turns.length - 1];
@@ -321,16 +375,17 @@ class App {
     }
     if (action === 'tab') {
       this.state.activeTab = el.dataset.tab;
+      this.setLocalUi({ tab: this.state.activeTab });
       this.state.creatingPersona = this.state.activeTab === 'create';
       if (this.state.creatingPersona) { this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; }
       this.render();
       if (this.state.creatingPersona) await this.call('startNewPersona'); else await this.call('setTab', el.dataset.tab);
       return;
     }
-    if (action === 'gallery-sheet') { this.state.gallerySheet = el.dataset.sheet === 'cards' ? 'cards' : 'avatars'; this.state.assetQuery = ''; this.render(); await this.call('setGallerySheet', this.state.gallerySheet); return; }
+    if (action === 'gallery-sheet') { this.state.gallerySheet = el.dataset.sheet === 'cards' ? 'cards' : 'avatars'; this.setLocalUi({ gallerySheet: this.state.gallerySheet }); this.state.assetQuery = ''; this.render(); await this.call('setGallerySheet', this.state.gallerySheet); return; }
     if (action === 'import-assets') { if (!this.fileInput) { this.fileInput = document.createElement('input'); this.fileInput.type = 'file'; this.fileInput.multiple = true; this.fileInput.addEventListener('change', () => this.importFiles(this.fileInput.files)); } this.fileInput.accept = this.state.gallerySheet === 'cards' ? 'image/*,.json' : 'image/*'; this.fileInput.click(); return; }
     if (action === 'remove-asset') return this.call('removeGalleryAsset', el.dataset.id);
-    if (action === 'select-asset') { this.state.selectedAssetId = el.dataset.id || ''; this.render(); return this.call('selectGalleryAsset', el.dataset.id); }
+    if (action === 'select-asset') { this.state.selectedAssetId = el.dataset.id || ''; this.setLocalUi({ selectedAssetId: this.state.selectedAssetId }); this.render(); return this.call('selectGalleryAsset', el.dataset.id); }
     if (action === 'upload-gallery-avatar') {
       try {
         const result = await this.call('uploadGalleryAvatar', el.dataset.id, this.state.editingPersonaId || '');
@@ -354,6 +409,7 @@ class App {
     if (action === 'edit-persona' || action === 'open-editor') {
       this.state.creatingPersona = false;
       this.state.editingPersonaId = el.dataset.id || '';
+      this.setLocalUi({ tab: 'editor', editingPersonaId: this.state.editingPersonaId });
       this.state.editorDraft = null;
       this.state.activeTab = 'editor';
       // `setEditingPersona()` persists the shared state and triggers a full
@@ -364,11 +420,11 @@ class App {
       try { await this.call('setEditingPersona', this.state.editingPersonaId); } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
       return;
     }
-    if (action === 'editor-back') { this.state.activeTab = 'current'; this.render(); await this.call('setTab', 'current'); return; }
-    if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; this.render(); await this.call('startNewPersona'); return; }
+    if (action === 'editor-back') { this.state.activeTab = 'current'; this.setLocalUi({ tab: 'current', editingPersonaId: '' }); this.render(); await this.call('setTab', 'current'); return; }
+    if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.setLocalUi({ tab: 'create', editingPersonaId: '' }); this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; this.render(); await this.call('startNewPersona'); return; }
     if (action === 'continue-new-persona') { this.state.recentCreatedPersona = null; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.render(); this.root?.querySelector('[data-field="editorName"]')?.focus(); return; }
-    if (action === 'editor-avatar-gallery') { this.state.activeTab = 'gallery'; this.state.gallerySheet = 'avatars'; this.render(); await this.call('setGallerySheet', 'avatars'); await this.call('setTab', 'gallery'); return; }
-    if (action === 'gallery-back-editor') { this.state.activeTab = 'editor'; this.render(); await this.call('setTab', 'editor'); return; }
+    if (action === 'editor-avatar-gallery') { this.state.activeTab = 'gallery'; this.setLocalUi({ tab: 'gallery', gallerySheet: 'avatars' }); this.state.gallerySheet = 'avatars'; this.render(); await this.call('setGallerySheet', 'avatars'); await this.call('setTab', 'gallery'); return; }
+    if (action === 'gallery-back-editor') { this.state.activeTab = 'editor'; this.setLocalUi({ tab: 'editor' }); this.render(); await this.call('setTab', 'editor'); return; }
     if (action === 'editor-use') { await this.call('usePersona', el.dataset.id); this.state.activeTab = 'editor'; this.render(); return; }
     if (action === 'editor-bind') { await this.call('setBinding', el.dataset.scope, 'bind', el.dataset.id); this.render(); return; }
     if (action === 'editor-unbind') { for (const scope of ['chat', 'card', 'global']) await this.call('setBinding', scope, 'none', null); this.render(); return; }
@@ -420,7 +476,7 @@ class App {
     if (action === 'edit' || action === 'open-edit' || action === 'open-native-edit') return this.call('openNativeEdit', el.dataset.id);
     if (action === 'bind-current') { const currentId = this.state.current?.persona?.id; if (currentId) return this.call('setBinding', el.dataset.scope, el.dataset.mode || 'bind', currentId); this.options.report?.('先在“人设档案”里选择一份人设。', 'info'); return; }
     if (action === 'assistant-info') { this.options.report?.('Milo 使用酒馆当前主 API 生成回复，需要一点时间，通常约 30 秒到 1 分钟，具体取决于模型和网速。请耐心等待；失败的请求不会保存到助手记录。', 'info'); return; }
-    if (action === 'new-assistant') { this.state.aiSessionFresh = true; this.state.aiPrompt = ''; this.state.suggestions = []; await this.call('newAssistantThread'); this.state.aiSessionFresh = false; this.render(); return; }
+    if (action === 'new-assistant') { this.state.aiSessionFresh = true; this.state.aiPrompt = ''; this.state.suggestions = []; const thread = await this.call('newAssistantThread'); if (thread?.activeThreadKey) this.state.assistantActiveThreadKey = thread.activeThreadKey; this.state.aiSessionFresh = false; this.render(); return; }
     if (action === 'clear-assistant') { this.state.aiSessionFresh = true; this.state.suggestions = []; this.state.aiPrompt = ''; await this.call('clearAssistantThread'); this.state.aiSessionFresh = false; this.render(); return; }
     if (action === 'assistant-send') {
       const request = String(this.state.aiPrompt || '').trim();
@@ -434,18 +490,18 @@ class App {
       try {
         const actionName = hasHistory ? 'assistantChat' : 'createDraft';
         const result = await this.call(actionName, { request, includeCard: this.state.includeCard !== false, includeWorld: this.state.includeWorld === true, includeChat: this.state.includeChat === true });
-        this.state.aiPrompt = '';
-        if (result?.candidates?.length) this.state.suggestions = result.candidates.slice(0, 2);
-        if (result?.draft?.candidates?.length) this.state.suggestions = result.draft.candidates.slice(0, 2);
+        if (!result?.__yantaiStale) this.state.aiPrompt = '';
+        if (!result?.__yantaiStale && result?.candidates?.length) this.state.suggestions = result.candidates.slice(0, 2);
+        if (!result?.__yantaiStale && result?.draft?.candidates?.length) this.state.suggestions = result.draft.candidates.slice(0, 2);
       } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
       this.state.aiBusy = false;
       this.render();
       return;
     }
-    if (action === 'generate-ai') { this.state.aiBusy = true; this.state.aiSessionFresh = false; this.render(); try { const result = await this.call('createDraft', { request: this.state.aiPrompt || '', includeCard: this.state.includeCard !== false, includeWorld: this.state.includeWorld === true, includeChat: this.state.includeChat === true }); this.state.suggestions = result?.draft?.candidates || result?.candidates || []; } catch (error) { this.options.report?.(error.message || String(error), 'error'); } this.state.aiBusy = false; this.render(); return; }
-    if (action === 'assistant-chat') { const request = String(this.state.aiPrompt || '').trim(); if (!request) { this.options.report?.('先写下你想和 Milo 讨论的内容。', 'info'); return; } this.state.aiBusy = true; this.render(); try { const result = await this.call('assistantChat', { request, includeCard: this.state.includeCard !== false, includeWorld: this.state.includeWorld === true, includeChat: this.state.includeChat === true }); this.state.aiPrompt = ''; if (result?.candidates?.length) this.state.suggestions = result.candidates.slice(0, 2); } catch (error) { this.options.report?.(error.message || String(error), 'error'); } this.state.aiBusy = false; this.render(); return; }
-    if (action === 'save-candidate') { const candidate = (this.state.suggestions || [])[Number(el.dataset.index)]; if (candidate) return this.call('saveCandidate', this.state.drafts?.[0]?.id, candidate); }
-    if (action === 'revise') { const instruction = globalThis.prompt?.('告诉 AI 要怎么调整这个方向', '保留核心感觉，写得更具体一些'); if (!instruction) return; this.state.aiBusy = true; this.render(); try { const result = await this.call('reviseDraft', this.state.drafts?.[0]?.id, instruction); this.state.suggestions = result?.draft?.candidates || result?.candidates || []; } finally { this.state.aiBusy = false; this.render(); } }
+    if (action === 'generate-ai') { this.state.aiBusy = true; this.state.aiSessionFresh = false; this.render(); try { const result = await this.call('createDraft', { request: this.state.aiPrompt || '', includeCard: this.state.includeCard !== false, includeWorld: this.state.includeWorld === true, includeChat: this.state.includeChat === true }); if (!result?.__yantaiStale) this.state.suggestions = result?.draft?.candidates || result?.candidates || []; } catch (error) { this.options.report?.(error.message || String(error), 'error'); } this.state.aiBusy = false; this.render(); return; }
+    if (action === 'assistant-chat') { const request = String(this.state.aiPrompt || '').trim(); if (!request) { this.options.report?.('先写下你想和 Milo 讨论的内容。', 'info'); return; } this.state.aiBusy = true; this.render(); try { const result = await this.call('assistantChat', { request, includeCard: this.state.includeCard !== false, includeWorld: this.state.includeWorld === true, includeChat: this.state.includeChat === true }); if (!result?.__yantaiStale) { this.state.aiPrompt = ''; if (result?.candidates?.length) this.state.suggestions = result.candidates.slice(0, 2); } } catch (error) { this.options.report?.(error.message || String(error), 'error'); } this.state.aiBusy = false; this.render(); return; }
+    if (action === 'save-candidate') { const candidate = (this.state.suggestions || [])[Number(el.dataset.index)]; const draft = (this.state.drafts || []).find(item => item?.targetKey === this.currentTargetKey()); if (candidate && draft) return this.call('saveCandidate', draft.id, candidate); }
+    if (action === 'revise') { const instruction = globalThis.prompt?.('告诉 AI 要怎么调整这个方向', '保留核心感觉，写得更具体一些'); if (!instruction) return; this.state.aiBusy = true; this.render(); try { const result = await this.call('reviseDraft', (this.state.drafts || []).find(item => item?.targetKey === this.currentTargetKey())?.id, instruction); this.state.suggestions = result?.draft?.candidates || result?.candidates || []; } finally { this.state.aiBusy = false; this.render(); } }
   }
   onInput(event) {
     const field = event.target.dataset?.field; if (!field) return;
