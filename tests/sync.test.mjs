@@ -75,6 +75,16 @@ test('stale empty new-thread key cannot hide phone history without an explicit l
   assert.equal(deliberate.assistantActiveThreadKey, desktop);
 });
 
+test('an older non-empty desktop thread does not beat newer phone history', () => {
+  const base = assistantThreadBaseKey('card', 'chat');
+  const desktop = `${base}|new_desktop`;
+  const merged = mergeExtensionState(
+    { assistantThreads: { [base]: { updatedAt: 200, turns: [turn(200, '手机', '新记录')] } }, assistantActiveThreadKey: base },
+    { assistantThreads: { [desktop]: { updatedAt: 100, turns: [turn(100, '电脑', '旧记录')] } }, assistantActiveThreadKey: desktop },
+  );
+  assert.equal(merged.assistantActiveThreadKey, base);
+});
+
 test('remote save reads latest full settings and never calls stale host saver', async () => {
   const oldFetch = globalThis.fetch;
   const oldTavern = globalThis.SillyTavern;

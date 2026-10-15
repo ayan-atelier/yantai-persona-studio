@@ -179,9 +179,9 @@ export function mergeExtensionState(remote = {}, local = {}) {
     .filter(thread => Array.isArray(thread?.turns) && thread.turns.length)
     .reduce((latest, thread) => Math.max(latest, Number(thread?.updatedAt || 0)), 0);
   const explicitNewAt = Number(localState.assistantActiveThreadChangedAt || 0);
-  const freshThread = freshCandidates && (!merged.assistantThreads[freshCandidates]?.turns?.length
-    ? explicitNewAt > newestTurnAt ? freshCandidates : ''
-    : freshCandidates);
+  const freshThread = freshCandidates && !merged.assistantThreads[freshCandidates]?.turns?.length && explicitNewAt > newestTurnAt
+    ? freshCandidates
+    : '';
   const nonEmpty = activeCandidates.find(key => merged.assistantThreads[key]?.turns?.length);
   const latest = Object.entries(merged.assistantThreads)
     .filter(([, thread]) => Array.isArray(thread?.turns) && thread.turns.length)
