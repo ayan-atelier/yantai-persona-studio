@@ -152,10 +152,14 @@ export function normalizeEnvelope(payload, { allowStateOnly = false } = {}) {
     ? root.data : root;
   const hasState = Object.prototype.hasOwnProperty.call(candidate, 'state');
   if (!hasState && !allowStateOnly) throw new SyncValidationError('同步服务没有返回有效的 state。', { payload: root });
+  if (candidate.schemaVersion !== undefined && Number(candidate.schemaVersion) !== SYNC_SCHEMA_VERSION) {
+    throw new SyncValidationError(`同步服务的数据版本不受支持（${candidate.schemaVersion}）。`, { code: 'UNSUPPORTED_SCHEMA', payload: root });
+  }
   const state = hasState ? candidate.state : candidate;
   assertSyncState(state);
   return {
     state,
+    schemaVersion: candidate.schemaVersion === undefined ? SYNC_SCHEMA_VERSION : Number(candidate.schemaVersion),
     revision: normalizeRevision(candidate.revision ?? candidate.currentRevision ?? candidate.baseRevision),
     checksum: candidate.checksum ? String(candidate.checksum) : '',
     updatedAt: candidate.updatedAt || candidate.updated_at || '',
@@ -207,7 +211,7 @@ export class SyncUnavailableError extends SyncError {
 
 export class SyncValidationError extends SyncError {
   constructor(message, details = null) {
-    super(message, { code: 'SYNC_INVALID_RESPONSE', status: 200, details, retryable: false });
+    super(message, { code: details?.code || 'SYNC_INVALID_RESPONSE', status: 200, details, retryable: false });
     this.name = 'YantaiPersonaSyncValidationError';
   }
 }
