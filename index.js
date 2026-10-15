@@ -77,13 +77,21 @@
   // on another device can switch that device into the wrong page. Keep the
   // choice in localStorage so a reload on the same device does not hide a
   // freshly-created thread.
-  const LOCAL_THREAD_STORAGE_KEY = `${NS}.assistant-thread.v1`;
+  const LOCAL_THREAD_STORAGE_BASE = `${NS}.assistant-thread.v1`;
   function threadStorage() { try { return root.sessionStorage || root.localStorage; } catch (_) { return null; } }
+  function storageScope() {
+    let context = null;
+    try { context = root.SillyTavern?.getContext?.() || null; } catch (_) { /* use the origin fallback */ }
+    const user = context?.user?.profile || context?.user || context?.currentUser || {};
+    const identity = user?.handle || user?.username || user?.id || context?.userId || root.location?.origin || 'local';
+    return encodeURIComponent(String(identity)).replace(/%/g, '_').slice(0, 120) || 'local';
+  }
+  function scopedStorageKey(base) { return `${base}.${storageScope()}`; }
   function readLocalAssistantThreadKey() {
-    try { return String(threadStorage()?.getItem(LOCAL_THREAD_STORAGE_KEY) || ''); } catch (_) { return ''; }
+    try { return String(threadStorage()?.getItem(scopedStorageKey(LOCAL_THREAD_STORAGE_BASE)) || ''); } catch (_) { return ''; }
   }
   function writeLocalAssistantThreadKey(value) {
-    try { if (value) threadStorage()?.setItem(LOCAL_THREAD_STORAGE_KEY, String(value)); else threadStorage()?.removeItem(LOCAL_THREAD_STORAGE_KEY); } catch (_) { /* private mode or quota */ }
+    try { if (value) threadStorage()?.setItem(scopedStorageKey(LOCAL_THREAD_STORAGE_BASE), String(value)); else threadStorage()?.removeItem(scopedStorageKey(LOCAL_THREAD_STORAGE_BASE)); } catch (_) { /* private mode or quota */ }
   }
   let localAssistantThreadKey = readLocalAssistantThreadKey();
   let assistantGenerationToken = 0;
@@ -168,20 +176,21 @@
     controlModule = null;
   }
 
-  const localSettingKey = 'yantai-persona-studio.local-settings.v1';
+  const localSettingBase = 'yantai-persona-studio.local-settings.v1';
+  function localSettingKey() { return scopedStorageKey(localSettingBase); }
   function readLocalSettings() {
     try {
-      const value = JSON.parse(globalThis.localStorage?.getItem(localSettingKey) || '{}');
+      const value = JSON.parse(globalThis.localStorage?.getItem(localSettingKey()) || '{}');
       return value && typeof value === 'object' ? value : {};
     } catch (_) { return {}; }
   }
   function writeLocalSettings(patch = {}) {
     try {
       const current = readLocalSettings();
-      globalThis.localStorage?.setItem(localSettingKey, JSON.stringify({ ...current, ...patch }));
+      globalThis.localStorage?.setItem(localSettingKey(), JSON.stringify({ ...current, ...patch }));
     } catch (_) { /* private mode or quota */ }
   }
-  function pendingStateKey() { return 'yantai-persona-studio.pending-sync.v1'; }
+  function pendingStateKey() { return scopedStorageKey('yantai-persona-studio.pending-sync.v1'); }
   function queuePendingState(value) {
     try { globalThis.localStorage?.setItem(pendingStateKey(), JSON.stringify(value)); } catch (_) { /* keep the in-memory copy */ }
   }
