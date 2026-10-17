@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.5",
+  "latest": "1.0.6",
   "releases": [
+    {
+      "version": "1.0.6",
+      "branch": "v1.0.6",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆修复版。兼容角色卡或存档加载时的临时上下文标识，确保人设助手回复落到当前线程并显示。"
+    },
     {
       "version": "1.0.5",
       "branch": "v1.0.5",

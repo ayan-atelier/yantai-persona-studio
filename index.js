@@ -480,6 +480,32 @@
     return session ? `${key}|session_${session}` : key;
   }
   function targetKey(target = activeTarget()) { return assistantThreadKey({ ...target, cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }).replace(/\|session_[^|]+$/, ''); }
+  function provisionalAssistantTarget(target = {}) {
+    const character = target?.character;
+    const data = character?.data || character || {};
+    const hasCharacter = Boolean(character && (character.avatar || character.id || data.name));
+    const card = String(target?.cardKey || '').trim();
+    const chat = String(target?.chatId || '').trim();
+    return !hasCharacter || !card || card === 'no-card' || card === 'card_811c9c5' || !chat || chat === 'no-chat' || chat === 'current-chat';
+  }
+  function responseDestination(target, thread) {
+    const current = activeTarget();
+    if (targetKey(current) === targetKey(target)) return { target, thread };
+    // A card/chat can be provisionally empty while SillyTavern finishes
+    // loading it. If that is the only change during the request, move the
+    // response into the now-stable thread so the UI does not hide it behind
+    // the temporary no-card/no-chat key. A real switch between two loaded
+    // cards remains isolated and keeps the response on its original thread.
+    if (provisionalAssistantTarget(target) && !provisionalAssistantTarget(current)) {
+      return { target: current, thread: activeAssistantThread(current) };
+    }
+    const fromCards = [target.cardKey, target.legacyCardKey, target.cardFingerprint].map(value => String(value || '').trim()).filter(Boolean);
+    const toCards = [current.cardKey, current.legacyCardKey, current.cardFingerprint].map(value => String(value || '').trim()).filter(Boolean);
+    if (fromCards.some(card => toCards.includes(card)) && String(target.chatId || '') === String(current.chatId || '')) {
+      return { target: current, thread: activeAssistantThread(current) };
+    }
+    return { target, thread };
+  }
   function makeTurnId() {
     try { if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID(); } catch (_) { /* use the fallback below */ }
     return `turn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -1150,9 +1176,10 @@
         const source = assistantContext(input, snapshot);
         const thread = activeAssistantThread(target);
         const result = await ai.generateDirections({ input, target, state, context: source, history: thread.turns, thread, mode: 'propose' });
-        if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
-        appendAssistantTurn(thread, input?.request || '', result);
-        if (result?.draft) state.drafts = [{ ...result.draft, targetKey: targetKey(target), target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' } }, ...state.drafts].slice(0, 20);
+        const destination = responseDestination(target, thread);
+        if (!generationIsCurrent(destination.target, token, destination.thread)) return { ...result, __yantaiStale: true };
+        appendAssistantTurn(destination.thread, input?.request || '', result);
+        if (result?.draft) state.drafts = [{ ...result.draft, targetKey: targetKey(destination.target), target: { cardKey: destination.target.cardKey || 'no-card', legacyCardKey: destination.target.legacyCardKey || '', chatId: destination.target.chatId || 'no-chat' } }, ...state.drafts].slice(0, 20);
         await save({ syncGallery: false });
         return result;
       },
@@ -1165,8 +1192,9 @@
         const fn = ai.continueChat || ai.chat || ai.generateChat;
         if (typeof fn !== 'function') throw new Error('当前版本尚未加载小助手对话接口，请刷新酒馆后重试。');
         const result = await fn({ input, target, state, context: source, history: thread.turns, thread, mode: 'chat' });
-        if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
-        appendAssistantTurn(thread, input?.request || '', result);
+        const destination = responseDestination(target, thread);
+        if (!generationIsCurrent(destination.target, token, destination.thread)) return { ...result, __yantaiStale: true };
+        appendAssistantTurn(destination.thread, input?.request || '', result);
         await save({ syncGallery: false });
         return result;
       },
@@ -1200,9 +1228,10 @@
         const snapshot = await adapter.contextSnapshot({ includeWorld: false });
         const source = assistantContext({ includeCard: true }, snapshot);
         const result = await ai.reviseDraft({ draft, instruction, target, state, context: source, history: thread.turns, thread, mode: 'revision' });
-        if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
-        appendAssistantTurn(thread, instruction, result);
-        if (result?.draft) { state.drafts = [{ ...result.draft, targetKey: targetKey(target), target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' } }, ...state.drafts.filter(item => item.id !== draftId)].slice(0, 20); await save({ syncGallery: false }); }
+        const destination = responseDestination(target, thread);
+        if (!generationIsCurrent(destination.target, token, destination.thread)) return { ...result, __yantaiStale: true };
+        appendAssistantTurn(destination.thread, instruction, result);
+        if (result?.draft) { state.drafts = [{ ...result.draft, targetKey: targetKey(destination.target), target: { cardKey: destination.target.cardKey || 'no-card', legacyCardKey: destination.target.legacyCardKey || '', chatId: destination.target.chatId || 'no-chat' } }, ...state.drafts.filter(item => item.id !== draftId)].slice(0, 20); await save({ syncGallery: false }); }
         return result;
       },
       async saveCandidate(draftId, candidate) {
