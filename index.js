@@ -603,7 +603,7 @@
     // sharedState() strips it before any server write. It is a local
     // navigation pointer, never portable data.
     state.assistantActiveThreadKey = localAssistantThreadKey;
-    const contextSnapshot = await adapter.contextSnapshot();
+    const contextSnapshot = await adapter.contextSnapshot({ includeWorld: false });
     if (sequence !== refreshSequence || targetKey(activeTarget()) !== targetIdentity || !app) return;
     app.update({ state, target, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas: adapter.readNativePersonas(), nativeGallery: nativeGallery(), contextSnapshot });
   }
@@ -745,12 +745,15 @@
     return true;
   }
 
-  async function saveImpl() {
+  async function saveImpl({ syncGallery = true } = {}) {
     // Gallery bytes still go through SillyTavern's image API. The gallery
     // manifest and all other extension data go to the independent CAS store
     // when available, or the extension namespace through Tavern's own saver
     // in compatibility mode.
-    if ((gallerySyncDirty || !gallerySync) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
+    // Assistant responses only need the lightweight shared-state write. A
+    // first save on a device with legacy gallery entries can otherwise wait
+    // for every image upload before the reply reaches the mobile UI.
+    if (syncGallery && (gallerySyncDirty || !gallerySync) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       // Publish image bytes through SillyTavern's shared user image store
       // before writing settings. Settings then carry only metadata and a URL;
       // IndexedDB remains the local/offline cache.
@@ -799,8 +802,8 @@
     await refresh();
   }
   let saveChain = Promise.resolve();
-  function save() {
-    const run = saveChain.then(() => saveImpl(), () => saveImpl());
+  function save(options = {}) {
+    const run = saveChain.then(() => saveImpl(options), () => saveImpl(options));
     saveChain = run.catch(() => {});
     return run;
   }
@@ -1133,20 +1136,20 @@
       async createDraft(input) {
         const target = activeTarget();
         const token = ++assistantGenerationToken;
-        const snapshot = await adapter.contextSnapshot();
+        const snapshot = await adapter.contextSnapshot({ includeWorld: input?.includeWorld === true });
         const source = assistantContext(input, snapshot);
         const thread = activeAssistantThread(target);
         const result = await ai.generateDirections({ input, target, state, context: source, history: thread.turns, thread, mode: 'propose' });
         if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(thread, input?.request || '', result);
         if (result?.draft) state.drafts = [{ ...result.draft, targetKey: targetKey(target), target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' } }, ...state.drafts].slice(0, 20);
-        await save();
+        await save({ syncGallery: false });
         return result;
       },
       async assistantChat(input = {}) {
         const target = activeTarget();
         const token = ++assistantGenerationToken;
-        const snapshot = await adapter.contextSnapshot();
+        const snapshot = await adapter.contextSnapshot({ includeWorld: input?.includeWorld === true });
         const source = assistantContext(input, snapshot);
         const thread = activeAssistantThread(target);
         const fn = ai.continueChat || ai.chat || ai.generateChat;
@@ -1154,7 +1157,7 @@
         const result = await fn({ input, target, state, context: source, history: thread.turns, thread, mode: 'chat' });
         if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(thread, input?.request || '', result);
-        await save();
+        await save({ syncGallery: false });
         return result;
       },
       async clearAssistantThread() {
@@ -1162,7 +1165,7 @@
         const thread = activeAssistantThread(activeTarget());
         thread.turns = [];
         thread.updatedAt = Date.now();
-        await save();
+        await save({ syncGallery: false });
         return thread;
       },
       async newAssistantThread() {
@@ -1184,18 +1187,18 @@
         if (!draft) return;
         const token = ++assistantGenerationToken;
         const thread = activeAssistantThread(target);
-        const snapshot = await adapter.contextSnapshot();
+        const snapshot = await adapter.contextSnapshot({ includeWorld: false });
         const source = assistantContext({ includeCard: true }, snapshot);
         const result = await ai.reviseDraft({ draft, instruction, target, state, context: source, history: thread.turns, thread, mode: 'revision' });
         if (!generationIsCurrent(target, token, thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(thread, instruction, result);
-        if (result?.draft) { state.drafts = [{ ...result.draft, targetKey: targetKey(target), target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' } }, ...state.drafts.filter(item => item.id !== draftId)].slice(0, 20); await save(); }
+        if (result?.draft) { state.drafts = [{ ...result.draft, targetKey: targetKey(target), target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' } }, ...state.drafts.filter(item => item.id !== draftId)].slice(0, 20); await save({ syncGallery: false }); }
         return result;
       },
       async saveCandidate(draftId, candidate) {
         const draft = state.drafts.find(item => item.id === draftId);
         if (draft) { draft.acceptedCandidateId = candidate.id; draft.status = 'accepted'; }
-        await save();
+        await save({ syncGallery: false });
         await actions.openNativeCreate();
         report('候选已保留。酒馆原生新建窗口已打开，请把候选正文放入原生描述框；这样人设仍由酒馆管理，不会产生第二份副本。', 'info');
       },

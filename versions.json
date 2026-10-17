@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.1",
+  "latest": "1.0.3",
   "releases": [
+    {
+      "version": "1.0.3",
+      "branch": "v1.0.3",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆修复版。修复人设助手移动端无回复与手机电脑记录不同步；助手保存不再等待图库迁移，世界书按勾选读取。"
+    },
     {
       "version": "1.0.1",
       "branch": "v1.0.1",
