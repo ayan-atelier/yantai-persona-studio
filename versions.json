@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.4",
+  "latest": "1.0.5",
   "releases": [
+    {
+      "version": "1.0.5",
+      "branch": "v1.0.5",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆修复版。修复进入角色卡时人设助手因酒馆上下文切换而丢失回复的问题，并兼容卡片临时标识与正式标识。"
+    },
     {
       "version": "1.0.4",
       "branch": "v1.0.4",

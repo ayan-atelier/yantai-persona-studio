@@ -57,10 +57,17 @@ export function personaTargetKey(target = {}) {
 export function threadMatchesTarget(thread = {}, target = {}) {
   if (!thread || typeof thread !== 'object') return false;
   const record = thread.target && typeof thread.target === 'object' ? thread.target : thread;
-  const card = record.cardKey || record.cardFingerprint;
-  const chat = record.chatId || record.chatKey;
-  if (card || chat) return personaTargetKey({ cardKey: card, chatId: chat }) === personaTargetKey(target);
-  return false;
+  const clean = value => String(value ?? '').trim();
+  const cards = [record.cardKey, record.cardFingerprint, record.legacyCardKey].map(clean).filter(Boolean);
+  const wantedCards = [target.cardKey, target.cardFingerprint, target.legacyCardKey].map(clean).filter(Boolean);
+  const chat = clean(record.chatId || record.chatKey);
+  const wantedChat = clean(target.chatId || target.chatKey);
+  // SillyTavern can expose a card's content fingerprint before its avatar
+  // file id is available, then switch to the stable id once the card finishes
+  // loading. Treat those two identities as aliases for the same card so a
+  // pending assistant response is not discarded during that transition.
+  return Boolean(cards.length && wantedCards.length && chat && wantedChat
+    && chat === wantedChat && cards.some(card => wantedCards.includes(card)));
 }
 
 function normalizeBinding(value) {

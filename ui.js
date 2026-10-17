@@ -68,9 +68,16 @@ class App {
   threadMatchesCurrentTarget(thread) {
     if (!thread || typeof thread !== 'object') return false;
     const record = thread.target && typeof thread.target === 'object' ? thread.target : thread;
-    const card = record.cardKey || record.cardFingerprint;
-    const chat = record.chatId || record.chatKey;
-    return Boolean(card || chat) && this.currentTargetKey({ cardKey: card, chatId: chat }) === this.currentTargetKey();
+    const cards = [record.cardKey, record.cardFingerprint, record.legacyCardKey].map(value => String(value ?? '').trim()).filter(Boolean);
+    const target = this.state.target || {};
+    const wantedCards = [target.cardKey, target.cardFingerprint, target.legacyCardKey].map(value => String(value ?? '').trim()).filter(Boolean);
+    const chat = String(record.chatId || record.chatKey || '').trim();
+    const wantedChat = String(target.chatId || target.chatKey || '').trim();
+    // A card can briefly identify itself by content fingerprint before its
+    // avatar id is available. Keep the same thread visible across that
+    // transition while retaining strict chat isolation.
+    return Boolean(cards.length && wantedCards.length && chat && wantedChat
+      && chat === wantedChat && cards.some(card => wantedCards.includes(card)));
   }
   mount() {
     if (this.root && this.root.isConnected) return this;

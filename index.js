@@ -385,7 +385,7 @@
     if (Array.isArray(state.aiTurns) && state.aiTurns.length && !Object.keys(state.assistantThreads || {}).length) {
       const target = activeTarget();
       const key = assistantThreadKey(target);
-      state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: state.aiTurns.slice() };
+      state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: state.aiTurns.slice() };
       delete state.aiTurns;
     }
     const localSettings = readLocalSettings();
@@ -503,7 +503,7 @@
     }).sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0));
     const source = candidates[0]?.[1];
     if (!source) return null;
-    const migrated = { ...source, id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, turns: Array.isArray(source.turns) ? source.turns.slice() : [] };
+    const migrated = { ...source, id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, turns: Array.isArray(source.turns) ? source.turns.slice() : [] };
     state.assistantThreads[key] = migrated;
     return migrated;
   }
@@ -511,11 +511,13 @@
     state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
     const current = findCompatibleThread(target, key);
     if (current) {
-      current.target = current.target && typeof current.target === 'object' ? current.target : { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' };
+      // Keep both representations while a card is loading. Tavern can first
+      // expose a content fingerprint and then switch to the avatar file id.
+      current.target = { ...(current.target && typeof current.target === 'object' ? current.target : {}), cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || current.target?.legacyCardKey || '', chatId: target.chatId || 'no-chat' };
       current.id = key;
       return current;
     }
-    const thread = { id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
+    const thread = { id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
     state.assistantThreads[key] = thread;
     return thread;
   }
@@ -531,11 +533,13 @@
   }
   function generationIsCurrent(target, token, thread) {
     if (token !== assistantGenerationToken) return false;
-    if (targetKey(activeTarget()) !== targetKey(target)) return false;
-    // Session overrides and the local “new thread” selector are also page
-    // identity. A response must not land in an older thread after either one
-    // changes, even when card/chat stayed the same.
-    if (String(localAssistantThreadKey || '') !== String(thread?.id || '')) return false;
+    // SillyTavern can emit CHARACTER_CHANGED/CHAT_CHANGED while a request is
+    // still in flight (for example while a character chat finishes loading).
+    // The target key may briefly change from a provisional no-card/no-chat
+    // value to its stable card/chat identity. Treating that normal refresh as
+    // cancellation silently dropped a completed API reply. The captured
+    // thread is still the right destination; a deliberate “new thread” or
+    // “clear” action increments assistantGenerationToken and cancels it.
     return thread === state.assistantThreads?.[thread?.id];
   }
   function appendAssistantTurn(thread, user, result) {
@@ -1181,7 +1185,7 @@
         localAssistantThreadKey = key;
         writeLocalAssistantThreadKey(localAssistantThreadKey);
         state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
-        state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
+        state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
         // An empty thread is a local navigation event. It is not written as a
         // shared active selector; the first actual turn is shared normally.
         await refresh();
