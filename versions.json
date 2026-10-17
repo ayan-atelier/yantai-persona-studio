@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.6",
+  "latest": "1.0.7",
   "releases": [
+    {
+      "version": "1.0.7",
+      "branch": "v1.0.7",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆修复版。兼容角色卡上下文下模型返回普通文本或常见回复字段，避免有效回复被当成空内容。"
+    },
     {
       "version": "1.0.6",
       "branch": "v1.0.6",
