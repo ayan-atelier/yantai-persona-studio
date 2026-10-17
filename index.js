@@ -313,12 +313,20 @@
     }
     result.personaGroups = [...groups.values()];
     result.gallery = storage?.mergeGallery ? storage.mergeGallery(remote.gallery || [], local.gallery || []) : [...(remote.gallery || []), ...(local.gallery || [])];
+    const remoteManifest = remote.gallerySync && typeof remote.gallerySync === 'object' ? remote.gallerySync : null;
+    const localManifest = local.gallerySync && typeof local.gallerySync === 'object' ? local.gallerySync : null;
     result.galleryRemoved = {};
-    for (const source of [local.galleryRemoved, remote.galleryRemoved]) {
+    for (const source of [local.galleryRemoved, remote.galleryRemoved, localManifest?.removed, remoteManifest?.removed]) {
       for (const [id, at] of Object.entries(source || {})) {
         result.galleryRemoved[id] = Math.max(Number(result.galleryRemoved[id] || 0), Number(at || 0));
       }
     }
+    // A host-settings save merges the candidate with the older namespace.
+    // Apply tombstones during that merge so a deleted image cannot be
+    // immediately reintroduced into the current view. A later re-import with
+    // a newer timestamp is still allowed to revive the deterministic asset.
+    const isGalleryRemoved = item => Number(result.galleryRemoved[String(item?.id || '')] || 0) >= Number(item?.updatedAt || 0);
+    result.gallery = result.gallery.filter(item => !isGalleryRemoved(item));
     const threads = {};
     for (const [key, incoming] of Object.entries({ ...(remote.assistantThreads || {}), ...(local.assistantThreads || {}) })) {
       const previous = threads[key];
@@ -334,8 +342,6 @@
     const drafts = new Map();
     for (const draft of [...(remote.drafts || []), ...(local.drafts || [])]) if (draft?.id && !drafts.has(String(draft.id))) drafts.set(String(draft.id), draft);
     result.drafts = [...drafts.values()].slice(0, 20);
-    const remoteManifest = remote.gallerySync && typeof remote.gallerySync === 'object' ? remote.gallerySync : null;
-    const localManifest = local.gallerySync && typeof local.gallerySync === 'object' ? local.gallerySync : null;
     if (remoteManifest || localManifest) {
       const assets = new Map();
       for (const item of [...(localManifest?.assets || []), ...(remoteManifest?.assets || [])]) {
@@ -343,14 +349,14 @@
         const previous = assets.get(String(item.id));
         if (!previous || Number(item.updatedAt || 0) >= Number(previous.updatedAt || 0)) assets.set(String(item.id), item);
       }
-      const removed = {};
+      const removed = { ...result.galleryRemoved };
       for (const source of [localManifest?.removed, remoteManifest?.removed]) {
         for (const [id, at] of Object.entries(source || {})) removed[id] = Math.max(Number(removed[id] || 0), Number(at || 0));
       }
       result.gallerySync = {
         ...(localManifest || {}), ...(remoteManifest || {}),
         version: Math.max(Number(localManifest?.version || 0), Number(remoteManifest?.version || 0), 2),
-        assets: [...assets.values()], removed,
+        assets: [...assets.values()].filter(item => Number(removed[String(item?.id || '')] || 0) < Number(item?.updatedAt || 0)), removed,
       };
     } else result.gallerySync = null;
     return result;
