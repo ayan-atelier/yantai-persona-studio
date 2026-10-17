@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.3",
+  "latest": "1.0.4",
   "releases": [
+    {
+      "version": "1.0.4",
+      "branch": "v1.0.4",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆修复版。修复普通安装下删除图库图片后被旧同步清单重新恢复的问题；保留重新导入同一素材的能力。"
+    },
     {
       "version": "1.0.3",
       "branch": "v1.0.3",
