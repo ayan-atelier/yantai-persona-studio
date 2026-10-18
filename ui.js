@@ -573,4 +573,3 @@ class App {
 export function createApp(options = {}) { return new App(options); }
 export { TABS };
 
-

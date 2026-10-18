@@ -1398,4 +1398,3 @@
   root.yantaiPersonaStudioClean = async () => { await storage?.clear(); };
   try { await initialize(); } catch (error) { initialized = false; console.error('[砚台·人设馆]', error); report('加载失败：' + (error?.message || error), 'error'); }
 })();
-
