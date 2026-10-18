@@ -11,6 +11,13 @@
       "notes": "砚台 · 人设馆稳定合并版。包含 v1.0.6 的卡内临时上下文修复、v1.0.7 的回复解析兼容、全局 Milo 记录和手机电脑合并保护；不要回退到 v1.0.5 或更早版本。"
     },
     {
+      "version": "1.0.7",
+      "branch": "v1.0.7",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆解析补丁。兼容 reply、answer、response、content、text 和 message 等常见字段；它不包含 v1.0.8 的全局助手与跨设备合并保护。"
+    },
+    {
       "version": "1.0.6",
       "branch": "v1.0.6",
       "settings_schema": 3,
