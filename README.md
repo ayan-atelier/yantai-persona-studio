@@ -72,4 +72,3 @@ https://github.com/ayan-atelier/yantai-persona-studio
 ## 反馈
 
 请附上酒馆版本、设备／浏览器、主题、截图、触发步骤，以及是链接安装还是文件夹安装。
-

@@ -152,4 +152,3 @@ export function createVersionManager({ settings, save, flush = save, context, mo
     dispose() { disposed = true; for (const controller of readControllers) controller.abort(); readControllers.clear(); },
   };
 }
-
