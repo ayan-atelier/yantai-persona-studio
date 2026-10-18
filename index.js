@@ -475,7 +475,10 @@
           syncRevision = 'host';
           syncRemoteState = sharedState(saved);
           syncStatus = 'host-ready';
-          report(`安全同步服务暂不可用，已切换到酒馆设置兼容同步：${error?.message || error}`, 'warning');
+          // The server plugin is optional. A malformed or unavailable probe
+          // should not look like a user-facing failure when the host-settings
+          // provider is working; real write failures are reported separately.
+          try { console.debug('[砚台·人设馆] optional safe-sync probe failed; using Tavern settings sync.', error); } catch (_) { /* ignore diagnostics */ }
         }
       }
     } else {

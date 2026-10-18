@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.9",
+  "latest": "1.0.10",
   "releases": [
+    {
+      "version": "1.0.10",
+      "branch": "v1.0.10",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆提示修复版。安全同步服务探测异常时静默回退到酒馆设置同步，避免单设备用户收到无用的报错提示；实际保存失败和同步冲突仍会提示。"
+    },
     {
       "version": "1.0.9",
       "branch": "v1.0.9",
