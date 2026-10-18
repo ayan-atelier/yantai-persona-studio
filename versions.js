@@ -1,5 +1,5 @@
 /* Explicit, user-triggered release switching for the native persona extension. */
-export const PERSONA_VERSION = '1.0.7';
+export const PERSONA_VERSION = '1.0.8';
 export const PERSONA_ID = 'yantai-persona-studio';
 export const SETTINGS_SCHEMA = 3;
 export const DEFAULT_REPOSITORY = 'https://github.com/ayan-atelier/yantai-persona-studio';
@@ -152,3 +152,4 @@ export function createVersionManager({ settings, save, flush = save, context, mo
     dispose() { disposed = true; for (const controller of readControllers) controller.abort(); readControllers.clear(); },
   };
 }
+

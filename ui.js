@@ -68,6 +68,10 @@ class App {
   threadMatchesCurrentTarget(thread) {
     if (!thread || typeof thread !== 'object') return false;
     const record = thread.target && typeof thread.target === 'object' ? thread.target : thread;
+    // The Milo base thread is intentionally portable across role cards and
+    // chats. Keep it visible when the user moves between cards on either
+    // device; card-scoped legacy threads still use the strict match below.
+    if (record.scope === 'global' || record.cardKey === '*' || record.chatId === '*') return true;
     const cards = [record.cardKey, record.cardFingerprint, record.legacyCardKey].map(value => String(value ?? '').trim()).filter(Boolean);
     const target = this.state.target || {};
     const wantedCards = [target.cardKey, target.cardFingerprint, target.legacyCardKey].map(value => String(value ?? '').trim()).filter(Boolean);
@@ -568,4 +572,5 @@ class App {
 
 export function createApp(options = {}) { return new App(options); }
 export { TABS };
+
 

@@ -83,6 +83,11 @@
   // choice in localStorage so a reload on the same device does not hide a
   // freshly-created thread.
   const LOCAL_THREAD_STORAGE_BASE = `${NS}.assistant-thread.v1`;
+  // Milo is a user-owned notebook rather than a property of the currently
+  // open role card. Legacy card/chat threads are merged into this portable
+  // base thread during load, while an explicit "新开一段" session keeps its
+  // own local navigation key.
+  const GLOBAL_ASSISTANT_THREAD_KEY = 'milo-global';
   function threadStorage() { try { return root.sessionStorage || root.localStorage; } catch (_) { return null; } }
   function storageScope() {
     let context = null;
@@ -261,7 +266,7 @@
     // Persona folders belong to the extension organiser rather than the
     // native persona store.  A missing groupId deliberately means “未分类”,
     // so older settings remain compatible without a migration pass.
-    return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, assistantThreads: {}, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
+    return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, assistantThreads: {}, assistantGlobalClearedAt: 0, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
   }
 
   function sharedState(source = state) {
@@ -304,6 +309,9 @@
   }
   function mergeSharedState(remote = {}, local = {}) {
     const result = { ...local, ...remote };
+    const assistantGlobalClearedAt = Math.max(Number(remote.assistantGlobalClearedAt || 0), Number(local.assistantGlobalClearedAt || 0));
+    const survivesAssistantClear = turn => assistantGlobalClearedAt <= 0 || Number(turn?.at || 0) > assistantGlobalClearedAt;
+    result.assistantGlobalClearedAt = assistantGlobalClearedAt;
     result.personaMeta = { ...(local.personaMeta || {}), ...(remote.personaMeta || {}) };
     const groups = new Map();
     for (const group of [...(local.personaGroups || []), ...(remote.personaGroups || [])]) {
@@ -328,15 +336,26 @@
     const isGalleryRemoved = item => Number(result.galleryRemoved[String(item?.id || '')] || 0) >= Number(item?.updatedAt || 0);
     result.gallery = result.gallery.filter(item => !isGalleryRemoved(item));
     const threads = {};
-    for (const [key, incoming] of Object.entries({ ...(remote.assistantThreads || {}), ...(local.assistantThreads || {}) })) {
-      const previous = threads[key];
-      if (!previous) { threads[key] = { ...incoming, turns: Array.isArray(incoming?.turns) ? [...incoming.turns] : [] }; continue; }
+    const threadKeys = new Set([...Object.keys(remote.assistantThreads || {}), ...Object.keys(local.assistantThreads || {})]);
+    for (const key of threadKeys) {
+      const remoteThread = remote.assistantThreads?.[key];
+      const localThread = local.assistantThreads?.[key];
+      const incomingTurns = [
+        ...(Array.isArray(remoteThread?.turns) ? remoteThread.turns : []),
+        ...(Array.isArray(localThread?.turns) ? localThread.turns : []),
+      ].filter(survivesAssistantClear);
       const byId = new Map();
-      for (const turn of [...(previous.turns || []), ...(incoming?.turns || [])]) {
+      for (const turn of incomingTurns) {
         const id = String(turn?.turnId || `${turn?.at || 0}|${turn?.user || ''}|${turn?.assistant || turn?.memory || ''}`);
         if (!byId.has(id)) byId.set(id, turn);
       }
-      threads[key] = { ...previous, ...incoming, target: incoming?.target || previous.target, turns: [...byId.values()].sort((a, b) => Number(a?.at || 0) - Number(b?.at || 0)), updatedAt: Math.max(Number(previous.updatedAt || 0), Number(incoming?.updatedAt || 0)) };
+      const base = { ...(localThread || {}), ...(remoteThread || {}) };
+      threads[key] = {
+        ...base,
+        target: remoteThread?.target || localThread?.target,
+        turns: [...byId.values()].sort((a, b) => Number(a?.at || 0) - Number(b?.at || 0)),
+        updatedAt: Math.max(Number(localThread?.updatedAt || 0), Number(remoteThread?.updatedAt || 0)),
+      };
     }
     result.assistantThreads = threads;
     const drafts = new Map();
@@ -388,6 +407,7 @@
       state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: state.aiTurns.slice() };
       delete state.aiTurns;
     }
+    mergeAssistantThreadsToGlobal();
     const localSettings = readLocalSettings();
     if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
     state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {};
@@ -431,6 +451,7 @@
             gallerySync = state.gallerySync || gallerySync;
             if (gallerySync) await storage.importSync(gallerySync).catch(() => {});
             mergeGalleryManifest(gallerySync);
+            mergeAssistantThreadsToGlobal();
             syncStatus = 'ready';
           }
         } else if (hasSharedData(state)) {
@@ -463,23 +484,52 @@
       syncRemoteState = sharedState(saved);
       syncStatus = 'host-ready';
     }
+    mergeAssistantThreadsToGlobal();
     return state;
   }
   function activeTarget() {
     const ctx = adapter.context();
     return { chatId: adapter.chatKey(ctx), cardKey: adapter.cardKey(ctx), legacyCardKey: adapter.cardFingerprint(ctx), character: adapter.currentCharacter(ctx), chatTitle: adapter.chatTitle(ctx) };
   }
+  function globalAssistantTarget() { return { scope: 'global', cardKey: '*', legacyCardKey: '*', chatId: '*' }; }
+  function mergeAssistantThreadsToGlobal() {
+    state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
+    const existing = state.assistantThreads[GLOBAL_ASSISTANT_THREAD_KEY];
+    const global = existing && typeof existing === 'object' ? { ...existing } : { id: GLOBAL_ASSISTANT_THREAD_KEY, ...globalAssistantTarget(), createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
+    const byId = new Map();
+    const clearAt = Number(state.assistantGlobalClearedAt || 0);
+    const survivesClear = turn => clearAt <= 0 || Number(turn?.at || 0) > clearAt;
+    for (const turn of (Array.isArray(global.turns) ? global.turns : []).filter(survivesClear)) {
+      const id = String(turn?.turnId || `${turn?.at || 0}|${turn?.user || ''}|${turn?.assistant || turn?.memory || ''}`);
+      if (!byId.has(id)) byId.set(id, turn);
+    }
+    // A clear is a portable tombstone. Without it, old card-scoped archives
+    // would be reintroduced the next time the two devices merge settings.
+    if (!clearAt) {
+      for (const [key, thread] of Object.entries(state.assistantThreads)) {
+        if (key === GLOBAL_ASSISTANT_THREAD_KEY || key.startsWith(`${GLOBAL_ASSISTANT_THREAD_KEY}|new_`)) continue;
+        for (const turn of (Array.isArray(thread?.turns) ? thread.turns : [])) {
+          const id = String(turn?.turnId || `${turn?.at || 0}|${turn?.user || ''}|${turn?.assistant || turn?.memory || ''}`);
+          if (!byId.has(id)) byId.set(id, turn);
+        }
+      }
+    }
+    global.id = GLOBAL_ASSISTANT_THREAD_KEY;
+    global.target = globalAssistantTarget();
+    global.turns = [...byId.values()].sort((a, b) => Number(a?.at || 0) - Number(b?.at || 0));
+    global.createdAt = Math.min(Number(global.createdAt || Date.now()), ...global.turns.map(turn => Number(turn?.at || Date.now())));
+    global.updatedAt = Math.max(Number(global.updatedAt || 0), ...global.turns.map(turn => Number(turn?.at || 0)), clearAt);
+    state.assistantThreads[GLOBAL_ASSISTANT_THREAD_KEY] = global;
+    return global;
+  }
   function assistantThreadKey(target = activeTarget()) {
-    // Do not include a browser/user identity here. ST installs commonly use
-    // the same local account on a phone and desktop, and the target itself is
-    // the portable conversation identity.
-    const key = adapter?.targetKey
+    return GLOBAL_ASSISTANT_THREAD_KEY;
+  }
+  function targetKey(target = activeTarget()) {
+    return adapter?.targetKey
       ? adapter.targetKey({ cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' })
       : [target.cardKey || 'no-card', target.chatId || 'no-chat'].map(value => String(value).replace(/[|\s]+/g, '_')).join('|');
-    const session = String(state?.sessionOverride || '').trim().replace(/[|\s]+/g, '_');
-    return session ? `${key}|session_${session}` : key;
   }
-  function targetKey(target = activeTarget()) { return assistantThreadKey({ ...target, cardKey: target.cardKey || 'no-card', chatId: target.chatId || 'no-chat' }).replace(/\|session_[^|]+$/, ''); }
   function provisionalAssistantTarget(target = {}) {
     const character = target?.character;
     const data = character?.data || character || {};
@@ -539,11 +589,13 @@
     if (current) {
       // Keep both representations while a card is loading. Tavern can first
       // expose a content fingerprint and then switch to the avatar file id.
-      current.target = { ...(current.target && typeof current.target === 'object' ? current.target : {}), cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || current.target?.legacyCardKey || '', chatId: target.chatId || 'no-chat' };
+      current.target = String(key) === GLOBAL_ASSISTANT_THREAD_KEY || String(key).startsWith(`${GLOBAL_ASSISTANT_THREAD_KEY}|new_`)
+        ? globalAssistantTarget()
+        : { ...(current.target && typeof current.target === 'object' ? current.target : {}), cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || current.target?.legacyCardKey || '', chatId: target.chatId || 'no-chat' };
       current.id = key;
       return current;
     }
-    const thread = { id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
+    const thread = { id: key, target: String(key) === GLOBAL_ASSISTANT_THREAD_KEY || String(key).startsWith(`${GLOBAL_ASSISTANT_THREAD_KEY}|new_`) ? globalAssistantTarget() : { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
     state.assistantThreads[key] = thread;
     return thread;
   }
@@ -566,7 +618,8 @@
     // cancellation silently dropped a completed API reply. The captured
     // thread is still the right destination; a deliberate “new thread” or
     // “clear” action increments assistantGenerationToken and cancels it.
-    return thread === state.assistantThreads?.[thread?.id];
+    const current = state.assistantThreads?.[thread?.id];
+    return thread === current;
   }
   function appendAssistantTurn(thread, user, result) {
     if (!thread || !String(user || '').trim() || !result || result.error) return;
@@ -695,8 +748,8 @@
     clearPendingState();
     return true;
   }
-  async function persistSharedState() {
-    const candidate = sharedState(state);
+  async function persistSharedState(candidate = sharedState(state)) {
+
     if (syncMode === 'host') {
       try {
         return await persistHostSharedState(candidate);
@@ -781,7 +834,7 @@
     return true;
   }
 
-  async function saveImpl({ syncGallery = true } = {}) {
+  async function saveImpl({ syncGallery = true, queuedShared = null } = {}) {
     // Gallery bytes still go through SillyTavern's image API. The gallery
     // manifest and all other extension data go to the independent CAS store
     // when available, or the extension namespace through Tavern's own saver
@@ -834,12 +887,17 @@
       }
     }
     state.gallerySync = gallerySync;
-    await persistSharedState();
+    await persistSharedState(queuedShared || sharedState(state));
     await refresh();
   }
   let saveChain = Promise.resolve();
   function save(options = {}) {
-    const run = saveChain.then(() => saveImpl(options), () => saveImpl(options));
+    // Assistant saves can wait behind a previous host refresh. Capture the
+    // shared snapshot at enqueue time so that refresh cannot replace the new
+    // turn with the older settings document before persistHostSharedState runs.
+    const queuedShared = options.syncGallery === false ? sharedState(state) : null;
+    const queuedOptions = queuedShared ? { ...options, queuedShared } : options;
+    const run = saveChain.then(() => saveImpl(queuedOptions), () => saveImpl(queuedOptions));
     saveChain = run.catch(() => {});
     return run;
   }
@@ -1203,6 +1261,7 @@
         const thread = activeAssistantThread(activeTarget());
         thread.turns = [];
         thread.updatedAt = Date.now();
+        if (thread.id === GLOBAL_ASSISTANT_THREAD_KEY) state.assistantGlobalClearedAt = Date.now();
         await save({ syncGallery: false });
         return thread;
       },
@@ -1213,7 +1272,7 @@
         localAssistantThreadKey = key;
         writeLocalAssistantThreadKey(localAssistantThreadKey);
         state.assistantThreads = state.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {};
-        state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
+        state.assistantThreads[key] = { id: key, target: globalAssistantTarget(), createdAt: Date.now(), updatedAt: Date.now(), turns: [] };
         // An empty thread is a local navigation event. It is not written as a
         // shared active selector; the first actual turn is shared normally.
         await refresh();
@@ -1339,3 +1398,4 @@
   root.yantaiPersonaStudioClean = async () => { await storage?.clear(); };
   try { await initialize(); } catch (error) { initialized = false; console.error('[砚台·人设馆]', error); report('加载失败：' + (error?.message || error), 'error'); }
 })();
+
