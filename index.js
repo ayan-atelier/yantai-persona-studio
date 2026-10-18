@@ -286,7 +286,7 @@
       shared.gallerySync = gallerySync;
     }
     if (Array.isArray(shared.gallery)) {
-      const fields = ['id', 'kind', 'name', 'mime', 'size', 'hash', 'createdAt', 'updatedAt', 'remoteUrl', 'previewUrl', 'thumbnailUrl', 'source', 'avatarId'];
+      const fields = ['id', 'kind', 'name', 'mime', 'size', 'hash', 'createdAt', 'updatedAt', 'remoteUrl', 'previewUrl', 'thumbnailUrl', 'remoteResetAt', 'source', 'avatarId'];
       shared.gallery = shared.gallery.map(item => {
         const copy = {};
         for (const field of fields) if (item?.[field] !== undefined) copy[field] = item[field];
@@ -741,6 +741,11 @@
       ui: state.ui,
       assistantActiveThreadKey: state.assistantActiveThreadKey,
     });
+    // Host compatibility saves carry shared gallery metadata only, so they
+    // intentionally omit this browser session's Blob URLs. Rehydrate the
+    // local IndexedDB bytes before the next render or upload/delete appears
+    // to make every thumbnail disappear until the user refreshes the page.
+    state.gallery = await storage.hydrateGallery(state.gallery || []);
     syncRemoteState = sharedState(merged);
     syncRevision = 'host';
     syncMode = 'host';

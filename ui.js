@@ -308,9 +308,12 @@ class App {
   assetCard(a) {
     const selected = this.state.selectedAssetId && String(this.state.selectedAssetId) === String(a.id);
     const isNative = a.source === 'native';
-    const fallback = galleryFallbackUrl(a.url, isNative ? 'avatar' : 'persona');
-    const preview = a.url ? '<button class="ytps-asset-preview" data-action="preview-asset" data-url="' + esc(a.url) + '" data-fallback="' + esc(fallback) + '" data-name="' + esc(a.name || '') + '" title="查看原图"><i class="fa-solid fa-expand"></i></button>' : '';
-    const image = a.url ? '<img src="' + esc(a.url) + '"' + (fallback ? ' data-fallback-src="' + esc(fallback) + '"' : '') + ' alt="">' : '<i class="fa-solid ' + (a.kind === 'card' ? 'fa-address-card' : 'fa-image') + '"></i>';
+    // Shared host settings intentionally omit Blob URLs. Keep a hosted or
+    // thumbnail URL usable in the immediate render while local bytes hydrate.
+    const imageUrl = a.url || a.remoteUrl || a.previewUrl || a.thumbnailUrl || '';
+    const fallback = galleryFallbackUrl(imageUrl, isNative ? 'avatar' : 'persona');
+    const preview = imageUrl ? '<button class="ytps-asset-preview" data-action="preview-asset" data-url="' + esc(imageUrl) + '" data-fallback="' + esc(fallback) + '" data-name="' + esc(a.name || '') + '" title="查看原图"><i class="fa-solid fa-expand"></i></button>' : '';
+    const image = imageUrl ? '<img src="' + esc(imageUrl) + '"' + (fallback ? ' data-fallback-src="' + esc(fallback) + '"' : '') + ' alt="">' : '<i class="fa-solid ' + (a.kind === 'card' ? 'fa-address-card' : 'fa-image') + '"></i>';
     return '<article class="ytps-asset ' + (selected ? 'is-selected' : '') + ' ' + (isNative ? 'is-native' : '') + '"><button class="ytps-asset-select" data-action="select-asset" data-id="' + esc(a.id) + '" title="' + (isNative ? '选择此图' : '选用此图') + '">' + (selected ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-' + (isNative ? 'eye' : 'check') + '"></i>') + '</button>' + preview + '<div class="ytps-asset-thumb" data-action="select-asset" data-id="' + esc(a.id) + '" title="点击选择这张图">' + image + '</div><div class="ytps-asset-meta"><b>' + esc(a.name) + '</b><small>' + (isNative ? '酒馆角色卡' : a.kind === 'card' ? '角色卡文件' : '头像素材') + '</small></div>' + (!isNative ? '<button class="ytps-remove" data-action="remove-asset" data-id="' + esc(a.id) + '" title="移除素材"><i class="fa-solid fa-xmark"></i></button>' : '') + '</article>';
   }
   assistantTurns() {

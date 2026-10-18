@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.8",
+  "latest": "1.0.9",
   "releases": [
+    {
+      "version": "1.0.9",
+      "branch": "v1.0.9",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆图库修复版。修复酒馆兼容保存后缩略图全部消失；同文件重新导入会清除失效旧地址并重新上传。保留 v1.0.8 的人设助手与手机电脑合并保护。"
+    },
     {
       "version": "1.0.8",
       "branch": "v1.0.8",

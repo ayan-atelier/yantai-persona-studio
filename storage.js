@@ -202,15 +202,23 @@ export function createStorage({ report = () => {} } = {}) {
       if (!previous) { byId.set(item.id, item); continue; }
       const newer = (item.updatedAt || 0) >= (previous.updatedAt || 0) ? item : previous;
       const older = newer === item ? previous : item;
+      // A same-file re-import gets the same deterministic id. Treat its
+      // fresh local Blob URL as a replacement, so a stale hosted URL from a
+      // deleted server file cannot suppress the upload of the new bytes.
+      const localReplacement = !String(newer.remoteUrl || '').trim()
+        && (Number(newer.remoteResetAt || 0) > 0 || isEphemeralUrl(newer.url) || newer.blob);
       // Metadata from another device may be newer while the local browser
       // still owns the only Blob preview. Preserve both the hosted URL and a
       // usable local URL instead of replacing one record wholesale.
       byId.set(item.id, {
         ...older,
         ...newer,
-        remoteUrl: preferGalleryUrl(newer.remoteUrl, older.remoteUrl),
-        previewUrl: newer.previewUrl || older.previewUrl || '',
-        url: preferGalleryUrl(newer.url, older.url),
+        remoteUrl: localReplacement ? '' : preferGalleryUrl(newer.remoteUrl, older.remoteUrl),
+        previewUrl: localReplacement ? '' : (newer.previewUrl || older.previewUrl || ''),
+        url: localReplacement ? String(newer.url || '') : preferGalleryUrl(newer.url, older.url),
+        remoteResetAt: localReplacement
+          ? Number(newer.remoteResetAt || newer.updatedAt || Date.now())
+          : (String(newer.remoteUrl || '').trim() ? 0 : Number(newer.remoteResetAt || older.remoteResetAt || 0)),
       });
     }
     return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
