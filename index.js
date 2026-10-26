@@ -77,6 +77,8 @@
   // without copying a second plugin.  This fallback has no server CAS.
   let syncMode = 'checking';
   let syncRemoteState = null;
+  let pendingSyncNotice = false;
+  let pendingGalleryNotice = false;
   // The selected assistant thread is a browser-local navigation choice. It
   // must never be persisted in shared settings, otherwise opening the plugin
   // on another device can switch that device into the wrong page. Keep the
@@ -210,7 +212,10 @@
       return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
     } catch (_) { return null; }
   }
-  function clearPendingState() { try { globalThis.localStorage?.removeItem(pendingStateKey()); } catch (_) {} }
+  function clearPendingState() {
+    try { globalThis.localStorage?.removeItem(pendingStateKey()); } catch (_) {}
+    pendingSyncNotice = false;
+  }
 
   function stopObserver() {
     observer?.disconnect?.();
@@ -281,6 +286,9 @@
             if (/^(?:data:|blob:)/i.test(String(copy[key] || ''))) delete copy[key];
           }
           return copy;
+        }).filter(item => {
+          const image = /^image\//i.test(String(item?.mime || ''));
+          return Boolean(item?.id) && (!image || String(item.remoteUrl || item.url || '').trim());
         });
       }
       shared.gallerySync = gallerySync;
@@ -294,7 +302,10 @@
           if (/^(?:data:|blob:)/i.test(String(copy[field] || ''))) delete copy[field];
         }
         return copy;
-      }).filter(item => item.id);
+      }).filter(item => {
+        const image = /^image\//i.test(String(item?.mime || ''));
+        return item.id && (!image || String(item.remoteUrl || item.url || '').trim());
+      });
     }
     return { ...shared, version: Math.max(Number(shared.version || 0), 3) };
   }
@@ -396,7 +407,10 @@
     const pending = readPendingState();
     if (pending) {
       state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(pending, sharedState(state)) });
-      report('发现上次未确认的本机同步副本，已先保留在当前页面，等待安全同步确认。', 'warning');
+      // Keep the recoverable local copy and surface its presence in the
+      // extension settings. Startup toasts make a historical interrupted save
+      // look like a fresh failure on every device and every reload.
+      pendingSyncNotice = true;
     }
     // Older builds exposed a single aiTurns array. Move it into the exact
     // current target thread once so the strict UI filter does not discard
@@ -424,6 +438,14 @@
     state.gallery = storage.mergeGallery(state.gallery, persisted.map(item => ({ ...item, blob: undefined })));
     state.gallery = state.gallery.filter(item => Number(state.galleryRemoved[item.id] || 0) <= Number(item.updatedAt || 0));
     state.gallery = await storage.hydrateGallery(state.gallery);
+    // A previous release could sync a gallery row before its bytes reached
+    // the shared image store. Keep that row out of the visible gallery on a
+    // device that has neither a local Blob nor a server URL; a blank card
+    // must not look like a successful cross-device sync.
+    state.gallery = state.gallery.filter(item => {
+      const image = /^image\//i.test(String(item?.mime || ''));
+      return !image || Boolean(String(item?.url || item?.remoteUrl || item?.previewUrl || '').trim());
+    });
     // Existing installs may contain local-only images from the old sync path
     // data-URL sync. Mark them for one-time server migration after the app is
     // ready; the local Blob remains usable even if upload is unavailable.
@@ -445,7 +467,10 @@
             // view and stop; silently selecting the remote document here
             // would make the phone's last edits appear to vanish.
             syncStatus = 'conflict';
-            report('远端已有新版本，而本机还有未确认的修改；已停止自动合并，请在设置中确认合并。', 'warning');
+            // This is a recoverable startup state, not an action failure.
+            // Keep it in the settings status so a reload does not produce a
+            // stack of identical warnings on mobile or on a second device.
+            pendingSyncNotice = true;
           } else {
             state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(syncRemoteState, sharedState(state)) });
             gallerySync = state.gallerySync || gallerySync;
@@ -699,7 +724,7 @@
     if (sequence !== refreshSequence || targetKey(activeTarget()) !== targetIdentity || !app) return;
     app.update({ state, target, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas: adapter.readNativePersonas(), nativeGallery: nativeGallery(), contextSnapshot });
   }
-  async function persistHostSharedState(candidate) {
+  async function persistHostSharedState(candidate, { preservePending = false } = {}) {
     const context = adapter?.context?.();
     if (!context || typeof context !== 'object') throw new Error('酒馆上下文不可用，无法保存人设馆设置。');
     const settings = context.extensionSettings && typeof context.extensionSettings === 'object'
@@ -748,19 +773,26 @@
     // intentionally omit this browser session's Blob URLs. Rehydrate the
     // local IndexedDB bytes before the next render or upload/delete appears
     // to make every thumbnail disappear until the user refreshes the page.
-    state.gallery = await storage.hydrateGallery(state.gallery || []);
+    const persistedAssets = await storage.listAssets().catch(() => []);
+    state.gallery = storage.mergeGallery(state.gallery || [], persistedAssets.map(item => ({ ...item, blob: undefined })));
+    state.gallery = await storage.hydrateGallery(state.gallery);
     syncRemoteState = sharedState(merged);
     syncRevision = 'host';
     syncMode = 'host';
     syncStatus = 'host-ready';
-    clearPendingState();
+    if (preservePending) {
+      queuePendingState(candidate);
+      pendingSyncNotice = true;
+    } else {
+      clearPendingState();
+    }
     return true;
   }
-  async function persistSharedState(candidate = sharedState(state)) {
+  async function persistSharedState(candidate = sharedState(state), { preservePending = false } = {}) {
 
     if (syncMode === 'host') {
       try {
-        return await persistHostSharedState(candidate);
+        return await persistHostSharedState(candidate, { preservePending });
       } catch (error) {
         queuePendingState(candidate);
         syncStatus = 'error';
@@ -785,7 +817,12 @@
       syncRevision = result.revision;
       syncStatus = 'ready';
       syncRemoteState = candidate;
-      clearPendingState();
+      if (preservePending) {
+        queuePendingState(candidate);
+        pendingSyncNotice = true;
+      } else {
+        clearPendingState();
+      }
       return true;
     } catch (error) {
       queuePendingState(candidate);
@@ -810,8 +847,11 @@
 
   async function migrateToSafeSync() {
     if (syncMode === 'host') {
-      const persisted = await persistHostSharedState(sharedState(state));
-      await refresh();
+      // The compatibility provider used to persist metadata first. If a
+      // phone had just added images, that published a blank record on the PC
+      // before the server upload had a chance to run. Reuse the normal save
+      // pipeline so bytes are uploaded and the manifest is built first.
+      const persisted = await saveImpl({ syncGallery: true });
       updateSettingsUi();
       return persisted;
     }
@@ -825,21 +865,22 @@
       // gallery records, turns and drafts with the remote document.
       state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(sharedState(state), remote.state) });
       syncStatus = 'ready';
-      const persisted = await persistSharedState();
-      await refresh();
+      const persisted = await saveImpl({ syncGallery: true });
       if (persisted) report('已确认合并本机副本与远端记录，合并结果已写入安全同步。', 'info');
       updateSettingsUi();
       return persisted;
     }
     await makeTavernSnapshot();
-    const result = await syncClient.putState(sharedState(state), { baseRevision: remote.revision });
-    syncRevision = result.revision;
-    syncRemoteState = result.state;
+    // Set the CAS base before entering the common save path. This lets a
+    // first migration publish local gallery bytes before committing the
+    // compact manifest, while still writing against the revision just read.
+    syncRevision = remote.revision;
+    syncRemoteState = remote.state;
     syncStatus = 'ready';
-    clearPendingState();
-    report('已完成安全同步迁移；旧版酒馆设置仍保留为备份。', 'info');
+    const persisted = await saveImpl({ syncGallery: true });
+    if (persisted) report('已完成安全同步迁移；旧版酒馆设置仍保留为备份。', 'info');
     updateSettingsUi();
-    return true;
+    return persisted;
   }
 
   async function saveImpl({ syncGallery = true, queuedShared = null } = {}) {
@@ -866,7 +907,9 @@
         }
         gallerySyncDirty = true;
       }
-      if (hosted.failed.length) report(`图库服务器同步失败 ${hosted.failed.length} 张，当前设备仍保留本地副本。`, 'warning');
+      // Keep an incomplete upload in the settings status instead of opening
+      // another toast on every refresh. The local Blob stays available for a
+      // later explicit retry.
       // Keep the settings payload a compact manifest. Legacy data URLs are
       // still accepted/imported, but new files use the server-backed path.
       // Keep the 500 MiB fallback for older Tavern builds where the image API
@@ -878,11 +921,18 @@
       if (nextGallerySync) {
         const latestGallerySync = syncRemoteState?.gallerySync || gallerySync;
         if (latestGallerySync) {
-          // Prefer the hosted manifest, while retaining a legacy data-URL
-          // entry when its local upload failed or the current device has no
-          // Blob to retry. This keeps an old image recoverable instead of
-          // trading the migration for data loss.
-          const assets = new Map((latestGallerySync.assets || []).map(item => [item.id, item]));
+          // Prefer the hosted manifest. An image without a usable server URL
+          // is intentionally left out: publishing its metadata would create
+          // an empty card on another device and falsely mark the upload done.
+          const resetIds = new Set((state.gallery || [])
+            .filter(item => /^image\//i.test(String(item?.mime || ''))
+              && !String(item?.remoteUrl || '').trim()
+              && Number(item?.remoteResetAt || 0) > 0)
+            .map(item => String(item.id)));
+          const assets = new Map((latestGallerySync.assets || [])
+            .filter(item => !resetIds.has(String(item?.id || '')))
+            .filter(item => !/^image\//i.test(String(item?.mime || '')) || String(item?.remoteUrl || item?.url || '').trim())
+            .map(item => [item.id, item]));
           for (const item of nextGallerySync.assets) {
             const previous = assets.get(item.id);
             if (!previous || Number(item.updatedAt || 0) >= Number(previous.updatedAt || 0)) assets.set(item.id, item);
@@ -891,12 +941,28 @@
           nextGallerySync.assets = [...assets.values()].filter(item => Number(removed[item.id] || 0) <= Number(item.updatedAt || 0));
           nextGallerySync.removed = removed;
         }
-        gallerySync = { ...nextGallerySync, version: 2, provider: 'tavern-user-images' }; gallerySyncDirty = false;
+        gallerySync = { ...nextGallerySync, version: 2, provider: 'tavern-user-images' };
+        // A failed upload leaves only a local IndexedDB Blob. Do not mark the
+        // migration complete while an image is still waiting; the next save
+        // must retry it instead of publishing a metadata-only record that
+        // renders as an empty card on another device.
+        const persistedAssets = await storage.listAssets().catch(() => []);
+        const localBlobIds = new Set(persistedAssets
+          .filter(item => item?.blob && typeof item.blob.arrayBuffer === 'function')
+          .map(item => String(item.id)));
+        const pendingLocalImage = state.gallery.some(item => /^image\//i.test(String(item?.mime || ''))
+          && !String(item?.remoteUrl || '').trim()
+          && localBlobIds.has(String(item.id)));
+        gallerySyncDirty = Boolean(hosted.failed.length || pendingLocalImage);
+        pendingGalleryNotice = gallerySyncDirty;
+        updateSettingsUi();
       }
     }
     state.gallerySync = gallerySync;
-    await persistSharedState(queuedShared || sharedState(state));
+    const preservePending = Boolean(syncGallery && gallerySyncDirty);
+    const persisted = await persistSharedState(queuedShared || sharedState(state), { preservePending });
     await refresh();
+    return Boolean(persisted && !preservePending);
   }
   let saveChain = Promise.resolve();
   function save(options = {}) {
@@ -943,7 +1009,8 @@
     const status = document.querySelector('#ytps-settings [data-role="status"]');
     if (status) {
       const syncLabel = syncStatus === 'ready' ? '安全同步已启用' : syncStatus === 'host-ready' ? '兼容同步已启用（保护有限）' : syncStatus === 'needs-migration' ? '等待迁移旧记录' : syncStatus === 'conflict' ? '同步冲突已停止覆盖' : syncStatus === 'checking' ? '正在检查同步服务' : syncStatus === 'error' ? '同步保存失败' : '同步服务未连接';
-      status.textContent = `${enabled ? '已启用' : '已关闭'} · V${VERSION} · ${syncLabel}`;
+      const notices = [pendingSyncNotice ? '有待确认本机副本' : '', pendingGalleryNotice ? '有未上传图库图片' : ''].filter(Boolean);
+      status.textContent = `${enabled ? '已启用' : '已关闭'} · V${VERSION} · ${syncLabel}${notices.length ? ` · ${notices.join('、')}` : ''}`;
     }
     const migrate = document.querySelector('#ytps-settings [data-action="migrate-sync"]');
     if (migrate) migrate.hidden = syncMode !== 'server' || !['needs-migration', 'ready', 'conflict'].includes(syncStatus);
@@ -1039,7 +1106,12 @@
     if (initialized) return;
     initialized = true;
     await loadModules();
+    // A newer extension runtime can dispose this one while its dynamic
+    // imports are still resolving. Do not let the old instance continue and
+    // emit duplicate startup notices after the new instance has mounted.
+    if (disposed) return;
     await loadState();
+    if (disposed) return;
     registerControlModule();
     app = ui.createApp({ version: VERSION, adapter, storage, actions: {}, report, getState: () => ({ state, target: activeTarget(), current: resolved() }) });
     const actions = {
@@ -1311,9 +1383,8 @@
       state: () => state,
     };
     app.options.actions = actions;
-    if (state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) {
-      report('发现尚未上传到酒馆图库的本地图片；为避免打开电脑时产生写入，已暂不自动迁移，请在确认安全同步后执行一次明确保存。', 'info');
-    }
+    pendingGalleryNotice = state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl);
+    updateSettingsUi();
     adapter.on('CHAT_CHANGED', refresh);
     adapter.on('CHARACTER_CHANGED', refresh);
     adapter.on('PERSONA_CHANGED', refresh);
