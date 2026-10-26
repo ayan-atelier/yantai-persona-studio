@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.10",
+  "latest": "1.0.11",
   "releases": [
+    {
+      "version": "1.0.11",
+      "branch": "v1.0.11",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆图库与同步修复版。确认同步前先上传原图，避免另一台设备出现空卡片；启动时静默处理可恢复状态；修复图库拖拽 JPG 被酒馆全局导入器误报；保存人设后刷新原生编辑区。"
+    },
     {
       "version": "1.0.10",
       "branch": "v1.0.10",
