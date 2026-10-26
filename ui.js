@@ -103,9 +103,9 @@ class App {
       image.dataset.ytpsFallbackTried = '1';
       image.src = fallback;
     }, true);
-    this.root.addEventListener('dragover', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.preventDefault(); z.classList.add('is-dragging'); } });
-    this.root.addEventListener('dragleave', event => event.target.closest('.ytps-dropzone')?.classList.remove('is-dragging'));
-    this.root.addEventListener('drop', event => { const z = event.target.closest('.ytps-dropzone'); if (!z) return; event.preventDefault(); z.classList.remove('is-dragging'); this.importFiles(event.dataTransfer.files); });
+    this.root.addEventListener('dragover', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.preventDefault(); event.stopPropagation(); z.classList.add('is-dragging'); } });
+    this.root.addEventListener('dragleave', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.stopPropagation(); z.classList.remove('is-dragging'); } });
+    this.root.addEventListener('drop', event => { const z = event.target.closest('.ytps-dropzone'); if (!z) return; event.preventDefault(); event.stopPropagation(); z.classList.remove('is-dragging'); this.importFiles(event.dataTransfer?.files); });
     return this;
   }
   open() { if (!this.mount()) return null; this.visible = true; this.render(); return this; }
