@@ -469,9 +469,31 @@ export async function updateNativePersona(id, patch = {}, context = getStContext
   }
   const saver = context.saveSettingsDebounced ?? context.saveSettings;
   if (typeof saver === 'function') await Promise.resolve(saver.call(context));
-  await emitNativeEvent(context, 'PERSONA_UPDATED', avatarId);
   const native = api || await nativeApi();
-  await native?.getUserAvatars?.(false, avatarId);
+  // SillyTavern keeps the persona editor textarea and the rendered avatar
+  // list separate from the power-user records above.  A plain
+  // getUserAvatars(false) only reads the list; it does not repaint either
+  // surface.  Refresh the native UI after the settings write, but never
+  // re-select the target persona: setUserAvatar() early-returns for the
+  // already-selected id and can touch chat/default locks on older clients.
+  if (String(current || '') === avatarId && typeof native?.setPersonaDescription === 'function') {
+    try {
+      await Promise.resolve(native.setPersonaDescription());
+    } catch (error) {
+      console.debug('[砚台·人设馆] native persona description refresh unavailable', error);
+    }
+  }
+  if (typeof native?.getUserAvatars === 'function') {
+    try {
+      await Promise.resolve(native.getUserAvatars(true, avatarId));
+    } catch (error) {
+      // Older/Tauri builds may only accept the read-only signature. Keep the
+      // existing fallback so the data write still succeeds there.
+      console.debug('[砚台·人设馆] native persona list render refresh unavailable', error);
+      try { await Promise.resolve(native.getUserAvatars(false, avatarId)); } catch (_) { /* keep the saved native record */ }
+    }
+  }
+  await emitNativeEvent(context, 'PERSONA_UPDATED', avatarId);
   return true;
 }
 
