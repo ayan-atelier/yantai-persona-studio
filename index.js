@@ -154,6 +154,7 @@
       async setEnabled(value) {
         state.enabled = Boolean(value);
         writeLocalSettings({ enabled: state.enabled });
+        try { await adapter?.saveExtensionState?.({ enabled: state.enabled }); } catch (_) { /* local setting remains authoritative */ }
         await refresh();
         if (!state.enabled) {
           lastNativeOpen = null;
@@ -192,14 +193,20 @@
   function localSettingKey() { return scopedStorageKey(localSettingBase); }
   function readLocalSettings() {
     try {
-      const value = JSON.parse(globalThis.localStorage?.getItem(localSettingKey()) || '{}');
-      return value && typeof value === 'object' ? value : {};
+      const scoped = JSON.parse(globalThis.localStorage?.getItem(localSettingKey()) || 'null');
+      const base = JSON.parse(globalThis.localStorage?.getItem(localSettingBase) || 'null');
+      return {
+        ...(base && typeof base === 'object' ? base : {}),
+        ...(scoped && typeof scoped === 'object' ? scoped : {}),
+      };
     } catch (_) { return {}; }
   }
   function writeLocalSettings(patch = {}) {
     try {
       const current = readLocalSettings();
-      globalThis.localStorage?.setItem(localSettingKey(), JSON.stringify({ ...current, ...patch }));
+      const next = JSON.stringify({ ...current, ...patch });
+      globalThis.localStorage?.setItem(localSettingKey(), next);
+      globalThis.localStorage?.setItem(localSettingBase, next);
     } catch (_) { /* private mode or quota */ }
   }
   function pendingStateKey() { return scopedStorageKey('yantai-persona-studio.pending-sync.v1'); }
@@ -759,7 +766,7 @@
     // defaults (enabled/ui/current thread) overwrite browser-local choices in
     // the host namespace.
     const merged = mergeSharedState(candidate, sharedState(current));
-    settings[NS] = { ...currentNamespace, ...merged };
+    settings[NS] = { ...currentNamespace, ...merged, enabled: state.enabled !== false };
     const saver = context.saveSettingsDebounced;
     if (typeof saver !== 'function') throw new Error('当前酒馆没有可用的设置保存入口。');
     await Promise.resolve(saver.call(context));
@@ -1057,12 +1064,9 @@
     state.ui.tab = allowedTabs.has(tab) ? tab : 'current';
     app?.setLocalUi?.({ tab: state.ui.tab });
     app?.update?.({ state });
-    const nativePanel = ensureNative ? await adapter.openNativePersonaPanel() : ([...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null) || document.querySelector('#persona-management-block'));
-    if (!ensureNative && !adapter.isNativePersonaPanelOpen()) {
-      app?.close();
-      adapter.setNativeTakeover(false);
-      return;
-    }
+    const nativePanel = ensureNative
+      ? await adapter.openNativePersonaPanel()
+      : (adapter.findNativePersonaPanel?.() || document.querySelector('#persona-management-block'));
     if (!nativePanel) {
       report('没有找到酒馆原生人设面板，请先打开“人设管理”后再试。', 'warning');
       return;
@@ -1077,7 +1081,6 @@
   }
 
   async function syncNativeDrawer() {
-    const isOpen = Boolean(adapter?.isNativePersonaPanelOpen?.());
     if (state.enabled === false) {
       app?.close();
       adapter?.setNativeTakeover?.(false);
@@ -1085,21 +1088,33 @@
       adapter?.setNativePresentation?.(false);
       return;
     }
-    if (isOpen === lastNativeOpen && !editMode) return;
+    const isOpen = Boolean(adapter?.isNativePersonaPanelOpen?.());
+    const openedNow = isOpen && lastNativeOpen === false;
+    const closedNow = !isOpen && lastNativeOpen === true;
     lastNativeOpen = isOpen;
-    if (isOpen) {
-      if (editMode) {
-        app?.close();
-        adapter?.setNativeEditMode?.(true);
-      } else {
-        await open({ ensureNative: false });
-      }
+    if (closedNow && editMode) {
+      editMode = false;
+    }
+    if (editMode) {
+      app?.close();
+      adapter?.setNativeTakeover?.(false);
+      adapter?.setNativeEditMode?.(true);
       return;
     }
-    editMode = false;
-    app?.close();
-    adapter?.setNativeTakeover?.(false);
-    adapter?.setNativeEditMode?.(false);
+    const panel = adapter?.findNativePersonaPanel?.() || document.querySelector('#persona-management-block');
+    if (!panel) return;
+    if (openedNow) {
+      state.ui = { ...(state.ui || {}), tab: 'current' };
+      app?.setLocalUi?.({ tab: 'current' });
+    }
+    const mountedNow = !app?.root?.isConnected || app.host !== panel || !app.visible;
+    if (mountedNow) {
+      app?.open?.();
+    }
+    adapter?.setNativeTakeover?.(true);
+    if (openedNow || mountedNow) {
+      await refresh();
+    }
   }
 
   async function initialize() {
@@ -1410,6 +1425,19 @@
       if (changed) await save();
     };
     adapter.on('PERSONA_DELETED', personaDeleted);
+    const onHostReady = async () => {
+      if (disposed) return;
+      const localSettings = readLocalSettings();
+      if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
+      if (state.enabled !== false) await adapter.installEntry();
+      adapter.setNativePresentation?.(state.enabled !== false);
+      installSettingsEntry();
+      updateSettingsUi();
+      await syncNativeDrawer();
+      await refresh();
+    };
+    adapter.on('APP_READY', onHostReady);
+    adapter.on('SETTINGS_LOADED', onHostReady);
     if (state.enabled !== false) await adapter.installEntry();
     adapter.setNativePresentation?.(state.enabled !== false);
     installSettingsEntry();
@@ -1445,6 +1473,7 @@
         const targets = [
           document.querySelector('#PersonaManagement'),
           document.querySelector('#persona-management-button'),
+          document.querySelector('#persona-management-button .drawer-icon'),
         ].filter(Boolean);
         if (!targets.length) return;
         // The drawer open/close state lives on these small native containers.
@@ -1453,8 +1482,17 @@
         panelObserver ||= new MutationObserver(() => scheduleSync());
         for (const target of targets) {
           if (panelObserverTargets.has(target)) continue;
-          panelObserver.observe(target, { attributes: true, attributeFilter: ['class', 'hidden'] });
+          panelObserver.observe(target, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
           panelObserverTargets.add(target);
+        }
+        const toggleButton = document.querySelector('#persona-management-button');
+        if (toggleButton && !panelObserverTargets.has(toggleButton.querySelector?.('.drawer-toggle') || toggleButton)) {
+          const clickTarget = toggleButton.querySelector?.('.drawer-toggle') || toggleButton;
+          panelObserverTargets.add(clickTarget);
+          clickTarget.addEventListener('click', () => {
+            scheduleSync();
+            setTimeout(scheduleSync, 180);
+          });
         }
       };
       // Keep the document observer to detect a lazy-mounted native drawer, but

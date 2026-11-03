@@ -84,28 +84,33 @@ class App {
       && chat === wantedChat && cards.some(card => wantedCards.includes(card)));
   }
   mount() {
-    if (this.root && this.root.isConnected) return this;
-    this.host = [...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null) || document.querySelector('#persona-management-block');
-    if (!this.host) return null;
-    this.root = document.createElement('section');
-    this.root.id = 'yt-persona-native-workspace';
-    this.root.setAttribute('aria-label', '砚台人设馆');
+    const host = this.options.adapter?.findNativePersonaPanel?.()
+      || [...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null)
+      || document.querySelector('#persona-management-block');
+    if (!host) return null;
+    if (this.root && this.root.isConnected && this.host === host && host.contains(this.root)) return this;
+    this.host = host;
+    if (!this.root) {
+      this.root = document.createElement('section');
+      this.root.id = 'yt-persona-native-workspace';
+      this.root.setAttribute('aria-label', '砚台人设馆');
+      this.root.addEventListener('click', event => this.onClick(event));
+      this.root.addEventListener('input', event => this.onInput(event));
+      this.root.addEventListener('change', event => this.onChange(event));
+      this.root.addEventListener('keydown', event => this.onKeyDown(event));
+      this.root.addEventListener('error', event => {
+        const image = event.target;
+        if (image?.tagName !== 'IMG' || image.dataset.ytpsFallbackTried !== undefined) return;
+        const fallback = image.dataset.fallbackSrc;
+        if (!fallback || image.src === fallback) return;
+        image.dataset.ytpsFallbackTried = '1';
+        image.src = fallback;
+      }, true);
+      this.root.addEventListener('dragover', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.preventDefault(); event.stopPropagation(); z.classList.add('is-dragging'); } });
+      this.root.addEventListener('dragleave', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.stopPropagation(); z.classList.remove('is-dragging'); } });
+      this.root.addEventListener('drop', event => { const z = event.target.closest('.ytps-dropzone'); if (!z) return; event.preventDefault(); event.stopPropagation(); z.classList.remove('is-dragging'); this.importFiles(event.dataTransfer?.files); });
+    }
     this.host.prepend(this.root);
-    this.root.addEventListener('click', event => this.onClick(event));
-    this.root.addEventListener('input', event => this.onInput(event));
-    this.root.addEventListener('change', event => this.onChange(event));
-    this.root.addEventListener('keydown', event => this.onKeyDown(event));
-    this.root.addEventListener('error', event => {
-      const image = event.target;
-      if (image?.tagName !== 'IMG' || image.dataset.ytpsFallbackTried !== undefined) return;
-      const fallback = image.dataset.fallbackSrc;
-      if (!fallback || image.src === fallback) return;
-      image.dataset.ytpsFallbackTried = '1';
-      image.src = fallback;
-    }, true);
-    this.root.addEventListener('dragover', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.preventDefault(); event.stopPropagation(); z.classList.add('is-dragging'); } });
-    this.root.addEventListener('dragleave', event => { const z = event.target.closest('.ytps-dropzone'); if (z) { event.stopPropagation(); z.classList.remove('is-dragging'); } });
-    this.root.addEventListener('drop', event => { const z = event.target.closest('.ytps-dropzone'); if (!z) return; event.preventDefault(); event.stopPropagation(); z.classList.remove('is-dragging'); this.importFiles(event.dataTransfer?.files); });
     return this;
   }
   open() { if (!this.mount()) return null; this.visible = true; this.render(); return this; }
@@ -159,12 +164,37 @@ class App {
     this.root.innerHTML = '<nav class=\"ytps-tabs\">' + Object.keys(TABS).map(key => '<button class=\"ytps-tab ' + (tab === key ? 'is-active' : '') + '\" data-action=\"tab\" data-tab=\"' + key + '\"><i class=\"fa-solid ' + TABS[key].icon + '\"></i><span>' + TABS[key].label + '</span></button>').join('') + '</nav>' +
       '<div class=\"ytps-body\">' + this.view() + '</div>';
     if (this.root.hidden !== !this.visible) this.root.hidden = !this.visible;
+    this.syncDrawerListHeight(tab);
     if (tab === 'assistant') {
       requestAnimationFrame(() => {
         const history = this.root?.querySelector('.ytps-ai-history');
         if (history) history.scrollTop = history.scrollHeight;
       });
     }
+  }
+  syncDrawerListHeight(tab = this.state.activeTab || 'current') {
+    if (!this.root) return;
+    const measureAndFit = () => {
+      if (!this.root || !this.root.isConnected) return;
+      this.root.style.removeProperty('--ytps-list-max-height');
+      this.root.style.removeProperty('--ytps-gallery-max-height');
+      if (tab !== 'library' && tab !== 'gallery') return;
+      if (typeof globalThis.matchMedia === 'function' && globalThis.matchMedia('(max-width: 700px)').matches) return;
+      const drawer = this.root.closest('#PersonaManagement, .drawer-content');
+      if (!drawer) return;
+      const drawerRect = drawer.getBoundingClientRect();
+      const rootRect = this.root.getBoundingClientRect();
+      if (drawerRect.height <= 0 || rootRect.height <= 0) return;
+      const style = typeof globalThis.getComputedStyle === 'function' ? globalThis.getComputedStyle(drawer) : null;
+      const padBottom = parseFloat(style?.paddingBottom || '0') || 0;
+      const unusedBottom = Math.floor(drawerRect.bottom - padBottom - rootRect.bottom);
+      if (unusedBottom > 32) {
+        this.root.style.setProperty('--ytps-list-max-height', `${440 + unusedBottom - 8}px`);
+        this.root.style.setProperty('--ytps-gallery-max-height', `${520 + unusedBottom - 8}px`);
+      }
+    };
+    measureAndFit();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(measureAndFit);
   }
   view() { return this.state.activeTab === 'library' ? this.library() : (this.state.activeTab === 'editor' || this.state.activeTab === 'create') ? this.editor() : this.state.activeTab === 'gallery' ? this.gallery() : this.state.activeTab === 'assistant' ? this.assistant() : this.current(); }
   current() {

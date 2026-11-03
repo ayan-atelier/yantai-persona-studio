@@ -692,9 +692,27 @@ export async function setNativeBinding(scope, id, context = getStContext(), api 
 
   return false;
 }
+export function isElementVisible(item) {
+  if (!item || item.hidden) return false;
+  const style = typeof globalThis.getComputedStyle === 'function' ? globalThis.getComputedStyle(item) : null;
+  if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+  if (typeof item.getBoundingClientRect === 'function') {
+    const rect = item.getBoundingClientRect();
+    if (rect.width > 0 || rect.height > 0) return true;
+  }
+  if (typeof item.getClientRects === 'function' && item.getClientRects().length > 0) return true;
+  // `position: fixed` drawers (TauriTavern 2.4.0, pinned .fillLeft/.fillRight,
+  // MovingUI, and custom themes) always report `offsetParent === null`.
+  if (style && style.position === 'fixed' && style.display !== 'none') return true;
+  return item.offsetParent !== null;
+}
+export function findNativePersonaPanel() {
+  const blocks = [...document.querySelectorAll('#persona-management-block')];
+  return blocks.find(item => isElementVisible(item)) || blocks[0] || null;
+}
 export async function openNativePersonaPanel() {
-  const panel = () => [...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null) || document.querySelector('#persona-management-block');
-  const isOpen = () => [...document.querySelectorAll('#PersonaManagement.drawer-content, #persona-management-button .drawer-content')].some(item => item.classList.contains('openDrawer') && item.offsetParent !== null);
+  const panel = () => findNativePersonaPanel();
+  const isOpen = () => isNativePersonaPanelOpen();
   if (!isOpen()) {
     const button = document.querySelector('#persona-management-button .drawer-toggle, #persona-management-button, [data-i18n="Persona Management"]');
     button?.click();
@@ -710,20 +728,36 @@ export async function openNativePersonaPanel() {
   return panel();
 }
 export function isNativePersonaPanelOpen() {
-  return [...document.querySelectorAll('#PersonaManagement.drawer-content, #persona-management-button .drawer-content')].some(item => item.classList.contains('openDrawer') && item.offsetParent !== null);
+  const drawers = [...document.querySelectorAll('#PersonaManagement, #PersonaManagement.drawer-content, #persona-management-button .drawer-content')];
+  if (drawers.some(item => {
+    if (item.classList?.contains('openDrawer')) {
+      const style = typeof globalThis.getComputedStyle === 'function' ? globalThis.getComputedStyle(item) : null;
+      return !style || (style.display !== 'none' && style.visibility !== 'hidden');
+    }
+    if (item.classList?.contains('closedDrawer')) return false;
+    return isElementVisible(item);
+  })) return true;
+  const icon = document.querySelector('#persona-management-button .drawer-icon');
+  if (icon?.classList?.contains('openIcon')) return true;
+  const block = document.querySelector('#persona-management-block');
+  return Boolean(block && !block.closest('.closedDrawer') && isElementVisible(block));
 }
 export function setNativeTakeover(active = true) {
-  const block = [...document.querySelectorAll('#persona-management-block')].find(item => item.offsetParent !== null) || document.querySelector('#persona-management-block');
-  if (!block) return false;
-  block.classList.toggle('ytps-takeover', Boolean(active));
-  block.classList.toggle('ytps-native-edit', false);
+  const blocks = [...document.querySelectorAll('#persona-management-block')];
+  if (!blocks.length) return false;
+  for (const block of blocks) {
+    block.classList.toggle('ytps-takeover', Boolean(active));
+    block.classList.toggle('ytps-native-edit', false);
+  }
   return true;
 }
 export function setNativeEditMode(active = true) {
-  const block = document.querySelector('#persona-management-block');
-  if (!block) return false;
-  block.classList.toggle('ytps-takeover', false);
-  block.classList.toggle('ytps-native-edit', Boolean(active));
+  const blocks = [...document.querySelectorAll('#persona-management-block')];
+  if (!blocks.length) return false;
+  for (const block of blocks) {
+    block.classList.toggle('ytps-takeover', false);
+    block.classList.toggle('ytps-native-edit', Boolean(active));
+  }
   return true;
 }
 export function focusNativePersona(id) {
@@ -924,6 +958,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { updateNativePersona } from '../adapter.js';
+import { updateNativePersona, isElementVisible, isNativePersonaPanelOpen } from '../adapter.js';
 
 function contextFor({ current = 'persona-a' } = {}) {
   const events = [];
@@ -64,4 +64,41 @@ test('non-current persona updates do not reselect the active persona', async () 
   assert.equal(await updateNativePersona('persona-a', { description: 'new description' }, state.context, api), true);
   assert.deepEqual(calls, [[true, 'persona-a']]);
   assert.equal(state.context.powerUserSettings.persona_description, 'old description');
+});
+
+test('isNativePersonaPanelOpen detects position:fixed drawers in TauriTavern and pinned layouts where offsetParent is null', () => {
+  const prevDoc = globalThis.document;
+  const prevStyle = globalThis.getComputedStyle;
+  try {
+    const fixedDrawer = {
+      hidden: false,
+      offsetParent: null,
+      classList: { contains: name => name === 'openDrawer' },
+      getBoundingClientRect: () => ({ width: 390, height: 680 }),
+    };
+    globalThis.getComputedStyle = () => ({ position: 'fixed', display: 'block', visibility: 'visible' });
+    globalThis.document = {
+      querySelectorAll: selector => (selector.includes('#PersonaManagement') ? [fixedDrawer] : []),
+      querySelector: () => null,
+    };
+    assert.equal(isElementVisible(fixedDrawer), true);
+    assert.equal(isNativePersonaPanelOpen(), true);
+
+    const closedFixedDrawer = {
+      hidden: false,
+      offsetParent: null,
+      classList: { contains: name => name === 'closedDrawer' },
+      getBoundingClientRect: () => ({ width: 0, height: 0 }),
+    };
+    globalThis.getComputedStyle = () => ({ position: 'fixed', display: 'none', visibility: 'visible' });
+    globalThis.document = {
+      querySelectorAll: selector => (selector.includes('#PersonaManagement') ? [closedFixedDrawer] : []),
+      querySelector: () => null,
+    };
+    assert.equal(isElementVisible(closedFixedDrawer), false);
+    assert.equal(isNativePersonaPanelOpen(), false);
+  } finally {
+    globalThis.document = prevDoc;
+    globalThis.getComputedStyle = prevStyle;
+  }
 });
