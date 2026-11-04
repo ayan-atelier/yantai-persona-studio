@@ -5,9 +5,12 @@ import {
   updateNativePersona,
   isElementVisible,
   isNativePersonaPanelOpen,
+  isPlaceholderPersonaName,
+  isPlaceholderPersonaBody,
   isPlaceholderPersonaRecord,
   mergeNativePersonasFromPayload,
   markPersonaDeletedLocally,
+  syncActivePersonaUserName,
 } from '../adapter.js';
 
 function contextFor({ current = 'persona-a' } = {}) {
@@ -176,4 +179,80 @@ test('mergeNativePersonasFromPayload preserves cross-device personas and heals [
   assert.equal(context.powerUserSettings.personas['persona-phone-new.png'], '手机新建人设');
   // Explicitly deleted persona was NOT resurrected
   assert.equal('persona-deleted.png' in context.powerUserSettings.personas, false);
+});
+
+test('mergeNativePersonasFromPayload heals partial corruption when description returned but name is still [Unnamed Persona]', () => {
+  assert.equal(isPlaceholderPersonaName('[Unnamed Persona]'), true);
+  assert.equal(isPlaceholderPersonaName('清砚'), false);
+  assert.equal(isPlaceholderPersonaBody({ description: '已有描述', title: '' }), false);
+
+  const context = {
+    powerUserSettings: {
+      user_avatar: '1793732147110-persona.png',
+      personas: {
+        '1793732147110-persona.png': '[Unnamed Persona]',
+      },
+      persona_descriptions: {
+        '1793732147110-persona.png': {
+          description: '少数民族的祭品成年女子，只能听懂部分普通话，常年不出屋导致皮肤很白，黑色长发，一双鹿眼十分有神。',
+          title: '',
+        },
+      },
+    },
+  };
+  const serverPayload = {
+    power_user: {
+      personas: {
+        '1793732147110-persona.png': '清砚',
+      },
+      persona_descriptions: {
+        '1793732147110-persona.png': {
+          description: '少数民族的祭品成年女子，只能听懂部分普通话，常年不出屋导致皮肤很白，黑色长发，一双鹿眼十分有神。',
+          title: '',
+        },
+      },
+    },
+  };
+  const result = mergeNativePersonasFromPayload(serverPayload, { context, preferServer: false });
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.updated, ['1793732147110-persona.png']);
+  assert.equal(context.powerUserSettings.personas['1793732147110-persona.png'], '清砚');
+});
+
+test('updateNativePersona and syncActivePersonaUserName sync name1 via setUserName and heal [Unnamed Persona] user chat messages', async () => {
+  let activeUserName = '[Unnamed Persona]';
+  let chatSaves = 0;
+  const context = {
+    name1: '[Unnamed Persona]',
+    chat: [
+      { name: '宋仲庭', is_user: false, mes: '你好' },
+      { name: '[Unnamed Persona]', is_user: true, mes: '二哥，你也是祭司吗？' },
+    ],
+    powerUserSettings: {
+      personas: { '1793732147110-persona.png': '清砚' },
+      persona_descriptions: { '1793732147110-persona.png': { description: '旧描述', title: '' } },
+    },
+    setUserName(val) {
+      activeUserName = val;
+      context.name1 = val;
+    },
+    saveSettingsDebounced() {},
+    saveChatDebounced() { chatSaves += 1; },
+    eventSource: { emit() {} },
+  };
+  const api = {
+    user_avatar: '1793732147110-persona.png',
+    setPersonaDescription() {},
+    getUserAvatars() {},
+  };
+
+  assert.equal(await syncActivePersonaUserName(context, api), true);
+  assert.equal(activeUserName, '清砚');
+  assert.equal(context.name1, '清砚');
+  assert.equal(context.chat[1].name, '清砚');
+  assert.equal(chatSaves, 1);
+
+  assert.equal(await updateNativePersona('1793732147110-persona.png', { name: '沈清砚', description: '新描述' }, context, api), true);
+  assert.equal(activeUserName, '沈清砚');
+  assert.equal(context.name1, '沈清砚');
 });

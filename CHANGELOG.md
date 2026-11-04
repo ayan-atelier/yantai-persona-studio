@@ -3,7 +3,7 @@
 
 - 新增「防跨设备冲掉人设」双保险机制：
   - **第一道保险（唤醒与保存前自动合并）**：当从手机切回未刷新的电脑标签页（窗口重新获得焦点、点击页面或打开人设抽屉）以及保存设置前，自动拉取服务器最新 `power_user.personas` 与 `persona_descriptions` 并合入当前内存，防止旧标签页保存预设/设置时把另一台设备新建的人设覆盖丢失。
-  - **第二道保险（`[Unnamed Persona]` 自动自愈快照）**：创建或编辑人设时同步在 `personaMeta`（及 `yantai-persona-sync` 安全同步存储）中保存轻量快照；一旦检测到酒馆 `addMissingPersonas()` 将某个人设重置为 `[Unnamed Persona]` 空白占位符，自动从快照瞬间恢复其原本的名称、描述、备注、注入位置与深度。
+  - **第二道保险（`[Unnamed Persona]` 自动自愈快照与姓名同步）**：创建或编辑人设时同步在 `personaMeta`（及 `yantai-persona-sync` 安全同步存储）中保存轻量快照；一旦检测到某个人设被重置为 `[Unnamed Persona]`（包括完整空白占位或「描述还在但名称变成 `[Unnamed Persona]`」的半缺失状态），自动从快照恢复原本的名称、描述、备注、注入位置与深度，并自动调用 `setUserName` 同步当前生效的 `username`（`name1`）及修正聊天记录中残留的 `[Unnamed Persona]` 发送者名称。
 
 ## 1.0.12
 

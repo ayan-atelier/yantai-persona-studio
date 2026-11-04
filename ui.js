@@ -282,6 +282,14 @@ class App {
     const persona = creating ? {} : this.editorPersona();
     const id = String(persona.id || '');
     const existing = this.state.editorDraft && String(this.state.editorDraft.id || '') === id ? this.state.editorDraft : null;
+    if (existing && !creating && id) {
+      if ((existing.name === '[Unnamed Persona]' || !existing.name) && persona.name && persona.name !== '[Unnamed Persona]') {
+        existing.name = persona.name;
+      }
+      if (!existing.description && persona.description) {
+        existing.description = persona.description;
+      }
+    }
     const draft = existing || { id, name: persona.name || '', note: persona.title || '', description: persona.description || '', lorebook: persona.lorebook || '' };
     if (!existing && (id || creating)) this.state.editorDraft = draft;
     const avatar = persona.avatarRef || '';

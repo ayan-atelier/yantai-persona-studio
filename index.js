@@ -323,24 +323,39 @@
     }
     return { ...shared, version: Math.max(Number(shared.version || 0), 3) };
   }
+  function isPlaceholderName(name) {
+    if (typeof adapter?.isPlaceholderPersonaName === 'function') {
+      return adapter.isPlaceholderPersonaName(name);
+    }
+    const clean = String(name ?? '').trim();
+    return !clean || clean === '[Unnamed Persona]';
+  }
+  function isPlaceholderBody(record = {}) {
+    if (!record || typeof record !== 'object') return true;
+    if (typeof adapter?.isPlaceholderPersonaBody === 'function') {
+      return adapter.isPlaceholderPersonaBody(record);
+    }
+    return !(
+      String(record.description || '').trim()
+      || String(record.title || record.note || '').trim()
+      || String(record.lorebook || '').trim()
+    );
+  }
   function isPlaceholderSnapshot(record = {}) {
     if (!record || typeof record !== 'object') return true;
     if (typeof adapter?.isPlaceholderPersonaRecord === 'function') {
       return adapter.isPlaceholderPersonaRecord(record.name, record);
     }
-    const cleanName = String(record.name ?? '').trim();
-    const hasName = Boolean(cleanName && cleanName !== '[Unnamed Persona]');
-    const hasBody = Boolean(
-      String(record.description || '').trim()
-      || String(record.title || '').trim()
-      || String(record.lorebook || '').trim(),
-    );
-    return !hasName && !hasBody;
+    return isPlaceholderName(record.name) && isPlaceholderBody(record);
   }
-  function normalizePersonaSnapshot(persona = {}, updatedAt = Date.now()) {
+  function normalizePersonaSnapshot(persona = {}, updatedAt = Date.now(), fallbackName = '') {
     if (!persona || typeof persona !== 'object' || isPlaceholderSnapshot(persona)) return null;
+    const resolvedName = !isPlaceholderName(persona.name)
+      ? String(persona.name || '').trim()
+      : (!isPlaceholderName(fallbackName) ? String(fallbackName || '').trim() : '');
+    if (!resolvedName) return null;
     return {
-      name: String(persona.name || '').trim(),
+      name: resolvedName,
       description: String(persona.description || ''),
       title: String(persona.title || persona.note || ''),
       lorebook: String(persona.lorebook || ''),
@@ -596,6 +611,7 @@
     }
     mergeAssistantThreadsToGlobal();
     await healPlaceholderPersonas({ force: true });
+    await adapter?.syncActivePersonaUserName?.();
     const seededSnapshots = capturePersonaSnapshots(adapter.readNativePersonas?.() || [], { initialSeed: true });
     if (seededSnapshots && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       void save({ syncGallery: false });
@@ -792,6 +808,14 @@
     }).filter(Boolean);
   }
   function resolved() { return adapter.resolvePersona({ state, target: activeTarget() }); }
+  function personaNeedsHeal(persona) {
+    const id = String(persona?.id || '').trim();
+    if (!id) return false;
+    if (isPlaceholderSnapshot(persona) || isPlaceholderName(persona?.name)) return true;
+    const snap = state?.personaMeta?.[id]?.snapshot;
+    if (snap && !isPlaceholderBody(snap) && isPlaceholderBody(persona)) return true;
+    return false;
+  }
   function capturePersonaSnapshots(personas = adapter?.readNativePersonas?.() || [], { initialSeed = false } = {}) {
     if (!state || typeof state !== 'object') return false;
     state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
@@ -802,9 +826,14 @@
       const currentMeta = state.personaMeta[id] && typeof state.personaMeta[id] === 'object' ? state.personaMeta[id] : {};
       if (Number(currentMeta.deletedAt || 0) > 0 && initialSeed) continue;
       const existingSnap = !isPlaceholderSnapshot(currentMeta.snapshot) ? currentMeta.snapshot : null;
-      if (existingSnap && snapshotContentMatches(existingSnap, persona)) continue;
+      const candidate = {
+        ...persona,
+        name: !isPlaceholderName(persona.name) ? persona.name : (existingSnap?.name || ''),
+        description: !isPlaceholderBody(persona) ? persona.description : (existingSnap?.description ?? persona.description ?? ''),
+      };
+      if (existingSnap && snapshotContentMatches(existingSnap, candidate)) continue;
       const stamp = existingSnap || !initialSeed ? Date.now() : 1;
-      const nextSnap = normalizePersonaSnapshot(persona, stamp);
+      const nextSnap = normalizePersonaSnapshot(candidate, stamp, existingSnap?.name);
       if (!nextSnap) continue;
       const { deletedAt: _deletedAt, ...restMeta } = currentMeta;
       state.personaMeta[id] = { ...restMeta, snapshot: nextSnap };
@@ -817,12 +846,13 @@
     healingPersonasPromise = (async () => {
       try {
         const personas = adapter?.readNativePersonas?.() || [];
-        const placeholders = personas.filter(p => p?.id && isPlaceholderSnapshot(p));
+        const placeholders = personas.filter(p => p?.id && personaNeedsHeal(p));
         if (!placeholders.length) return false;
         const now = Date.now();
         const needsServerProbe = placeholders.some(p => {
           const id = String(p.id || '').trim();
-          const hasLocalSnap = !isPlaceholderSnapshot(state?.personaMeta?.[id]?.snapshot);
+          const snap = state?.personaMeta?.[id]?.snapshot;
+          const hasLocalSnap = Boolean(snap && !isPlaceholderName(snap.name) && (!isPlaceholderBody(p) || !isPlaceholderBody(snap)));
           const recentlyChecked = now - Number(checkedPlaceholderAt.get(id) || 0) < 10000;
           return !hasLocalSnap && (force || !recentlyChecked);
         });
@@ -858,16 +888,25 @@
         const currentPersonas = adapter?.readNativePersonas?.() || [];
         for (const persona of currentPersonas) {
           const id = String(persona?.id || '').trim();
-          if (!id || !isPlaceholderSnapshot(persona)) continue;
+          if (!id || !personaNeedsHeal(persona)) continue;
           const meta = state?.personaMeta?.[id];
           if (!meta || Number(meta.deletedAt || 0) > Number(meta?.snapshot?.updatedAt || 0)) continue;
           const snap = meta.snapshot;
           if (!snap || isPlaceholderSnapshot(snap)) continue;
+          const healedName = !isPlaceholderName(persona.name)
+            ? String(persona.name).trim()
+            : (!isPlaceholderName(snap.name) ? String(snap.name).trim() : '');
+          if (!healedName) continue;
+          const healedDesc = String(persona.description || '').trim()
+            ? String(persona.description)
+            : String(snap.description ?? '');
+          const healedTitle = String(persona.title || '').trim() || String(snap.title ?? '');
+          const healedLorebook = String(persona.lorebook || '').trim() || String(snap.lorebook ?? '');
           const ok = await adapter?.updatePersona?.(id, {
-            name: snap.name,
-            description: snap.description ?? '',
-            title: snap.title ?? '',
-            lorebook: snap.lorebook ?? '',
+            name: healedName,
+            description: healedDesc,
+            title: healedTitle,
+            lorebook: healedLorebook,
             ...(snap.position !== undefined ? { position: snap.position } : {}),
             ...(snap.depth !== undefined ? { depth: snap.depth } : {}),
             ...(snap.role !== undefined ? { role: snap.role } : {}),
@@ -903,11 +942,12 @@
           }
         }
         const healed = await healPlaceholderPersonas({ force });
+        const nameSynced = await adapter.syncActivePersonaUserName?.();
         const snapshotChanged = capturePersonaSnapshots(adapter.readNativePersonas?.() || []);
         if (snapshotChanged && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
           void save({ syncGallery: false });
         }
-        if (synced?.changed || healed) {
+        if (synced?.changed || healed || nameSynced) {
           await refresh();
           return true;
         }
@@ -936,10 +976,11 @@
     // navigation pointer, never portable data.
     state.assistantActiveThreadKey = localAssistantThreadKey;
     let personas = adapter.readNativePersonas();
-    if (personas.some(persona => persona?.id && isPlaceholderSnapshot(persona))) {
+    if (personas.some(persona => persona?.id && personaNeedsHeal(persona))) {
       const healed = await healPlaceholderPersonas();
       if (healed) personas = adapter.readNativePersonas();
     }
+    await adapter?.syncActivePersonaUserName?.();
     if (capturePersonaSnapshots(personas) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       void save({ syncGallery: false });
     }
@@ -1439,10 +1480,15 @@
       },
       async setDefault(id) { await adapter.setDefault(id || null); await refresh(); },
       async updatePersona(id, patch) {
-        const ok = await adapter.updatePersona?.(id, patch);
+        const prevSnap = state?.personaMeta?.[id]?.snapshot;
+        const effectivePatch = { ...patch };
+        if (isPlaceholderName(effectivePatch.name) && !isPlaceholderName(prevSnap?.name)) {
+          effectivePatch.name = String(prevSnap.name).trim();
+        }
+        const ok = await adapter.updatePersona?.(id, effectivePatch);
         if (ok) {
           const updated = (adapter.readNativePersonas?.() || []).find(item => String(item?.id || '') === String(id || ''));
-          const snap = normalizePersonaSnapshot(updated || { id, ...patch }, Date.now());
+          const snap = normalizePersonaSnapshot(updated || { id, ...effectivePatch }, Date.now(), prevSnap?.name);
           if (snap) {
             state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
             const prev = state.personaMeta[id] && typeof state.personaMeta[id] === 'object' ? state.personaMeta[id] : {};
