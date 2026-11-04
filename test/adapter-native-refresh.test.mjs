@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { updateNativePersona, isElementVisible, isNativePersonaPanelOpen } from '../adapter.js';
+import {
+  updateNativePersona,
+  isElementVisible,
+  isNativePersonaPanelOpen,
+  isPlaceholderPersonaRecord,
+  mergeNativePersonasFromPayload,
+  markPersonaDeletedLocally,
+} from '../adapter.js';
 
 function contextFor({ current = 'persona-a' } = {}) {
   const events = [];
@@ -101,4 +108,72 @@ test('isNativePersonaPanelOpen detects position:fixed drawers in TauriTavern and
     globalThis.document = prevDoc;
     globalThis.getComputedStyle = prevStyle;
   }
+});
+
+test('mergeNativePersonasFromPayload preserves cross-device personas and heals [Unnamed Persona] placeholders without downgrading real records', () => {
+  assert.equal(isPlaceholderPersonaRecord('[Unnamed Persona]', { description: '', title: '' }), true);
+  assert.equal(isPlaceholderPersonaRecord('清砚', { description: '', title: '' }), false);
+  assert.equal(isPlaceholderPersonaRecord('[Unnamed Persona]', { description: '有描述正文', title: '' }), false);
+
+  const context = {
+    powerUserSettings: {
+      user_avatar: '1793732147110-persona.png',
+      persona_description: '',
+      personas: {
+        'persona-existing.png': '清砚',
+        '1793732147110-persona.png': '[Unnamed Persona]',
+      },
+      persona_descriptions: {
+        'persona-existing.png': { description: '原本的人设描述', title: '原本备注', depth: 4 },
+        '1793732147110-persona.png': { description: '', title: '', depth: 4 },
+      },
+    },
+  };
+
+  const serverPayload = {
+    power_user: {
+      personas: {
+        'persona-existing.png': '[Unnamed Persona]',
+        '1793732147110-persona.png': '清砚',
+        'persona-phone-new.png': '手机新建人设',
+        'persona-deleted.png': '已删除人设',
+      },
+      persona_descriptions: {
+        'persona-existing.png': { description: '', title: '' },
+        '1793732147110-persona.png': {
+          description: '少数民族的祭品少女，只能听懂部分普通话，常年不出屋导致皮肤很白，一双鹿眼十分有神。',
+          title: '',
+          position: 0,
+          depth: 2,
+          role: 0,
+          lorebook: '',
+        },
+        'persona-phone-new.png': { description: '手机端刚写好的设定', title: '手机测试' },
+        'persona-deleted.png': { description: '不应被恢复', title: '' },
+      },
+    },
+  };
+
+  markPersonaDeletedLocally('persona-deleted.png');
+  const result = mergeNativePersonasFromPayload(serverPayload, { context, preferServer: true });
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.added, ['persona-phone-new.png']);
+  assert.deepEqual(result.updated, ['1793732147110-persona.png']);
+  // Real local persona was NOT downgraded by server placeholder
+  assert.equal(context.powerUserSettings.personas['persona-existing.png'], '清砚');
+  assert.equal(context.powerUserSettings.persona_descriptions['persona-existing.png'].description, '原本的人设描述');
+  // Local placeholder WAS healed by server record
+  assert.equal(context.powerUserSettings.personas['1793732147110-persona.png'], '清砚');
+  assert.equal(
+    context.powerUserSettings.persona_descriptions['1793732147110-persona.png'].description,
+    '少数民族的祭品少女，只能听懂部分普通话，常年不出屋导致皮肤很白，一双鹿眼十分有神。',
+  );
+  assert.equal(
+    context.powerUserSettings.persona_description,
+    '少数民族的祭品少女，只能听懂部分普通话，常年不出屋导致皮肤很白，一双鹿眼十分有神。',
+  );
+  // Missing phone persona WAS added
+  assert.equal(context.powerUserSettings.personas['persona-phone-new.png'], '手机新建人设');
+  // Explicitly deleted persona was NOT resurrected
+  assert.equal('persona-deleted.png' in context.powerUserSettings.personas, false);
 });

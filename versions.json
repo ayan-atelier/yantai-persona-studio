@@ -1,14 +1,21 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.12",
+  "latest": "1.0.13",
   "releases": [
+    {
+      "version": "1.0.13",
+      "branch": "v1.0.13",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆防跨设备冲掉人设双保险版。新增跨设备未刷新标签页唤醒与保存前自动合并远端人设，以及 [Unnamed Persona] 占位符人设自动自愈恢复机制；同时包含 v1.0.12 的 TT 2.4.0 适配、重登自动接管与 PC 半屏/全屏智能高度。"
+    },
     {
       "version": "1.0.12",
       "branch": "v1.0.12",
       "settings_schema": 3,
       "minimum_client_version": "1.16.0",
-      "notes": "砚台 · 人设馆兼容与界面修复版。适配 TauriTavern (TT) 2.4.0 与固定定位抽屉；修复重登或刷新后需手动重新开启接管的问题；保留默认半屏高度，同时在美化主题或停靠抽屉撑高面板时自动填满下半部分空白。不改动任何原生人设读写与同步数据逻辑。"
+      "notes": "砚台 · 人设馆兼容与界面修复版。适配 TauriTavern (TT) 2.4.0 与固定定位抽屉；修复重登或刷新后需手动重新开启接管的问题；保留默认半屏高度，同时在美化主题或停靠抽屉撑高面板时自动填满下半部分空白。"
     },
     {
       "version": "1.0.11",
