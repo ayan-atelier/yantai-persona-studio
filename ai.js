@@ -163,13 +163,14 @@ async function generate(mode, input = {}, options = {}) {
       // Keep source selection explicit: includeWorld/includeChat are already
       // serialized into quietPrompt by buildSafeContext. Do not add a second
       // copy through the Tavern's ambient WIAN/worldbook injection.
+      const timeoutMs = Number(options?.timeoutMs) > 0 ? Number(options.timeoutMs) : 0;
       raw = await invoke({
         ...extra,
         quietPrompt,
         quietToLoud: false,
         skipWIAN: true,
         quietName: 'System',
-      }, hasRichContext ? 18000 : 0);
+      }, timeoutMs);
     } else {
       raw = await invoke({ systemPrompt: `${SYSTEM_PROMPT}\n\n${OUTPUT_GUIDANCE}`, prompt, ...extra });
     }
@@ -179,7 +180,7 @@ async function generate(mode, input = {}, options = {}) {
     // serialized role-card/persona payload is present. Keep the user's card
     // checkbox semantics, but retry once with a deliberately minimal prompt
     // so a bad card field cannot make the whole assistant appear silent.
-    const canFallback = hasRichContext && ['BAD_REQUEST', 'GENERATION_TIMEOUT'].includes(normalizedError?.code);
+    const canFallback = hasRichContext && ['BAD_REQUEST', 'CONTENT_BLOCKED'].includes(normalizedError?.code);
     if (!canFallback) throw normalizedError;
     try {
       raw = await runMinimalFallback();

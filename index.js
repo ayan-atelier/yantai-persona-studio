@@ -670,8 +670,9 @@
     return !hasCharacter || !card || card === 'no-card' || card === 'card_811c9c5' || !chat || chat === 'no-chat' || chat === 'current-chat';
   }
   function responseDestination(target, thread) {
+    const liveThread = (thread?.id && state.assistantThreads?.[thread.id]) || thread;
     const current = activeTarget();
-    if (targetKey(current) === targetKey(target)) return { target, thread };
+    if (targetKey(current) === targetKey(target)) return { target, thread: liveThread };
     // A card/chat can be provisionally empty while SillyTavern finishes
     // loading it. If that is the only change during the request, move the
     // response into the now-stable thread so the UI does not hide it behind
@@ -685,7 +686,7 @@
     if (fromCards.some(card => toCards.includes(card)) && String(target.chatId || '') === String(current.chatId || '')) {
       return { target: current, thread: activeAssistantThread(current) };
     }
-    return { target, thread };
+    return { target, thread: liveThread };
   }
   function makeTurnId() {
     try { if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID(); } catch (_) { /* use the fallback below */ }
@@ -743,14 +744,15 @@
   function generationIsCurrent(target, token, thread) {
     if (token !== assistantGenerationToken) return false;
     // SillyTavern can emit CHARACTER_CHANGED/CHAT_CHANGED while a request is
-    // still in flight (for example while a character chat finishes loading).
-    // The target key may briefly change from a provisional no-card/no-chat
-    // value to its stable card/chat identity. Treating that normal refresh as
-    // cancellation silently dropped a completed API reply. The captured
-    // thread is still the right destination; a deliberate “new thread” or
+    // still in flight (for example while a character chat finishes loading),
+    // and resume syncs (focus/pointerdown/visibilitychange) can replace thread
+    // objects in state.assistantThreads with fresh shallow clones via
+    // mergeSharedState(). Match by thread id so background syncs never
+    // invalidate an in-flight generation; a deliberate “new thread” or
     // “clear” action increments assistantGenerationToken and cancels it.
-    const current = state.assistantThreads?.[thread?.id];
-    return thread === current;
+    if (!thread?.id) return false;
+    const current = state.assistantThreads?.[thread.id];
+    return Boolean(current && String(current.id || thread.id) === String(thread.id));
   }
   function appendAssistantTurn(thread, user, result) {
     if (!thread || !String(user || '').trim() || !result || result.error) return;
