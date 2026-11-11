@@ -107,6 +107,7 @@
   }
   let localAssistantThreadKey = readLocalAssistantThreadKey();
   let assistantGenerationToken = 0;
+  let assistantAbortController = null;
   let refreshSequence = 0;
   let resumeListenersCleanup = null;
   let lastResumeSyncAt = 0;
@@ -243,6 +244,8 @@
   async function dispose() {
     if (disposed) return;
     disposed = true;
+    try { assistantAbortController?.abort(); } catch (_) {}
+    assistantAbortController = null;
     stopObserver();
     resumeListenersCleanup?.();
     resumeListenersCleanup = null;
@@ -290,7 +293,7 @@
 
   function sharedState(source = state) {
     const value = source && typeof source === 'object' ? source : {};
-    const { ui: _ui, assistantActiveThreadKey: _active, sessionOverride: _session, enabled: _enabled, ...shared } = value;
+    const { ui: _ui, assistantActiveThreadKey: _active, sessionOverride: _session, enabled: _enabled, turnRepairs: _turnRepairs, ...shared } = value;
     if (shared.gallerySync && typeof shared.gallerySync === 'object') {
       const gallerySync = { ...shared.gallerySync };
       if (Array.isArray(gallerySync.assets)) {
@@ -444,6 +447,17 @@
     const isGalleryRemoved = item => Number(result.galleryRemoved[String(item?.id || '')] || 0) >= Number(item?.updatedAt || 0);
     result.gallery = result.gallery.filter(item => !isGalleryRemoved(item));
     const threads = {};
+    const preferTurn = (existing, candidate) => {
+      if (!existing) return candidate;
+      if (!candidate) return existing;
+      const eRep = Number(existing?.repairedAt || 0);
+      const cRep = Number(candidate?.repairedAt || 0);
+      if (cRep !== eRep) return cRep > eRep ? candidate : existing;
+      const eBroken = String(existing?.assistant || '').trim().startsWith('{') && (!Array.isArray(existing?.proposals) || !existing.proposals.length);
+      const cBroken = String(candidate?.assistant || '').trim().startsWith('{') && (!Array.isArray(candidate?.proposals) || !candidate.proposals.length);
+      if (eBroken !== cBroken) return eBroken ? candidate : existing;
+      return existing;
+    };
     const threadKeys = new Set([...Object.keys(remote.assistantThreads || {}), ...Object.keys(local.assistantThreads || {})]);
     for (const key of threadKeys) {
       const remoteThread = remote.assistantThreads?.[key];
@@ -455,7 +469,7 @@
       const byId = new Map();
       for (const turn of incomingTurns) {
         const id = String(turn?.turnId || `${turn?.at || 0}|${turn?.user || ''}|${turn?.assistant || turn?.memory || ''}`);
-        if (!byId.has(id)) byId.set(id, turn);
+        byId.set(id, preferTurn(byId.get(id), turn));
       }
       const base = { ...(localThread || {}), ...(remoteThread || {}) };
       threads[key] = {
@@ -521,6 +535,68 @@
     mergeAssistantThreadsToGlobal();
     const localSettings = readLocalSettings();
     if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
+    syncMode = 'checking';
+    syncStatus = 'unavailable';
+    syncRevision = null;
+    syncRemoteState = null;
+    let shouldFlushPending = false;
+    if (syncClient) {
+      try {
+        const remote = await syncClient.getState();
+        syncMode = 'server';
+        syncRevision = remote.revision || '0';
+        syncRemoteState = remote.state || {};
+        if (syncRevision !== '0' || hasSharedData(syncRemoteState, { includeSnapshots: true })) {
+          // Auto-merge any queued local edits with the latest server document
+          // via timestamp/tombstone-aware mergeSharedState() instead of halting
+          // in a manual conflict state.
+          const mergedDoc = pending
+            ? mergeSharedState(sharedState(state), syncRemoteState)
+            : mergeSharedState(syncRemoteState, sharedState(state));
+          state = adapter.normalizeState({ ...defaultState(), ...state, ...mergedDoc, enabled: state.enabled });
+          syncStatus = 'ready';
+          if (pending) {
+            pendingSyncNotice = false;
+            shouldFlushPending = true;
+          }
+        } else if (hasSharedData(state)) {
+          await makeTavernSnapshot().catch(() => {});
+          syncStatus = 'ready';
+          pendingSyncNotice = false;
+          shouldFlushPending = true;
+        } else {
+          syncStatus = 'ready';
+          if (pending) clearPendingState();
+        }
+      } catch (error) {
+        if (error?.code === 'SYNC_UNAVAILABLE') {
+          // A normal install does not contain a Node server plugin. Fall back
+          // to the extension's own namespace in SillyTavern settings so the
+          // GitHub extension remains one-click installable.
+          syncMode = 'host';
+          syncRevision = 'host';
+          syncRemoteState = sharedState(saved);
+          syncStatus = 'host-ready';
+          if (pending) { pendingSyncNotice = false; shouldFlushPending = true; }
+        } else {
+          syncMode = 'host';
+          syncRevision = 'host';
+          syncRemoteState = sharedState(saved);
+          syncStatus = 'host-ready';
+          if (pending) { pendingSyncNotice = false; shouldFlushPending = true; }
+          // The server plugin is optional. A malformed or unavailable probe
+          // should not look like a user-facing failure when the host-settings
+          // provider is working; real write failures are reported separately.
+          try { console.debug('[砚台·人设馆] optional safe-sync probe failed; using Tavern settings sync.', error); } catch (_) { /* ignore diagnostics */ }
+        }
+      }
+    } else {
+      syncMode = 'host';
+      syncRevision = 'host';
+      syncRemoteState = sharedState(saved);
+      syncStatus = 'host-ready';
+      if (pending) { pendingSyncNotice = false; shouldFlushPending = true; }
+    }
     state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {};
     gallerySync = state.gallerySync || saved?.gallerySync || null;
     gallerySyncDirty = !gallerySync;
@@ -530,7 +606,8 @@
     // blob URL cannot hide the server-backed preview.
     mergeGalleryManifest(gallerySync);
     // Blob URLs are session-scoped. Rehydrate gallery entries from IndexedDB
-    // so imported images remain visible after a reload or device reconnect.
+    // after remote merge so imported images remain visible in both server and
+    // host-settings sync modes.
     const persisted = await storage.listAssets().catch(() => []);
     state.gallery = storage.mergeGallery(state.gallery, persisted.map(item => ({ ...item, blob: undefined })));
     state.gallery = state.gallery.filter(item => Number(state.galleryRemoved[item.id] || 0) <= Number(item.updatedAt || 0));
@@ -547,76 +624,47 @@
     // data-URL sync. Mark them for one-time server migration after the app is
     // ready; the local Blob remains usable even if upload is unavailable.
     if (gallerySync?.provider !== 'tavern-user-images' || state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl)) gallerySyncDirty = true;
-    syncMode = 'checking';
-    syncStatus = 'unavailable';
-    syncRevision = null;
-    syncRemoteState = null;
-    if (syncClient) {
-      try {
-        const remote = await syncClient.getState();
-        syncMode = 'server';
-        syncRevision = remote.revision || '0';
-        syncRemoteState = remote.state || {};
-        if (syncRevision !== '0' || hasSharedData(syncRemoteState, { includeSnapshots: true })) {
-          if (pending) {
-            // A queued local candidate means this browser has changes that
-            // were never acknowledged by the server. Keep that candidate in
-            // view and stop; silently selecting the remote document here
-            // would make the phone's last edits appear to vanish.
-            syncStatus = 'conflict';
-            // This is a recoverable startup state, not an action failure.
-            // Keep it in the settings status so a reload does not produce a
-            // stack of identical warnings on mobile or on a second device.
-            pendingSyncNotice = true;
-          } else {
-            state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(syncRemoteState, sharedState(state)) });
-            gallerySync = state.gallerySync || gallerySync;
-            if (gallerySync) await storage.importSync(gallerySync).catch(() => {});
-            mergeGalleryManifest(gallerySync);
-            mergeAssistantThreadsToGlobal();
-            syncStatus = 'ready';
-          }
-        } else if (hasSharedData(state)) {
-          // A new server document must never silently replace a legacy local
-          // document. The settings panel exposes an explicit migration action.
-          syncStatus = 'needs-migration';
-        } else {
-          syncStatus = 'ready';
-        }
-      } catch (error) {
-        if (error?.code === 'SYNC_UNAVAILABLE') {
-          // A normal install does not contain a Node server plugin. Fall back
-          // to the extension's own namespace in SillyTavern settings so the
-          // GitHub extension remains one-click installable.
-          syncMode = 'host';
-          syncRevision = 'host';
-          syncRemoteState = sharedState(saved);
-          syncStatus = 'host-ready';
-        } else {
-          syncMode = 'host';
-          syncRevision = 'host';
-          syncRemoteState = sharedState(saved);
-          syncStatus = 'host-ready';
-          // The server plugin is optional. A malformed or unavailable probe
-          // should not look like a user-facing failure when the host-settings
-          // provider is working; real write failures are reported separately.
-          try { console.debug('[砚台·人设馆] optional safe-sync probe failed; using Tavern settings sync.', error); } catch (_) { /* ignore diagnostics */ }
-        }
-      }
-    } else {
-      syncMode = 'host';
-      syncRevision = 'host';
-      syncRemoteState = sharedState(saved);
-      syncStatus = 'host-ready';
-    }
     mergeAssistantThreadsToGlobal();
+    const repairedTurns = applyTurnRepairs(state, saved?.turnRepairs);
+    if (repairedTurns && pending) {
+      queuePendingState(sharedState(state));
+    }
     await healPlaceholderPersonas({ force: true });
     await adapter?.syncActivePersonaUserName?.();
     const seededSnapshots = capturePersonaSnapshots(adapter.readNativePersonas?.() || [], { initialSeed: true });
-    if (seededSnapshots && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
-      void save({ syncGallery: false });
+    if ((seededSnapshots || repairedTurns || shouldFlushPending) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
+      void save({ syncGallery: shouldFlushPending });
     }
     return state;
+  }
+  function applyTurnRepairs(targetState, repairs) {
+    if (!targetState || !Array.isArray(repairs) || !repairs.length) return false;
+    const threads = targetState.assistantThreads;
+    if (!threads || typeof threads !== 'object') return false;
+    let changed = false;
+    for (const thread of Object.values(threads)) {
+      if (!Array.isArray(thread?.turns)) continue;
+      thread.turns = thread.turns.map(turn => {
+        const userText = String(turn?.user || '');
+        const asstText = String(turn?.assistant || '').trim();
+        for (const rule of repairs) {
+          const needles = Array.isArray(rule?.matchUserIncludes) ? rule.matchUserIncludes : [];
+          if (!needles.length || !needles.every(word => userText.includes(String(word)))) continue;
+          if (rule.onlyBroken !== false && !asstText.startsWith('{') && Array.isArray(turn?.proposals) && turn.proposals.length > 0) continue;
+          changed = true;
+          return {
+            ...turn,
+            assistant: String(rule.assistant || ''),
+            memory: String(rule.memory || rule.assistant || ''),
+            proposals: Array.isArray(rule.proposals) ? rule.proposals : [],
+            mode: String(rule.mode || 'revision'),
+            repairedAt: Date.now(),
+          };
+        }
+        return turn;
+      });
+    }
+    return changed;
   }
   function activeTarget() {
     const ctx = adapter.context();
@@ -760,12 +808,13 @@
     const candidates = Array.isArray(result.candidates) ? result.candidates : (Array.isArray(result.draft?.candidates) ? result.draft.candidates : []);
     const proposalData = candidates.map((item, index) => {
       const title = String(item?.title || `方向 ${index + 1}`).trim();
+      const persona = String(item?.persona || '').trim();
+      const name = String(item?.name || ai?.inferCandidateName?.({ title, persona }, index) || '').trim();
       const concept = String(item?.concept || '').trim();
       const fit = String(item?.fit || '').trim();
       const tradeoffs = String(item?.tradeoffs || '').trim();
-      const persona = String(item?.persona || '').trim();
       const hooks = Array.isArray(item?.interactionHooks) ? item.interactionHooks.filter(Boolean).map(value => String(value).trim()).join('\n') : '';
-      return { title, concept, fit, tradeoffs, persona, interactionHooks: hooks ? hooks.split('\n').filter(Boolean) : [] };
+      return { name, title, concept, fit, tradeoffs, persona, interactionHooks: hooks ? hooks.split('\n').filter(Boolean) : [] };
     }).filter(item => item.title || item.persona || item.concept);
     // Keep the conversational reply separate from the reusable persona text.
     // The UI can render and copy both candidates without turning the reply
@@ -924,6 +973,13 @@
     })();
     return healingPersonasPromise;
   }
+  function knownDeletedPersonaIds() {
+    const ids = [];
+    for (const [id, meta] of Object.entries(state?.personaMeta || {})) {
+      if (meta && Number(meta.deletedAt || 0) > Number(meta?.snapshot?.updatedAt || 0)) ids.push(id);
+    }
+    return ids;
+  }
   async function syncNativePersonasOnResume({ force = false, preferServer = true } = {}) {
     if (disposed || !adapter) return false;
     const now = Date.now();
@@ -932,7 +988,37 @@
     if (resumeSyncInFlight) return resumeSyncInFlight;
     resumeSyncInFlight = (async () => {
       try {
-        const synced = await adapter.syncNativePersonasFromServer?.({ preferServer });
+        let remoteStateChanged = false;
+        if (syncClient && syncMode === 'server') {
+          const remote = await syncClient.getState().catch(() => null);
+          if (remote && remote.revision && remote.revision !== syncRevision) {
+            const pendingLocal = readPendingState();
+            const mergedDoc = pendingLocal
+              ? mergeSharedState(sharedState(state), remote.state || {})
+              : mergeSharedState(remote.state || {}, sharedState(state));
+            const persistedAssets = await storage?.listAssets?.().catch(() => []) || [];
+            state = adapter.normalizeState({
+              ...defaultState(),
+              ...state,
+              ...mergedDoc,
+              enabled: state.enabled,
+              ui: state.ui,
+              assistantActiveThreadKey: state.assistantActiveThreadKey,
+            });
+            gallerySync = state.gallerySync || gallerySync;
+            if (gallerySync) await storage?.importSync?.(gallerySync).catch(() => {});
+            mergeGalleryManifest(gallerySync);
+            state.gallery = storage.mergeGallery(state.gallery || [], persistedAssets.map(item => ({ ...item, blob: undefined })));
+            state.gallery = await storage.hydrateGallery(state.gallery);
+            mergeAssistantThreadsToGlobal();
+            syncRevision = remote.revision;
+            syncRemoteState = remote.state || {};
+            syncStatus = 'ready';
+            remoteStateChanged = true;
+            if (pendingLocal) void save({ syncGallery: false });
+          }
+        }
+        const synced = await adapter.syncNativePersonasFromServer?.({ preferServer, deletedIds: knownDeletedPersonaIds() });
         if (synced?.raw) {
           const ext = synced.raw?.extension_settings?.[NS] || synced.raw?.extensionSettings?.[NS];
           if (ext?.personaMeta && typeof ext.personaMeta === 'object') {
@@ -949,7 +1035,7 @@
         if (snapshotChanged && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
           void save({ syncGallery: false });
         }
-        if (synced?.changed || healed || nameSynced) {
+        if (synced?.changed || healed || nameSynced || remoteStateChanged) {
           await refresh();
           return true;
         }
@@ -1008,7 +1094,7 @@
       if (response.ok) {
         const payload = await response.json();
         const raw = typeof payload?.settings === 'string' ? JSON.parse(payload.settings) : payload?.settings;
-        adapter?.mergeNativePersonasFromPayload?.(raw, { context, preferServer: false });
+        adapter?.mergeNativePersonasFromPayload?.(raw, { context, preferServer: true, deletedIds: knownDeletedPersonaIds() });
         const extensions = raw?.extension_settings || raw?.extensionSettings;
         if (extensions?.[NS] && typeof extensions[NS] === 'object') {
           currentNamespace = extensions[NS];
@@ -1056,8 +1142,7 @@
     return true;
   }
   async function persistSharedState(candidate = sharedState(state), { preservePending = false } = {}) {
-
-    if (syncMode === 'host') {
+    if (syncMode === 'host' || !syncClient) {
       try {
         return await persistHostSharedState(candidate, { preservePending });
       } catch (error) {
@@ -1067,41 +1152,78 @@
         return false;
       }
     }
-    if (!syncClient || syncStatus === 'unavailable' || syncStatus === 'error' || syncStatus === 'conflict') {
-      queuePendingState(candidate);
-      report(syncStatus === 'conflict'
-        ? '安全同步存在冲突，已停止继续写入；请先重新读取并合并本机副本。'
-        : '同步服务未连接，本次修改只保留在当前页面。', 'warning');
-      return false;
-    }
-    if (syncStatus === 'needs-migration') {
-      queuePendingState(candidate);
-      report('检测到旧版人设馆记录。请先在扩展设置中点击“迁移到安全同步”，当前修改不会覆盖旧数据。', 'warning');
-      return false;
-    }
-    try {
-      const result = await syncClient.putState(candidate, { baseRevision: syncRevision });
-      syncRevision = result.revision;
-      syncStatus = 'ready';
-      syncRemoteState = candidate;
-      if (preservePending) {
-        queuePendingState(candidate);
-        pendingSyncNotice = true;
-      } else {
-        clearPendingState();
+    let workingCandidate = candidate;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        if (!syncRevision || syncStatus !== 'ready') {
+          const latest = await syncClient.getState();
+          syncRevision = latest.revision || '0';
+          syncRemoteState = latest.state || {};
+          if (syncRevision !== '0' || hasSharedData(syncRemoteState, { includeSnapshots: true })) {
+            workingCandidate = mergeSharedState(workingCandidate, syncRemoteState);
+          }
+        }
+        const result = await syncClient.putState(workingCandidate, { baseRevision: syncRevision });
+        syncRevision = result.revision;
+        syncStatus = 'ready';
+        syncRemoteState = workingCandidate;
+        if (workingCandidate !== candidate) {
+          const persistedAssets = await storage.listAssets().catch(() => []);
+          state = adapter.normalizeState({
+            ...defaultState(), ...state, ...workingCandidate,
+            enabled: state.enabled,
+            ui: state.ui,
+            assistantActiveThreadKey: state.assistantActiveThreadKey,
+          });
+          gallerySync = state.gallerySync || gallerySync;
+          if (gallerySync) await storage.importSync(gallerySync).catch(() => {});
+          mergeGalleryManifest(gallerySync);
+          state.gallery = storage.mergeGallery(state.gallery || [], persistedAssets.map(item => ({ ...item, blob: undefined })));
+          state.gallery = await storage.hydrateGallery(state.gallery);
+          mergeAssistantThreadsToGlobal();
+        }
+        if (preservePending) {
+          queuePendingState(workingCandidate);
+          pendingSyncNotice = true;
+        } else {
+          clearPendingState();
+        }
+        updateSettingsUi();
+        return true;
+      } catch (error) {
+        if (error?.code === 'REVISION_MISMATCH' && attempt < 2) {
+          // Another device updated the server document since this tab loaded.
+          // Silently rebase onto the latest revision and retry without nagging.
+          const latest = error?.current?.state
+            ? error.current
+            : await syncClient.getState().catch(() => null);
+          if (latest && latest.revision) {
+            syncRevision = latest.revision;
+            syncRemoteState = latest.state || {};
+            workingCandidate = mergeSharedState(workingCandidate, syncRemoteState);
+            continue;
+          }
+        }
+        if (error?.code === 'SYNC_UNAVAILABLE') {
+          syncMode = 'host';
+          syncRevision = 'host';
+          try {
+            return await persistHostSharedState(workingCandidate, { preservePending });
+          } catch (_) { /* fall through to local pending queue */ }
+        }
+        queuePendingState(workingCandidate);
+        if (error?.code === 'REVISION_MISMATCH') {
+          syncStatus = 'ready';
+          syncRevision = null;
+        } else {
+          syncStatus = error?.code === 'SYNC_UNAVAILABLE' ? 'unavailable' : 'error';
+          report(`安全同步暂未连通：${error?.message || error}。修改已暂存本机，恢复连接后将自动合并。`, 'warning');
+        }
+        updateSettingsUi();
+        return false;
       }
-      return true;
-    } catch (error) {
-      queuePendingState(candidate);
-      if (error?.code === 'REVISION_MISMATCH') {
-        syncStatus = 'conflict';
-        report('发现另一台设备刚刚修改了人设馆数据。为防止互相覆盖，本次修改已保留在本机，未覆盖远端；请重新读取后再合并。', 'warning');
-      } else {
-        syncStatus = error?.code === 'SYNC_UNAVAILABLE' ? 'unavailable' : 'error';
-        report(`安全同步失败：${error?.message || error}。本次修改已保留在本机，未写入远端。`, 'warning');
-      }
-      return false;
     }
+    return false;
   }
 
   async function makeTavernSnapshot() {
@@ -1275,13 +1397,13 @@
     if (openButton) openButton.disabled = !enabled;
     const status = document.querySelector('#ytps-settings [data-role="status"]');
     if (status) {
-      const syncLabel = syncStatus === 'ready' ? '安全同步已启用' : syncStatus === 'host-ready' ? '兼容同步已启用（保护有限）' : syncStatus === 'needs-migration' ? '等待迁移旧记录' : syncStatus === 'conflict' ? '同步冲突已停止覆盖' : syncStatus === 'checking' ? '正在检查同步服务' : syncStatus === 'error' ? '同步保存失败' : '同步服务未连接';
-      const notices = [pendingSyncNotice ? '有待确认本机副本' : '', pendingGalleryNotice ? '有未上传图库图片' : ''].filter(Boolean);
+      const syncLabel = syncStatus === 'ready' ? '多端自动合并同步已启用' : syncStatus === 'host-ready' ? '酒馆设置同步已启用' : syncStatus === 'checking' ? '正在检查同步服务' : syncStatus === 'error' ? '同步暂存本机（待重连）' : '同步服务未连接';
+      const notices = [pendingGalleryNotice ? '有未上传图库图片' : ''].filter(Boolean);
       status.textContent = `${enabled ? '已启用' : '已关闭'} · V${VERSION} · ${syncLabel}${notices.length ? ` · ${notices.join('、')}` : ''}`;
     }
     const migrate = document.querySelector('#ytps-settings [data-action="migrate-sync"]');
-    if (migrate) migrate.hidden = syncMode !== 'server' || !['needs-migration', 'ready', 'conflict'].includes(syncStatus);
-    if (migrate) migrate.textContent = syncStatus === 'needs-migration' ? '备份并迁移旧记录' : syncStatus === 'conflict' ? '重新读取并合并本机副本' : '重新读取安全同步';
+    if (migrate) migrate.hidden = syncMode !== 'server' || !['ready', 'error', 'conflict', 'needs-migration'].includes(syncStatus);
+    if (migrate) migrate.textContent = '手动同步远端数据';
   }
 
   function installSettingsEntry() {
@@ -1621,13 +1743,17 @@
         if (!result?.cancelled) await refresh();
         return result;
       },
-      async createDraft(input) {
+      async createDraft(input = {}) {
+        try { assistantAbortController?.abort(); } catch (_) {}
+        const controller = new AbortController();
+        assistantAbortController = controller;
         const target = activeTarget();
         const token = ++assistantGenerationToken;
         const snapshot = await adapter.contextSnapshot({ includeWorld: input?.includeWorld === true });
         const source = assistantContext(input, snapshot);
         const thread = activeAssistantThread(target);
-        const result = await ai.generateDirections({ input, target, state, context: source, history: thread.turns, thread, mode: 'propose' });
+        const result = await ai.generateDirections({ input, target, state, context: source, history: thread.turns, thread, mode: 'propose', onStream: input?.onStream, signal: controller.signal });
+        if (assistantAbortController === controller) assistantAbortController = null;
         const destination = responseDestination(target, thread);
         if (!generationIsCurrent(destination.target, token, destination.thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(destination.thread, input?.request || '', result);
@@ -1636,6 +1762,9 @@
         return result;
       },
       async assistantChat(input = {}) {
+        try { assistantAbortController?.abort(); } catch (_) {}
+        const controller = new AbortController();
+        assistantAbortController = controller;
         const target = activeTarget();
         const token = ++assistantGenerationToken;
         const snapshot = await adapter.contextSnapshot({ includeWorld: input?.includeWorld === true });
@@ -1643,15 +1772,25 @@
         const thread = activeAssistantThread(target);
         const fn = ai.continueChat || ai.chat || ai.generateChat;
         if (typeof fn !== 'function') throw new Error('当前版本尚未加载小助手对话接口，请刷新酒馆后重试。');
-        const result = await fn({ input, target, state, context: source, history: thread.turns, thread, mode: 'chat' });
+        const requestedMode = input?.mode || 'auto';
+        const result = await fn({ input, target, state, context: source, history: thread.turns, thread, mode: requestedMode, onStream: input?.onStream, signal: controller.signal });
+        if (assistantAbortController === controller) assistantAbortController = null;
         const destination = responseDestination(target, thread);
         if (!generationIsCurrent(destination.target, token, destination.thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(destination.thread, input?.request || '', result);
+        if (result?.draft) state.drafts = [{ ...result.draft, targetKey: targetKey(destination.target), target: { cardKey: destination.target.cardKey || 'no-card', legacyCardKey: destination.target.legacyCardKey || '', chatId: destination.target.chatId || 'no-chat' } }, ...state.drafts].slice(0, 20);
         await save({ syncGallery: false });
         return result;
       },
+      async cancelAssistantGeneration() {
+        assistantGenerationToken += 1;
+        try { assistantAbortController?.abort(); } catch (_) {}
+        assistantAbortController = null;
+      },
       async clearAssistantThread() {
         assistantGenerationToken += 1;
+        try { assistantAbortController?.abort(); } catch (_) {}
+        assistantAbortController = null;
         const thread = activeAssistantThread(activeTarget());
         thread.turns = [];
         thread.updatedAt = Date.now();
@@ -1661,6 +1800,8 @@
       },
       async newAssistantThread() {
         assistantGenerationToken += 1;
+        try { assistantAbortController?.abort(); } catch (_) {}
+        assistantAbortController = null;
         const target = activeTarget();
         const key = assistantThreadKey(target) + '|new_' + Date.now().toString(36);
         localAssistantThreadKey = key;
@@ -1672,7 +1813,10 @@
         await refresh();
         return { ...state.assistantThreads[key], activeThreadKey: key };
       },
-      async reviseDraft(draftId, instruction) {
+      async reviseDraft(draftId, instruction, options = {}) {
+        try { assistantAbortController?.abort(); } catch (_) {}
+        const controller = new AbortController();
+        assistantAbortController = controller;
         const target = activeTarget();
         const draft = state.drafts.find(item => item.id === draftId && (!item.targetKey || item.targetKey === targetKey(target)));
         if (!draft) return;
@@ -1680,19 +1824,41 @@
         const thread = activeAssistantThread(target);
         const snapshot = await adapter.contextSnapshot({ includeWorld: false });
         const source = assistantContext({ includeCard: true }, snapshot);
-        const result = await ai.reviseDraft({ draft, instruction, target, state, context: source, history: thread.turns, thread, mode: 'revision' });
+        const result = await ai.reviseDraft({ draft, instruction, target, state, context: source, history: thread.turns, thread, mode: 'revision', onStream: options?.onStream, signal: controller.signal });
+        if (assistantAbortController === controller) assistantAbortController = null;
         const destination = responseDestination(target, thread);
         if (!generationIsCurrent(destination.target, token, destination.thread)) return { ...result, __yantaiStale: true };
         appendAssistantTurn(destination.thread, instruction, result);
         if (result?.draft) { state.drafts = [{ ...result.draft, targetKey: targetKey(destination.target), target: { cardKey: destination.target.cardKey || 'no-card', legacyCardKey: destination.target.legacyCardKey || '', chatId: destination.target.chatId || 'no-chat' } }, ...state.drafts.filter(item => item.id !== draftId)].slice(0, 20); await save({ syncGallery: false }); }
         return result;
       },
+      async importAssistantCandidate(candidate = {}, { activate = false } = {}) {
+        const description = String(candidate?.persona || candidate?.description || candidate?.concept || '').trim();
+        if (!description) throw new Error('这份候选还没有可导入的完整人设正文。');
+        const inferred = ai?.inferCandidateName?.(candidate, 0) || '';
+        const rawName = String(candidate?.name || inferred || candidate?.title || '新角色人设').trim().slice(0, 48);
+        const rawTitle = String(candidate?.title || '').trim();
+        const note = rawTitle && rawTitle !== rawName ? rawTitle : 'Milo 人设方案';
+        const created = await adapter.createPersona?.({ name: rawName, title: note, description });
+        if (!created?.id) throw new Error('酒馆没有返回新建人设编号，请刷新人设面板后重试。');
+        const snap = normalizePersonaSnapshot({ name: created.name || rawName, title: note, description }, Date.now());
+        if (snap) {
+          state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
+          const prev = state.personaMeta[created.id] && typeof state.personaMeta[created.id] === 'object' ? state.personaMeta[created.id] : {};
+          const { deletedAt: _deletedAt, ...rest } = prev;
+          state.personaMeta[created.id] = { ...rest, snapshot: snap };
+        }
+        let activated = false;
+        if (activate) {
+          activated = Boolean(await adapter.selectNativePersona?.(created.id));
+        }
+        await save({ syncGallery: false });
+        return { id: created.id, name: created.name || rawName, note, activated };
+      },
       async saveCandidate(draftId, candidate) {
         const draft = state.drafts.find(item => item.id === draftId);
         if (draft) { draft.acceptedCandidateId = candidate.id; draft.status = 'accepted'; }
-        await save({ syncGallery: false });
-        await actions.openNativeCreate();
-        report('候选已保留。酒馆原生新建窗口已打开，请把候选正文放入原生描述框；这样人设仍由酒馆管理，不会产生第二份副本。', 'info');
+        return actions.importAssistantCandidate(candidate, { activate: true });
       },
       state: () => state,
     };

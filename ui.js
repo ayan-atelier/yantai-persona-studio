@@ -1,3 +1,5 @@
+import { extractJsonPreview, inferCandidateName } from './ai.js';
+
 const TABS = {
   current: { label: '当前', icon: 'fa-house' },
   library: { label: '人设档案', icon: 'fa-address-card' },
@@ -53,7 +55,7 @@ class App {
     this.fileInput = null;
     this.visible = false;
     this.localUi = readLocalUi();
-    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', personaGroups: [], personaMeta: {}, personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
+    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', personaGroups: [], personaMeta: {}, personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiStreaming: null, importedCandidates: {}, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
   }
   setLocalUi(patch = {}) {
     this.localUi = { ...this.localUi, ...patch };
@@ -362,38 +364,164 @@ class App {
     if (!active || !this.threadMatchesCurrentTarget(active)) return [];
     return Array.isArray(active.turns) ? active.turns : [];
   }
-  assistantRound(turn, index, proposal = '') {
-    const user = String(turn?.user || '').trim();
-    const answer = String(turn?.assistant || turn?.reply || turn?.summary || '').trim();
-    // Replies and reusable persona bodies are kept as separate fields. This
-    // prevents the conversational bubble from growing into a wall of text,
-    // while still leaving each candidate fully visible and copyable.
-    const storedProposal = Array.isArray(turn?.proposals) && turn.proposals.length ? this.assistantProposalText(turn.proposals) : proposal;
-    const shownAnswer = [answer, storedProposal].filter(Boolean).join('\n\n').trim();
-    if (!user && !shownAnswer) return '';
-    // A turn is rendered as two ordinary chat bubbles. The API still receives
-    // the same paired turn, but the UI no longer exposes internal round
-    // numbers or proposal labels.
-    return '<article class="ytps-ai-turn">' + (user ? '<div class="ytps-ai-bubble ytps-ai-user"><b>你</b><p>' + esc(short(user, 2400)) + '</p></div>' : '') + (shownAnswer ? '<div class="ytps-ai-bubble ytps-ai-assistant"><b>Milo</b><p>' + esc(shownAnswer) + '</p></div>' : '') + '</article>';
+  cleanHistoricalTurn(turn) {
+    const rawAnswer = String(turn?.assistant || turn?.reply || turn?.summary || '').trim();
+    const storedProposals = Array.isArray(turn?.proposals) ? turn.proposals : [];
+    if (rawAnswer && (/^\s*[\[{]/.test(rawAnswer) || /"(?:mode|reply|candidates)"\s*:/.test(rawAnswer))) {
+      const preview = extractJsonPreview(rawAnswer, turn?.mode || 'chat');
+      if (preview.isJson && (preview.reply || preview.candidates.length)) {
+        let reply = preview.reply;
+        if (!preview.complete && reply && !preview.candidates.length && !reply.includes('接口返回在此处中断')) {
+          reply += '\n\n（⚠️ 上次接口返回在此处中断，以上为已接收到的内容）';
+        }
+        return { reply, proposals: storedProposals.length ? storedProposals : preview.candidates };
+      }
+    }
+    return { reply: rawAnswer, proposals: storedProposals };
   }
-  assistantProposalText(candidates = []) {
+  turnFallbackProposals(turns = [], turnIndex = -1) {
+    if (turnIndex < 0 || turnIndex !== turns.length - 1) return [];
+    const latestTurn = turns[turnIndex];
+    if (!latestTurn || latestTurn.mode === 'chat' || latestTurn.mode === 'explain' || Array.isArray(latestTurn.proposals)) return [];
+    const latestAnswer = String(latestTurn.assistant || '');
+    if (/人设\s*[12]\s*[·:：]/.test(latestAnswer)) return [];
+    const currentTarget = this.currentTargetKey();
+    const draft = (this.state.drafts || []).find(item => item?.targetKey && item.targetKey === currentTarget);
+    return this.state.suggestions?.length ? this.state.suggestions : (draft?.candidates || []);
+  }
+  candidateAt(turnIndex, candIndex) {
+    const turns = this.assistantTurns();
+    const turn = turns[turnIndex];
+    if (!turn) return null;
+    const cleaned = this.cleanHistoricalTurn(turn);
+    const list = cleaned.proposals.length ? cleaned.proposals : this.turnFallbackProposals(turns, turnIndex);
+    return list[candIndex] || null;
+  }
+  findMatchingImportedPersona(candidate, turnKey, candIndex) {
+    const cacheKey = `${turnKey}:${candIndex}`;
+    const cached = this.state.importedCandidates?.[cacheKey];
+    const personas = Array.isArray(this.state.personas) ? this.state.personas : [];
+    const currentId = String(this.state.current?.persona?.id || '');
+    if (cached?.id) {
+      const found = personas.find(item => String(item?.id || '') === String(cached.id));
+      if (found) return { id: found.id, name: found.name || cached.name, isCurrent: currentId === String(found.id) };
+    }
+    const body = String(candidate?.persona || candidate?.description || '').trim();
+    if (body.length >= 24) {
+      const head = body.slice(0, 64);
+      const matched = personas.find(item => String(item?.description || '').trim().slice(0, 64) === head);
+      if (matched) return { id: matched.id, name: matched.name, isCurrent: currentId === String(matched.id) };
+    }
+    return null;
+  }
+  renderProposalCards(candidates = [], { turnKey = 'live', turnIndex = -1, streaming = false } = {}) {
     if (!Array.isArray(candidates) || !candidates.length) return '';
-    return candidates.slice(0, 2).map((item, index) => {
-      const title = String(item?.title || ('方向 ' + (index + 1))).trim();
-      const body = String(item?.persona || item?.concept || item?.description || '').trim();
-      return '人设 ' + (index + 1) + ' · ' + title + (body ? '\n' + body : '');
-    }).filter(Boolean).join('\n\n');
+    const cards = candidates.slice(0, 2).map((item, idx) => {
+      const name = inferCandidateName(item, idx);
+      const title = String(item?.title || ('方向 ' + (idx + 1))).trim();
+      const body = String(item?.persona || item?.description || item?.concept || '').trim();
+      if (!title && !body) return '';
+      const imported = !streaming && turnIndex >= 0 ? this.findMatchingImportedPersona(item, turnKey, idx) : null;
+      let actionsHtml = '';
+      if (!streaming && body && turnIndex >= 0) {
+        if (imported) {
+          actionsHtml = '<div class="ytps-ai-proposal-actions">'
+            + '<span class="ytps-ai-imported-badge"><i class="fa-solid fa-circle-check"></i> ' + (imported.isCurrent ? '已导入并启用' : '已存入档案') + ' · ' + esc(imported.name) + '</span>'
+            + (!imported.isCurrent ? '<button class="ytps-btn ytps-primary ytps-proposal-btn" data-action="use" data-id="' + esc(imported.id) + '"><i class="fa-solid fa-check"></i> 设为当前</button>' : '')
+            + '<button class="ytps-btn ytps-proposal-btn" data-action="open-editor" data-id="' + esc(imported.id) + '"><i class="fa-solid fa-pen-to-square"></i> 编辑 / 换头像</button>'
+            + '<button class="ytps-btn ytps-quiet ytps-proposal-btn" data-action="copy-candidate" data-turn="' + turnIndex + '" data-cand="' + idx + '"><i class="fa-regular fa-copy"></i> 复制</button>'
+            + '</div>';
+        } else {
+          actionsHtml = '<div class="ytps-ai-proposal-actions">'
+            + '<button class="ytps-btn ytps-primary ytps-proposal-btn" data-action="import-candidate" data-turn="' + turnIndex + '" data-cand="' + idx + '" data-turn-key="' + esc(turnKey) + '" data-activate="1"><i class="fa-solid fa-user-check"></i> 导入酒馆并启用</button>'
+            + '<button class="ytps-btn ytps-proposal-btn" data-action="import-candidate" data-turn="' + turnIndex + '" data-cand="' + idx + '" data-turn-key="' + esc(turnKey) + '" data-activate="0"><i class="fa-solid fa-folder-plus"></i> 仅存入档案</button>'
+            + '<button class="ytps-btn ytps-quiet ytps-proposal-btn" data-action="copy-candidate" data-turn="' + turnIndex + '" data-cand="' + idx + '"><i class="fa-regular fa-copy"></i> 复制正文</button>'
+            + '</div>';
+        }
+      }
+      return '<div class="ytps-ai-proposal-card">'
+        + '<div class="ytps-ai-proposal-head"><span class="ytps-ai-proposal-badge">人设 ' + (idx + 1) + '</span><strong class="ytps-ai-proposal-name">' + esc(name) + '</strong>' + (title && title !== name ? '<span class="ytps-ai-proposal-title">' + esc(title) + '</span>' : '') + '</div>'
+        + '<div class="ytps-ai-proposal-body">' + esc(body || (streaming ? '正在落笔人设正文…' : '')) + '</div>'
+        + actionsHtml
+        + '</div>';
+    }).filter(Boolean).join('');
+    return cards ? '<div class="ytps-ai-proposals">' + cards + '</div>' : '';
+  }
+  assistantRound(turn, turnIndex, fallbackCandidates = []) {
+    const user = String(turn?.user || '').trim();
+    const cleaned = this.cleanHistoricalTurn(turn);
+    const answer = cleaned.reply;
+    const proposals = cleaned.proposals.length ? cleaned.proposals : fallbackCandidates;
+    const turnKey = String(turn?.turnId || turn?.at || ('turn_' + turnIndex));
+    const cardsHtml = this.renderProposalCards(proposals, { turnKey, turnIndex, streaming: false });
+    if (!user && !answer && !cardsHtml) return '';
+    return '<article class="ytps-ai-turn">'
+      + (user ? '<div class="ytps-ai-bubble ytps-ai-user"><b>你</b><p>' + esc(short(user, 2400)) + '</p></div>' : '')
+      + (answer ? '<div class="ytps-ai-bubble ytps-ai-assistant"><b>Milo</b><p>' + esc(answer) + '</p></div>' : '')
+      + cardsHtml
+      + '</article>';
+  }
+  streamingTurnInnerHtml(streaming = this.state.aiStreaming) {
+    if (!streaming) return '';
+    const user = String(streaming.user || '').trim();
+    const reply = String(streaming.reply || '').trim();
+    const cardsHtml = this.renderProposalCards(streaming.candidates || [], { turnKey: 'streaming', turnIndex: -1, streaming: true });
+    const statusText = cardsHtml ? '正在撰写候选人设档案…' : (reply ? 'Milo 正在往下写…' : 'Milo 正在看剧本构思…');
+    const dots = '<div class="ytps-ai-inline-thinking"><span></span><span></span><span></span><em>' + statusText + '</em></div>';
+    return (user ? '<div class="ytps-ai-bubble ytps-ai-user"><b>你</b><p>' + esc(short(user, 2400)) + '</p></div>' : '')
+      + '<div class="ytps-ai-bubble ytps-ai-assistant"><b>Milo</b>' + (reply ? '<p>' + esc(reply) + '</p>' : '') + dots + '</div>'
+      + cardsHtml;
+  }
+  updateStreamingDom() {
+    if (!this.root || this.state.activeTab !== 'assistant' || !this.state.aiStreaming) return;
+    const history = this.root.querySelector('.ytps-ai-history');
+    const container = this.root.querySelector('.ytps-ai-streaming-turn');
+    if (!container) {
+      this.render();
+      return;
+    }
+    const nearBottom = history ? (history.scrollHeight - history.scrollTop - history.clientHeight < 110) : true;
+    container.innerHTML = this.streamingTurnInnerHtml(this.state.aiStreaming);
+    if (history && nearBottom) history.scrollTop = history.scrollHeight;
+  }
+  async copyText(text) {
+    const value = String(text || '').trim();
+    if (!value) return false;
+    try {
+      if (globalThis.navigator?.clipboard?.writeText) {
+        await globalThis.navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch (_) { /* fallback below */ }
+    try {
+      const area = document.createElement('textarea');
+      area.value = value;
+      area.setAttribute('readonly', 'readonly');
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand('copy');
+      area.remove();
+      return Boolean(ok);
+    } catch (_) {
+      return false;
+    }
   }
   assistant() {
     const turns = this.assistantTurns();
-    const currentTarget = this.currentTargetKey();
-    const draft = (this.state.drafts || []).find(item => item?.targetKey && item.targetKey === currentTarget);
-    const suggestions = this.state.suggestions?.length ? this.state.suggestions : (draft?.candidates || []);
-    const latestAnswer = String(turns[turns.length - 1]?.assistant || '');
-    const latestTurn = turns[turns.length - 1];
-    const proposal = latestTurn && latestTurn.mode !== 'chat' && !Array.isArray(latestTurn.proposals) && !/人设\s*[12]\s*[·:：]/.test(latestAnswer) ? this.assistantProposalText(suggestions) : '';
-    const history = turns.length ? '<div class="ytps-ai-history">' + turns.map((turn, index) => this.assistantRound(turn, index + 1, index === turns.length - 1 ? proposal : '')).join('') + '</div>' : '<div class="ytps-empty ytps-ai-empty">还没有片场对话。写下你想让 User 进入故事的感觉，Milo 会给你两条可以开拍的路。</div>';
-    return '<div class="ytps-ai-shell ytps-ai-modern"><section class="ytps-panel ytps-ai-chat-panel"><div class="ytps-panel-title"><i class="fa-solid fa-wand-magic-sparkles"></i><b>Milo</b><span>砚台片场搭档</span><button class="ytps-icon-btn" data-action="assistant-info" title="使用说明"><i class="fa-solid fa-circle-info"></i></button></div><p class="ytps-muted">请和 Milo 描述一下你想要的人设感觉，无论是几个词、一两句描述，还是大段的设定都可以～我会帮你分析生成。</p><div class="ytps-checks ytps-ai-sources"><span class="ytps-ai-sources-label">本轮资料</span><label title="发送当前角色卡摘要，以及当前生效人设的姓名、备注和描述"><input type="checkbox" data-field="includeCard" ' + (this.state.includeCard !== false ? 'checked' : '') + '> 角色卡摘要</label><label title="如果当前酒馆版本提供了活动世界书，就发送截取后的资料"><input type="checkbox" data-field="includeWorld" ' + (this.state.includeWorld === true ? 'checked' : '') + '> 相关世界书</label><label title="发送当前存档最近几条消息的短摘录"><input type="checkbox" data-field="includeChat" ' + (this.state.includeChat === true ? 'checked' : '') + '> 当前存档片段</label></div>' + history + (this.state.aiBusy ? '<div class="ytps-ai-thinking"><span></span><span></span><span></span><em>Milo 正在看剧本…</em></div>' : '') + '<div class="ytps-ai-composer"><textarea class="ytps-textarea ytps-ai-input" data-field="aiPrompt" placeholder="请和 Milo 描述一下你想要的人设感觉……">' + esc(this.state.aiPrompt || '') + '</textarea><div class="ytps-ai-compose-row"><small>Ctrl/⌘ + Enter 发送</small><div class="ytps-ai-quick-actions"><button class="ytps-btn ytps-quiet" data-action="new-assistant">新开一段</button><button class="ytps-btn ytps-quiet" data-action="clear-assistant">清空记录</button></div><button class="ytps-btn ytps-primary ytps-ai-send" data-action="assistant-send" ' + (this.state.aiBusy ? 'disabled' : '') + '><i class="fa-solid fa-paper-plane"></i> 发送</button></div></div></section></div>';
+    const streamingHtml = this.state.aiStreaming ? '<article class="ytps-ai-turn ytps-ai-streaming-turn">' + this.streamingTurnInnerHtml(this.state.aiStreaming) + '</article>' : '';
+    const hasContent = turns.length > 0 || Boolean(streamingHtml);
+    const history = hasContent
+      ? '<div class="ytps-ai-history">' + turns.map((turn, idx) => this.assistantRound(turn, idx, this.turnFallbackProposals(turns, idx))).join('') + streamingHtml + '</div>'
+      : '<div class="ytps-empty ytps-ai-empty">还没有片场对话。写下你想让 User 进入故事的感觉，Milo 会给你两条可以直接导入酒馆开拍的路。</div>';
+    const busyNotice = (this.state.aiBusy && !this.state.aiStreaming)
+      ? '<div class="ytps-ai-thinking"><span></span><span></span><span></span><em>Milo 正在看剧本…</em></div>'
+      : '';
+    const primaryActionBtn = this.state.aiBusy
+      ? '<button class="ytps-btn ytps-danger ytps-ai-send" data-action="assistant-stop"><i class="fa-solid fa-stop"></i> 停止</button>'
+      : '<button class="ytps-btn ytps-primary ytps-ai-send" data-action="assistant-send"><i class="fa-solid fa-paper-plane"></i> 发送</button>';
+    return '<div class="ytps-ai-shell ytps-ai-modern"><section class="ytps-panel ytps-ai-chat-panel"><div class="ytps-panel-title"><i class="fa-solid fa-wand-magic-sparkles"></i><b>Milo</b><span>砚台片场搭档</span><button class="ytps-icon-btn" data-action="assistant-info" title="使用说明"><i class="fa-solid fa-circle-info"></i></button></div><p class="ytps-muted">请和 Milo 描述一下你想要的人设感觉，无论是几个词、一两句想法，还是基于上一轮方向继续打磨都可以～定稿后可一键导入酒馆人设。</p><div class="ytps-checks ytps-ai-sources"><span class="ytps-ai-sources-label">本轮资料</span><label title="发送当前角色卡摘要，以及当前生效人设的姓名、备注和描述"><input type="checkbox" data-field="includeCard" ' + (this.state.includeCard !== false ? 'checked' : '') + '> 角色卡摘要</label><label title="如果当前酒馆版本提供了活动世界书，就发送截取后的资料"><input type="checkbox" data-field="includeWorld" ' + (this.state.includeWorld === true ? 'checked' : '') + '> 相关世界书</label><label title="发送当前存档最近几条消息的短摘录"><input type="checkbox" data-field="includeChat" ' + (this.state.includeChat === true ? 'checked' : '') + '> 当前存档片段</label></div>' + history + busyNotice + '<div class="ytps-ai-composer"><textarea class="ytps-textarea ytps-ai-input" data-field="aiPrompt" placeholder="请和 Milo 描述一下你想要的人设感觉……">' + esc(this.state.aiPrompt || '') + '</textarea><div class="ytps-ai-compose-row"><small>Ctrl/⌘ + Enter 发送</small><div class="ytps-ai-quick-actions"><button class="ytps-btn ytps-quiet" data-action="new-assistant" ' + (this.state.aiBusy ? 'disabled' : '') + '>新开一段</button><button class="ytps-btn ytps-quiet" data-action="clear-assistant" ' + (this.state.aiBusy ? 'disabled' : '') + '>清空记录</button></div>' + primaryActionBtn + '</div></div></section></div>';
   }
   async onClick(event) {
     const el = event.target.closest('[data-action]'); if (!el || !this.root.contains(el)) return;
@@ -527,25 +655,87 @@ class App {
     if (action === 'set-default') return this.call('setBinding', 'global', 'bind', el.dataset.id);
     if (action === 'edit' || action === 'open-edit' || action === 'open-native-edit') return this.call('openNativeEdit', el.dataset.id);
     if (action === 'bind-current') { const currentId = this.state.current?.persona?.id; if (currentId) return this.call('setBinding', el.dataset.scope, el.dataset.mode || 'bind', currentId); this.options.report?.('先在“人设档案”里选择一份人设。', 'info'); return; }
-    if (action === 'assistant-info') { this.options.report?.('Milo 使用酒馆当前主 API 生成回复，需要一点时间，通常约 30 秒到 1 分钟，具体取决于模型和网速。请耐心等待；失败的请求不会保存到助手记录。', 'info'); return; }
-    if (action === 'new-assistant') { this.state.aiSessionFresh = true; this.state.aiPrompt = ''; this.state.suggestions = []; const thread = await this.call('newAssistantThread'); if (thread?.activeThreadKey) this.state.assistantActiveThreadKey = thread.activeThreadKey; this.state.aiSessionFresh = false; this.render(); return; }
-    if (action === 'clear-assistant') { this.state.aiSessionFresh = true; this.state.suggestions = []; this.state.aiPrompt = ''; await this.call('clearAssistantThread'); this.state.aiSessionFresh = false; this.render(); return; }
+    if (action === 'assistant-info') { this.options.report?.('Milo 使用独立纯净请求直连当前 API 并开启流式输出（不会重复套入酒馆主预设或主线记录）。给出候选方案后，可直接点击卡片下方的「导入酒馆并启用」一键写入原生人设库。', 'info'); return; }
+    if (action === 'assistant-stop') {
+      await this.call('cancelAssistantGeneration');
+      if (!this.state.aiPrompt && this.state.aiStreaming?.user) this.state.aiPrompt = this.state.aiStreaming.user;
+      this.state.aiStreaming = null;
+      this.state.aiBusy = false;
+      this.render();
+      this.options.report?.('已停止本次生成。', 'info');
+      return;
+    }
+    if (action === 'copy-candidate') {
+      const candidate = this.candidateAt(Number(el.dataset.turn), Number(el.dataset.cand));
+      const body = String(candidate?.persona || candidate?.description || candidate?.concept || '').trim();
+      if (!body) { this.options.report?.('没有可复制的人设正文。', 'info'); return; }
+      const ok = await this.copyText(body);
+      this.options.report?.(ok ? '人设正文已复制到剪贴板。' : '复制失败，请手动选中文本复制。', ok ? 'success' : 'warning');
+      return;
+    }
+    if (action === 'import-candidate') {
+      const turnIndex = Number(el.dataset.turn);
+      const candIndex = Number(el.dataset.cand);
+      const turnKey = String(el.dataset.turnKey || ('turn_' + turnIndex));
+      const activate = el.dataset.activate === '1';
+      const candidate = this.candidateAt(turnIndex, candIndex);
+      if (!candidate) { this.options.report?.('找不到这份候选人设，请刷新页面后重试。', 'error'); return; }
+      try {
+        const created = await this.call('importAssistantCandidate', candidate, { activate });
+        if (created?.id) {
+          this.state.importedCandidates = {
+            ...(this.state.importedCandidates || {}),
+            [`${turnKey}:${candIndex}`]: { id: created.id, name: created.name, activated: Boolean(created.activated) },
+          };
+          this.render();
+          this.options.report?.(
+            created.activated
+              ? `已导入「${created.name}」并切换为当前生效人设！`
+              : `已将「${created.name}」存入酒馆人设档案。`,
+            'success',
+          );
+        }
+      } catch (error) {
+        this.options.report?.(error?.message || String(error), 'error');
+      }
+      return;
+    }
+    if (action === 'new-assistant') { this.state.aiSessionFresh = true; this.state.aiStreaming = null; this.state.aiBusy = false; this.state.aiPrompt = ''; this.state.suggestions = []; const thread = await this.call('newAssistantThread'); if (thread?.activeThreadKey) this.state.assistantActiveThreadKey = thread.activeThreadKey; this.state.aiSessionFresh = false; this.render(); return; }
+    if (action === 'clear-assistant') { this.state.aiSessionFresh = true; this.state.aiStreaming = null; this.state.aiBusy = false; this.state.suggestions = []; this.state.aiPrompt = ''; await this.call('clearAssistantThread'); this.state.aiSessionFresh = false; this.render(); return; }
     if (action === 'assistant-send') {
       const request = String(this.state.aiPrompt || '').trim();
       if (!request) { this.options.report?.('先写下你想和 Milo 讨论的内容。', 'info'); return; }
-      // The first message is a proposal (two usable directions); later
-      // messages continue the same thread as a normal conversation. A new
-      // thread therefore naturally starts with a fresh pair of directions.
       const hasHistory = this.assistantTurns().length > 0;
+      const mode = hasHistory ? 'auto' : 'propose';
       this.state.aiBusy = true;
+      this.state.aiPrompt = '';
+      this.state.aiStreaming = { user: request, reply: '', candidates: [], mode };
       this.render();
+      const onStream = preview => {
+        if (!this.state.aiBusy) return;
+        this.state.aiStreaming = {
+          user: request,
+          reply: preview?.reply || '',
+          candidates: Array.isArray(preview?.candidates) ? preview.candidates : [],
+          mode: preview?.mode || mode,
+        };
+        this.updateStreamingDom();
+      };
       try {
         const actionName = hasHistory ? 'assistantChat' : 'createDraft';
-        const result = await this.call(actionName, { request, includeCard: this.state.includeCard !== false, includeWorld: this.state.includeWorld === true, includeChat: this.state.includeChat === true });
-        if (!result?.__yantaiStale) this.state.aiPrompt = '';
+        const result = await this.call(actionName, { request, mode, includeCard: this.state.includeCard !== false, includeWorld: this.state.includeWorld === true, includeChat: this.state.includeChat === true, onStream });
         if (!result?.__yantaiStale && result?.candidates?.length) this.state.suggestions = result.candidates.slice(0, 2);
         if (!result?.__yantaiStale && result?.draft?.candidates?.length) this.state.suggestions = result.draft.candidates.slice(0, 2);
-      } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
+        if (result?.truncated) {
+          this.options.report?.('本次接口中途断开，已为你保留并整理已接收到的内容。', 'warning');
+        }
+      } catch (error) {
+        if (!this.state.aiPrompt) this.state.aiPrompt = request;
+        if (error?.name !== 'AbortError') {
+          this.options.report?.(error.message || String(error), 'error');
+        }
+      }
+      this.state.aiStreaming = null;
       this.state.aiBusy = false;
       this.render();
       return;

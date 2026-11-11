@@ -256,3 +256,69 @@ test('updateNativePersona and syncActivePersonaUserName sync name1 via setUserNa
   assert.equal(activeUserName, '沈清砚');
   assert.equal(context.name1, '沈清砚');
 });
+
+test('mergeNativePersonasFromPayload syncs cross-device edits & tombstoned deletions without touching excludeId or unsaved local personas', () => {
+  const context = {
+    powerUserSettings: {
+      user_avatar: 'persona-active.png',
+      persona_description: '当前生效人设描述',
+      personas: {
+        'persona-active.png': '林知夏',
+        'persona-editing.png': '苏砚（电脑正在编辑）',
+        'persona-phone-edited.png': '旧名字',
+        'persona-deleted-on-phone.png': '手机已删人设',
+        'persona-local-unsaved.png': '电脑刚新建尚未落盘的人设',
+      },
+      persona_descriptions: {
+        'persona-active.png': { description: '当前生效人设描述', title: '' },
+        'persona-editing.png': { description: '电脑刚写了一半的新设定', title: '编辑中' },
+        'persona-phone-edited.png': { description: '电脑缓存里的旧描述', title: '旧备注' },
+        'persona-deleted-on-phone.png': { description: '不该诈尸回写', title: '' },
+        'persona-local-unsaved.png': { description: '刚建好还没存到服务端', title: '' },
+      },
+    },
+  };
+
+  const serverPayload = {
+    power_user: {
+      personas: {
+        'persona-active.png': '林知夏',
+        'persona-editing.png': '苏砚（服务器旧名）',
+        'persona-phone-edited.png': '手机改后的新名字',
+      },
+      persona_descriptions: {
+        'persona-active.png': { description: '当前生效人设描述', title: '' },
+        'persona-editing.png': { description: '服务器上的旧设定', title: '' },
+        'persona-phone-edited.png': { description: '手机端刚改完的新描述', title: '新备注' },
+      },
+    },
+    extension_settings: {
+      'yantai-persona-studio': {
+        personaMeta: {
+          'persona-deleted-on-phone.png': { deletedAt: 1794430000000 },
+        },
+      },
+    },
+  };
+
+  const result = mergeNativePersonasFromPayload(serverPayload, {
+    context,
+    preferServer: true,
+    excludeId: 'persona-editing.png',
+  });
+
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.updated, ['persona-phone-edited.png']);
+  assert.deepEqual(result.removed, ['persona-deleted-on-phone.png']);
+  // Currently edited persona on PC is strictly protected by excludeId
+  assert.equal(context.powerUserSettings.personas['persona-editing.png'], '苏砚（电脑正在编辑）');
+  assert.equal(context.powerUserSettings.persona_descriptions['persona-editing.png'].description, '电脑刚写了一半的新设定');
+  // Other persona edited on phone is updated to latest server version
+  assert.equal(context.powerUserSettings.personas['persona-phone-edited.png'], '手机改后的新名字');
+  assert.equal(context.powerUserSettings.persona_descriptions['persona-phone-edited.png'].description, '手机端刚改完的新描述');
+  // Tombstoned persona deleted on phone is removed from local memory so PC won't resurrect it
+  assert.equal('persona-deleted-on-phone.png' in context.powerUserSettings.personas, false);
+  // Brand-new local persona without tombstone is NEVER deleted
+  assert.equal(context.powerUserSettings.personas['persona-local-unsaved.png'], '电脑刚新建尚未落盘的人设');
+});
+

@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.0.13",
+  "latest": "1.1.0",
   "releases": [
+    {
+      "version": "1.1.0",
+      "branch": "v1.1.0",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆 Milo 流式重构、一键导入与多端静默自动合并正式版。Milo 人设助手改用独立纯净请求绕开酒馆主预设污染，支持真 SSE 流式输出、随时停止、断流自动抢救与多轮自适应出稿；候选方案卡片新增「一键导入酒馆并启用 / 仅存入档案」；跨设备同步升级为后台静默无损自动合并（Auto-Rebase），彻底告别手机电脑来回切换时的黄色冲突警告弹窗，并补齐跨端修改防冲回与删除墓碑清理。"
+    },
     {
       "version": "1.0.13",
       "branch": "v1.0.13",

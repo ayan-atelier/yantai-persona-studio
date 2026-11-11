@@ -93,7 +93,7 @@ export function resolveBinding(bindings = {}, context = getStContext()) {
 
 export function getExtensionSettings(context = getStContext(), extensionId = EXTENSION_ID) { return context?.extensionSettings?.[extensionId] ?? {}; }
 export async function saveExtensionSettings(patch = {}, context = getStContext(), extensionId = EXTENSION_ID) {
-  await syncNativePersonasFromServer({ context, preferServer: false });
+  await syncNativePersonasFromServer({ context, preferServer: true });
   const settings = context.extensionSettings ?? (context.extensionSettings = {});
   settings[extensionId] = { ...(settings[extensionId] ?? {}), ...patch };
   const saver = context.saveSettingsDebounced ?? context.saveSettings;
@@ -146,25 +146,35 @@ export function isPlaceholderPersonaRecord(name, descriptor = {}) {
  * placeholder, and heals partial corruption when only the name or only the
  * description was lost.
  */
-export function mergeNativePersonasFromPayload(rawSettings, { context = getStContext(), api = null, preferServer = false, excludeId = '' } = {}) {
+export function mergeNativePersonasFromPayload(rawSettings, { context = getStContext(), api = null, preferServer = false, excludeId = '', deletedIds = null } = {}) {
   const remotePower = rawSettings?.power_user ?? rawSettings?.powerUserSettings ?? rawSettings ?? {};
   const remotePersonas = remotePower?.personas && typeof remotePower.personas === 'object' ? remotePower.personas : null;
-  if (!remotePersonas) return { changed: false, added: [], updated: [] };
+  if (!remotePersonas) return { changed: false, added: [], updated: [], removed: [] };
   const remoteDescriptions = remotePower?.persona_descriptions && typeof remotePower.persona_descriptions === 'object'
     ? remotePower.persona_descriptions
     : {};
   const settings = powerSettings(context);
-  if (!settings || typeof settings !== 'object') return { changed: false, added: [], updated: [] };
+  if (!settings || typeof settings !== 'object') return { changed: false, added: [], updated: [], removed: [] };
   settings.personas = settings.personas && typeof settings.personas === 'object' ? settings.personas : {};
   settings.persona_descriptions = settings.persona_descriptions && typeof settings.persona_descriptions === 'object'
     ? settings.persona_descriptions
     : {};
+  const extMeta = rawSettings?.extension_settings?.[EXTENSION_ID]?.personaMeta
+    || rawSettings?.extensionSettings?.[EXTENSION_ID]?.personaMeta
+    || {};
+  const tombstoneSet = new Set(deletedIds ? [...deletedIds].map(String) : []);
+  for (const [metaId, metaVal] of Object.entries(extMeta)) {
+    if (metaVal && Number(metaVal.deletedAt || 0) > Number(metaVal?.snapshot?.updatedAt || 0)) {
+      tombstoneSet.add(String(metaId));
+    }
+  }
   const skipId = String(excludeId || '').trim();
   const added = [];
   const updated = [];
+  const removed = [];
   for (const [avatarId, remoteNameRaw] of Object.entries(remotePersonas)) {
     const id = String(avatarId || '').trim();
-    if (!id || id === skipId || locallyDeletedPersonas.has(id)) continue;
+    if (!id || id === skipId || locallyDeletedPersonas.has(id) || tombstoneSet.has(id)) continue;
     const remoteName = String(remoteNameRaw ?? id);
     const remoteDescRaw = remoteDescriptions[id];
     const remoteDesc = remoteDescRaw && typeof remoteDescRaw === 'object'
@@ -214,16 +224,25 @@ export function mergeNativePersonasFromPayload(rawSettings, { context = getStCon
     if (itemUpdated) updated.push(id);
   }
   const currentId = String(currentNativeId(context, api) || rawSettings?.user_avatar || '');
+  for (const localId of Object.keys(settings.personas)) {
+    if (!localId || localId === skipId || localId === currentId) continue;
+    if (Object.prototype.hasOwnProperty.call(remotePersonas, localId)) continue;
+    if (locallyDeletedPersonas.has(localId) || tombstoneSet.has(localId)) {
+      delete settings.personas[localId];
+      delete settings.persona_descriptions[localId];
+      removed.push(localId);
+    }
+  }
   if (currentId && (added.includes(currentId) || updated.includes(currentId)) && settings.persona_descriptions[currentId]) {
     settings.persona_description = String(settings.persona_descriptions[currentId].description ?? '');
     if (settings.persona_descriptions[currentId].lorebook !== undefined) {
       settings.persona_description_lorebook = String(settings.persona_descriptions[currentId].lorebook || '');
     }
   }
-  return { changed: added.length > 0 || updated.length > 0, added, updated };
+  return { changed: added.length > 0 || updated.length > 0 || removed.length > 0, added, updated, removed };
 }
-export async function syncNativePersonasFromServer({ context = getStContext(), api = null, preferServer = false, excludeId = '' } = {}) {
-  if (typeof globalThis.fetch !== 'function') return { ok: false, changed: false, added: [], updated: [], raw: null };
+export async function syncNativePersonasFromServer({ context = getStContext(), api = null, preferServer = false, excludeId = '', deletedIds = null } = {}) {
+  if (typeof globalThis.fetch !== 'function') return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
   try {
     const getter = context?.getRequestHeaders || globalThis.getRequestHeaders;
     const headers = typeof getter === 'function' ? (getter.call(context, { omitContentType: false }) || {}) : {};
@@ -233,15 +252,15 @@ export async function syncNativePersonasFromServer({ context = getStContext(), a
       cache: 'no-store',
       credentials: 'same-origin',
     });
-    if (!response?.ok) return { ok: false, changed: false, added: [], updated: [], raw: null };
+    if (!response?.ok) return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
     const payload = await response.json();
     const raw = typeof payload?.settings === 'string' ? JSON.parse(payload.settings) : payload?.settings;
-    if (!raw || typeof raw !== 'object') return { ok: false, changed: false, added: [], updated: [], raw: null };
-    const merged = mergeNativePersonasFromPayload(raw, { context, api, preferServer, excludeId });
+    if (!raw || typeof raw !== 'object') return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
+    const merged = mergeNativePersonasFromPayload(raw, { context, api, preferServer, excludeId, deletedIds });
     await syncActivePersonaUserName(context, api);
     return { ok: true, ...merged, raw };
   } catch (_) {
-    return { ok: false, changed: false, added: [], updated: [], raw: null };
+    return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
   }
 }
 async function nativeApi() {
@@ -460,7 +479,7 @@ export async function createNativePersona({ name, title = '', description = '', 
   const personaName = String(name || '').trim();
   if (!personaName) throw new Error('请先填写人设名称。');
   const native = api || await nativeApi();
-  await syncNativePersonasFromServer({ context, api: native, preferServer: false });
+  await syncNativePersonasFromServer({ context, api: native, preferServer: true });
   const settings = powerSettings(context);
   const slug = personaName.replace(/[^a-zA-Z0-9]+/g, '').slice(0, 40) || 'persona';
   let avatarId = `${Date.now()}-${slug}.png`;
@@ -473,7 +492,7 @@ export async function createNativePersona({ name, title = '', description = '', 
   const blob = await response.blob();
   const file = typeof File === 'function' ? new File([blob], 'persona-default.png', { type: blob.type || 'image/png' }) : blob;
   await uploadNativeAvatar(file, { resizePrompt: false, overwriteName: avatarId, createPersona: false, context });
-  await syncNativePersonasFromServer({ context, api: native, preferServer: false, excludeId: avatarId });
+  await syncNativePersonasFromServer({ context, api: native, preferServer: true, excludeId: avatarId });
   if (typeof native?.initPersona === 'function') {
     await native.initPersona(avatarId, personaName, descriptor.description, descriptor.title, { silent: true, position, depth, role, lorebook: descriptor.lorebook });
   } else {
@@ -638,7 +657,7 @@ export async function selectNativePersona(id, context = getStContext(), api = nu
   return false;
 }
 export async function setNativeDefaultPersona(id, context = getStContext(), api = null) {
-  await syncNativePersonasFromServer({ context, api, preferServer: false });
+  await syncNativePersonasFromServer({ context, api, preferServer: true });
   const settings = powerSettings(context);
   if (id && !(String(id) in (settings.personas || {}))) return false;
   if (typeof api?.setDefaultPersona === 'function') {
@@ -661,7 +680,7 @@ export async function setNativeDefaultPersona(id, context = getStContext(), api 
  */
 export async function updateNativePersona(id, patch = {}, context = getStContext(), api = null) {
   const avatarId = String(id || '');
-  await syncNativePersonasFromServer({ context, api, preferServer: false, excludeId: avatarId });
+  await syncNativePersonasFromServer({ context, api, preferServer: true, excludeId: avatarId });
   const settings = powerSettings(context);
   if (!avatarId || !settings.personas || !(avatarId in settings.personas)) return false;
   const descriptor = settings.persona_descriptions?.[avatarId] || {
@@ -763,7 +782,7 @@ export async function duplicateNativePersona(id, context = getStContext(), api =
   const avatarId = String(id || '');
   if (!avatarId) return false;
   const native = api || await nativeApi();
-  await syncNativePersonasFromServer({ context, api: native, preferServer: false });
+  await syncNativePersonasFromServer({ context, api: native, preferServer: true });
   const settings = powerSettings(context);
   const personaName = String(settings.personas?.[avatarId] || '');
   if (!personaName) return false;
@@ -790,7 +809,7 @@ export async function duplicateNativePersona(id, context = getStContext(), api =
   const uploadResponse = await fetch('/api/avatars/upload', { method: 'POST', headers, cache: 'no-cache', body: formData });
   if (!uploadResponse.ok) throw new Error(`复制人设头像失败：${uploadResponse.statusText}`);
 
-  await syncNativePersonasFromServer({ context, api: native, preferServer: false, excludeId: newAvatarId });
+  await syncNativePersonasFromServer({ context, api: native, preferServer: true, excludeId: newAvatarId });
   if (typeof native?.initPersona === 'function') {
     await native.initPersona(newAvatarId, personaName, descriptor.description || '', descriptor.title || '', {
       silent: true,
