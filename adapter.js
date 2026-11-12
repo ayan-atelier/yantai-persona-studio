@@ -241,19 +241,34 @@ export function mergeNativePersonasFromPayload(rawSettings, { context = getStCon
   }
   return { changed: added.length > 0 || updated.length > 0 || removed.length > 0, added, updated, removed };
 }
-export async function syncNativePersonasFromServer({ context = getStContext(), api = null, preferServer = false, excludeId = '', deletedIds = null } = {}) {
+export async function syncNativePersonasFromServer({ context = getStContext(), api = null, preferServer = false, excludeId = '', deletedIds = null, timeoutMs = 4500 } = {}) {
   if (typeof globalThis.fetch !== 'function') return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer = null;
+  const timeoutGuard = timeoutMs > 0
+    ? new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        try { controller?.abort(); } catch (_) {}
+        reject(new Error('SETTINGS_FETCH_TIMEOUT'));
+      }, timeoutMs);
+    })
+    : null;
   try {
     const getter = context?.getRequestHeaders || globalThis.getRequestHeaders;
     const headers = typeof getter === 'function' ? (getter.call(context, { omitContentType: false }) || {}) : {};
-    const response = await globalThis.fetch('/api/settings/get', {
+    const fetchPromise = Promise.resolve().then(() => globalThis.fetch('/api/settings/get', {
       method: 'POST',
       headers,
       cache: 'no-store',
       credentials: 'same-origin',
+      ...(controller ? { signal: controller.signal } : {}),
+    })).then(async response => {
+      if (!response?.ok) return null;
+      return response.json();
     });
-    if (!response?.ok) return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
-    const payload = await response.json();
+    fetchPromise.catch(() => {});
+    const payload = timeoutGuard ? await Promise.race([fetchPromise, timeoutGuard]) : await fetchPromise;
+    if (!payload) return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
     const raw = typeof payload?.settings === 'string' ? JSON.parse(payload.settings) : payload?.settings;
     if (!raw || typeof raw !== 'object') return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
     const merged = mergeNativePersonasFromPayload(raw, { context, api, preferServer, excludeId, deletedIds });
@@ -261,22 +276,42 @@ export async function syncNativePersonasFromServer({ context = getStContext(), a
     return { ok: true, ...merged, raw };
   } catch (_) {
     return { ok: false, changed: false, added: [], updated: [], removed: [], raw: null };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 async function nativeApi() {
+  if (cachedNativeModule) return cachedNativeModule;
   if (!nativeModulePromise) {
     nativeModulePromise = import('/scripts/personas.js')
-      .then(mod => { cachedNativeModule = mod; return mod; })
-      .catch(() => null);
+      .catch(() => import(new URL('../../../personas.js', import.meta.url).href))
+      .then(mod => {
+        if (mod) cachedNativeModule = mod;
+        else nativeModulePromise = null;
+        return mod || null;
+      })
+      .catch(() => {
+        nativeModulePromise = null;
+        return null;
+      });
   }
   return nativeModulePromise;
 }
 async function scriptApi() {
+  if (cachedScriptModule) return cachedScriptModule;
   if (!scriptModulePromise) {
     scriptModulePromise = import('/script.js')
       .catch(() => import('/scripts/script.js'))
-      .then(mod => { cachedScriptModule = mod; return mod; })
-      .catch(() => null);
+      .catch(() => import(new URL('../../../../script.js', import.meta.url).href))
+      .then(mod => {
+        if (mod) cachedScriptModule = mod;
+        else scriptModulePromise = null;
+        return mod || null;
+      })
+      .catch(() => {
+        scriptModulePromise = null;
+        return null;
+      });
   }
   return scriptModulePromise;
 }
@@ -284,11 +319,17 @@ async function scriptApi() {
 function avatarFileName(value) {
   let raw = String(value || '').trim();
   if (!raw) return '';
+  const looksLikePathOrUrl = /[\\/]/.test(raw) || /^https?:/i.test(raw);
+  if (looksLikePathOrUrl) {
+    raw = raw.split(/[?#]/, 1)[0].replace(/\\/g, '/');
+  }
   try { raw = decodeURIComponent(raw); } catch (_) { /* keep the original path */ }
-  raw = raw.split(/[?#]/, 1)[0].replace(/\\/g, '/');
-  const marker = raw.toLowerCase().lastIndexOf('/user avatars/');
-  if (marker >= 0) raw = raw.slice(marker + '/user avatars/'.length);
-  return raw.split('/').filter(Boolean).pop() || '';
+  if (looksLikePathOrUrl) {
+    const marker = raw.toLowerCase().lastIndexOf('/user avatars/');
+    if (marker >= 0) raw = raw.slice(marker + '/user avatars/'.length);
+    return raw.split('/').filter(Boolean).pop() || '';
+  }
+  return raw;
 }
 
 async function nativeAvatarUrl(file, context = {}, native = null) {
@@ -514,8 +555,12 @@ function currentNativeId(context, api = null) {
   return mod?.user_avatar ?? context?.user_avatar ?? settings.user_avatar ?? context?.currentAvatar ?? fromDom ?? null;
 }
 export async function syncActivePersonaUserName(context = getStContext(), api = null, explicitName = '') {
-  const native = api || cachedNativeModule || await nativeApi();
-  const currentId = String(currentNativeId(context, native) || '').trim();
+  let native = api || cachedNativeModule;
+  let currentId = String(currentNativeId(context, native) || '').trim();
+  if (!currentId && !native) {
+    native = await nativeApi();
+    currentId = String(currentNativeId(context, native) || '').trim();
+  }
   const settings = powerSettings(context);
   const personaName = String(
     explicitName
@@ -523,7 +568,7 @@ export async function syncActivePersonaUserName(context = getStContext(), api = 
     || '',
   ).trim();
   if (!personaName || isPlaceholderPersonaName(personaName)) return false;
-  const scriptMod = cachedScriptModule || await scriptApi();
+  const scriptMod = cachedScriptModule || (context?.name1 !== undefined && typeof context?.setUserName === 'function' ? null : await scriptApi());
   const liveName = String(scriptMod?.name1 ?? context?.name1 ?? '').trim();
   const domName = String(globalThis.document?.querySelector?.('#your_name')?.textContent ?? '').trim();
   const chatList = Array.isArray(context?.chat) ? context.chat : [];
@@ -575,12 +620,16 @@ function personaImageUrl(context, avatarId, api = null) {
   if (!id) return '';
   if (/^(?:https?:|data:|blob:)/i.test(id)) return id;
   try {
-    if (typeof api?.getUserAvatar === 'function') return api.getUserAvatar(id);
-  } catch (_) { /* use the stable native endpoint below */ }
-  // The thumbnail endpoint is intentionally only a fallback. It is useful on
-  // older ST/TT builds, but it downscales the image and made the editor look
-  // blurry even when the original avatar was sharp.
-  return '/User Avatars/' + encodeURIComponent(id);
+    if (typeof api?.getUserAvatar === 'function') {
+      const candidate = String(api.getUserAvatar(id) || '');
+      if (/^(?:https?:|data:|blob:)/i.test(candidate)) return candidate;
+    }
+  } catch (_) { /* use the stable encoded native endpoint below */ }
+  // Encode the filename explicitly: SillyTavern's native getUserAvatar() does
+  // raw string concatenation (`User Avatars/${id}`), which breaks on `#`, `?`,
+  // `%` or spaces in TauriTavern WebViews.
+  const file = avatarFileName(id) || id;
+  return '/User Avatars/' + encodeURIComponent(file);
 }
 
 /** Read every persona already present in the native store. No import step. */
@@ -792,9 +841,10 @@ export async function duplicateNativePersona(id, context = getStContext(), api =
   const newAvatarId = `${Date.now()}-${personaName.replace(/[^a-zA-Z0-9]/g, '')}.png`;
   locallyDeletedPersonas.delete(newAvatarId);
   const descriptor = settings.persona_descriptions?.[avatarId] || {};
-  const sourceUrl = typeof native?.getUserAvatar === 'function'
-    ? native.getUserAvatar(avatarId)
-    : '/User Avatars/' + encodeURIComponent(avatarId);
+  const rawAvatarUrl = typeof native?.getUserAvatar === 'function' ? String(native.getUserAvatar(avatarId) || '') : '';
+  const sourceUrl = /^(?:https?:|data:|blob:)/i.test(rawAvatarUrl)
+    ? rawAvatarUrl
+    : '/User Avatars/' + encodeURIComponent(avatarFileName(avatarId) || avatarId);
   const sourceResponse = await fetch(sourceUrl, { cache: 'no-cache' });
   if (!sourceResponse.ok) throw new Error(`复制人设头像失败：${sourceResponse.statusText}`);
   const sourceBlob = await sourceResponse.blob();
@@ -998,6 +1048,7 @@ export function setNativeTakeover(active = true) {
   for (const block of blocks) {
     block.classList.toggle('ytps-takeover', Boolean(active));
     block.classList.toggle('ytps-native-edit', false);
+    block.closest?.('#PersonaManagement')?.classList?.toggle('ytps-drawer-takeover', Boolean(active));
   }
   return true;
 }
@@ -1007,6 +1058,7 @@ export function setNativeEditMode(active = true) {
   for (const block of blocks) {
     block.classList.toggle('ytps-takeover', false);
     block.classList.toggle('ytps-native-edit', Boolean(active));
+    block.closest?.('#PersonaManagement')?.classList?.toggle('ytps-drawer-takeover', false);
   }
   return true;
 }
@@ -1158,7 +1210,12 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     const ctx = context(); const source = ctx.eventSource; const types = ctx.eventTypes || ctx.event_types || {}; const type = types[name] || name;
     if (!source?.on || typeof fn !== 'function') return;
     const key = name + ':' + fn;
-    if (listeners.has(key)) return;
+    const existing = listeners.get(key);
+    if (existing && existing[0] === source) return;
+    if (existing) {
+      const [oldSource, oldType, oldHandler] = existing;
+      if (oldSource?.removeListener) oldSource.removeListener(oldType, oldHandler); else oldSource?.off?.(oldType, oldHandler);
+    }
     source.on(type, fn); listeners.set(key, [source, type, fn]);
   };
   const off = (name, fn) => {
@@ -1191,6 +1248,7 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativePersonaHeader(false);
     const block = document.querySelector('#persona-management-block');
     block?.classList.remove('ytps-takeover', 'ytps-native-edit');
+    document.querySelector('#PersonaManagement')?.classList?.remove('ytps-drawer-takeover');
   };
   const loadExtensionState = async (fallback = {}) => ({ ...fallback, ...getExtensionSettings(context(), namespace) });
   const saveExtensionState = async state => saveExtensionSettings(state, context(), namespace);
@@ -1208,6 +1266,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), await loadNativeApi(), explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), native, explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

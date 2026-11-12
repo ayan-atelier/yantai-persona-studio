@@ -4,11 +4,17 @@
  * locks are read from ST; this extension adds an organiser, gallery and AI
  * helper around the existing panel.
  */
+import { PERSONA_VERSION, createVersionManager } from './versions.js';
+import { openVersionDialog } from './version-ui.js';
+import { createAdapter, getExtensionSettings } from './adapter.js';
+import { createStorage } from './storage.js';
+import * as uiModule from './ui.js';
+import { createAiHelper } from './ai.js';
+import { createSyncClient } from './sync-client.js';
+
 (async () => {
   'use strict';
 
-  const { PERSONA_VERSION, createVersionManager } = await import(new URL('./versions.js', import.meta.url));
-  const { openVersionDialog } = await import(new URL('./version-ui.js', import.meta.url));
   const VERSION = PERSONA_VERSION;
   const NS = 'yantai-persona-studio';
   const root = globalThis;
@@ -58,8 +64,12 @@
   let initialized = false;
   let observer = null;
   let panelObserver = null;
+  let avatarListObserver = null;
+  let avatarListTimer = null;
   let panelObserverTargets = new WeakSet();
   let observerTimer = null;
+  let bootTimers = [];
+  let stateHydratedPromise = null;
   let disposed = false;
   let editMode = false;
   let lastNativeOpen = null;
@@ -235,9 +245,15 @@
     observer = null;
     panelObserver?.disconnect?.();
     panelObserver = null;
+    avatarListObserver?.disconnect?.();
+    avatarListObserver = null;
+    if (avatarListTimer) clearTimeout(avatarListTimer);
+    avatarListTimer = null;
     panelObserverTargets = new WeakSet();
     if (observerTimer) clearTimeout(observerTimer);
     observerTimer = null;
+    for (const timer of bootTimers) clearTimeout(timer);
+    bootTimers = [];
     if (globalThis.document?.body?.dataset) delete globalThis.document.body.dataset.yantaiPersonaObserver;
   }
 
@@ -263,25 +279,22 @@
 
   root[RUNTIME_KEY] = { dispose };
 
-  async function loadModules() {
-    const base = new URL('.', import.meta.url);
-    const [adapterModule, storageModule, uiModule, aiModule, syncModule] = await Promise.all([
-      import(new URL('./adapter.js', base)),
-      import(new URL('./storage.js', base)),
-      import(new URL('./ui.js', base)),
-      import(new URL('./ai.js', base)),
-      import(new URL('./sync-client.js', base)),
-    ]);
-    adapter = adapterModule.createAdapter({ namespace: NS, version: VERSION, report });
-    // Load the real native persona module once so the current selection and
-    // setter use SillyTavern's live bindings instead of a stale context copy.
-    await adapter.loadNativeApi();
-    storage = storageModule.createStorage({ namespace: NS, report });
+  function loadModules() {
+    adapter = createAdapter({ namespace: NS, version: VERSION, report });
+    // Kick off the native personas.js module import in the background without
+    // blocking UI mount on cold TauriTavern startups; refresh once it resolves.
+    void adapter.loadNativeApi().then(mod => {
+      if (mod && app && !disposed) void refresh();
+    }).catch(() => {});
+    storage = createStorage({ namespace: NS, report });
     ui = uiModule;
-    ai = aiModule.createAiHelper({ namespace: NS, version: VERSION, adapter, report });
-    const context = adapter.context();
-    const getter = context?.getRequestHeaders || globalThis.getRequestHeaders;
-    syncClient = syncModule.createSyncClient({ getRequestHeaders: typeof getter === 'function' ? getter.bind(context) : null, clientVersion: VERSION });
+    ai = createAiHelper({ namespace: NS, version: VERSION, adapter, report });
+    const getDynamicHeaders = opts => {
+      const ctx = adapter?.context?.();
+      const getter = ctx?.getRequestHeaders || globalThis.getRequestHeaders;
+      return typeof getter === 'function' ? getter.call(ctx, opts) : {};
+    };
+    syncClient = createSyncClient({ getRequestHeaders: getDynamicHeaders, clientVersion: VERSION });
   }
 
   function defaultState() {
@@ -512,12 +525,53 @@
     })).filter(item => item.id) : [];
     if (assets.length) state.gallery = storage.mergeGallery(state.gallery, assets);
   }
-  async function loadState() {
-    const saved = await adapter.loadExtensionState(defaultState());
+  function seedInitialState() {
+    const saved = getExtensionSettings(adapter?.context?.(), NS);
     state = adapter.normalizeState({ ...defaultState(), ...saved });
     const pending = readPendingState();
     if (pending) {
       state = adapter.normalizeState({ ...defaultState(), ...state, ...mergeSharedState(pending, sharedState(state)) });
+      pendingSyncNotice = true;
+    }
+    if (Array.isArray(state.aiTurns) && state.aiTurns.length && !Object.keys(state.assistantThreads || {}).length) {
+      const target = activeTarget();
+      const key = assistantThreadKey(target);
+      state.assistantThreads[key] = { id: key, target: { cardKey: target.cardKey || 'no-card', legacyCardKey: target.legacyCardKey || target.cardFingerprint || '', chatId: target.chatId || 'no-chat' }, createdAt: Date.now(), updatedAt: Date.now(), turns: state.aiTurns.slice() };
+      delete state.aiTurns;
+    }
+    mergeAssistantThreadsToGlobal();
+    const localSettings = readLocalSettings();
+    if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
+    state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {};
+    gallerySync = state.gallerySync || saved?.gallerySync || null;
+    mergeGalleryManifest(gallerySync);
+    applyTurnRepairs(state, saved?.turnRepairs);
+    return state;
+  }
+  async function loadState() {
+    const currentLiveUi = () => (state?.ui && typeof state.ui === 'object' ? { ...state.ui } : null);
+    const currentLiveEnabled = () => {
+      const local = readLocalSettings();
+      if (typeof local.enabled === 'boolean') return local.enabled;
+      return typeof state?.enabled === 'boolean' ? state.enabled : true;
+    };
+    const saved = await adapter.loadExtensionState(defaultState());
+    const liveUiBeforeMerge = currentLiveUi();
+    state = adapter.normalizeState({
+      ...defaultState(),
+      ...saved,
+      ...(liveUiBeforeMerge ? { ui: liveUiBeforeMerge } : {}),
+      enabled: currentLiveEnabled(),
+    });
+    const pending = readPendingState();
+    if (pending) {
+      state = adapter.normalizeState({
+        ...defaultState(),
+        ...state,
+        ...mergeSharedState(pending, sharedState(state)),
+        ...(currentLiveUi() ? { ui: currentLiveUi() } : {}),
+        enabled: currentLiveEnabled(),
+      });
       // Keep the recoverable local copy and surface its presence in the
       // extension settings. Startup toasts make a historical interrupted save
       // look like a fresh failure on every device and every reload.
@@ -533,8 +587,7 @@
       delete state.aiTurns;
     }
     mergeAssistantThreadsToGlobal();
-    const localSettings = readLocalSettings();
-    if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
+    state.enabled = currentLiveEnabled();
     syncMode = 'checking';
     syncStatus = 'unavailable';
     syncRevision = null;
@@ -553,7 +606,13 @@
           const mergedDoc = pending
             ? mergeSharedState(sharedState(state), syncRemoteState)
             : mergeSharedState(syncRemoteState, sharedState(state));
-          state = adapter.normalizeState({ ...defaultState(), ...state, ...mergedDoc, enabled: state.enabled });
+          state = adapter.normalizeState({
+            ...defaultState(),
+            ...state,
+            ...mergedDoc,
+            ...(currentLiveUi() ? { ui: currentLiveUi() } : {}),
+            enabled: currentLiveEnabled(),
+          });
           syncStatus = 'ready';
           if (pending) {
             pendingSyncNotice = false;
@@ -632,6 +691,7 @@
     await healPlaceholderPersonas({ force: true });
     await adapter?.syncActivePersonaUserName?.();
     const seededSnapshots = capturePersonaSnapshots(adapter.readNativePersonas?.() || [], { initialSeed: true });
+    stateHydratedPromise = null;
     if ((seededSnapshots || repairedTurns || shouldFlushPending) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       void save({ syncGallery: shouldFlushPending });
     }
@@ -1048,8 +1108,8 @@
     })();
     return resumeSyncInFlight;
   }
-  async function refresh() {
-    if (!app) return;
+  async function refresh(retryCount = 0) {
+    if (!app || disposed) return;
     const sequence = ++refreshSequence;
     const target = activeTarget();
     const targetIdentity = targetKey(target);
@@ -1073,8 +1133,13 @@
       void save({ syncGallery: false });
     }
     const contextSnapshot = await adapter.contextSnapshot({ includeWorld: false });
-    if (sequence !== refreshSequence || targetKey(activeTarget()) !== targetIdentity || !app) return;
-    app.update({ state, target, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas, nativeGallery: nativeGallery(), contextSnapshot });
+    if (sequence !== refreshSequence || !app || disposed) return;
+    if (targetKey(activeTarget()) !== targetIdentity && retryCount < 2) {
+      return refresh(retryCount + 1);
+    }
+    const finalTarget = activeTarget();
+    personas = adapter.readNativePersonas();
+    app.update({ state, target: finalTarget, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas, nativeGallery: nativeGallery(), contextSnapshot });
   }
   async function persistHostSharedState(candidate, { preservePending = false } = {}) {
     const context = adapter?.context?.();
@@ -1090,18 +1155,37 @@
     try {
       const getter = context.getRequestHeaders || globalThis.getRequestHeaders;
       const headers = typeof getter === 'function' ? (getter.call(context, { omitContentType: false }) || {}) : {};
-      const response = await fetch('/api/settings/get', { method: 'POST', headers, cache: 'no-store', credentials: 'same-origin' });
-      if (response.ok) {
-        const payload = await response.json();
-        const raw = typeof payload?.settings === 'string' ? JSON.parse(payload.settings) : payload?.settings;
-        adapter?.mergeNativePersonasFromPayload?.(raw, { context, preferServer: true, deletedIds: knownDeletedPersonaIds() });
-        const extensions = raw?.extension_settings || raw?.extensionSettings;
-        if (extensions?.[NS] && typeof extensions[NS] === 'object') {
-          currentNamespace = extensions[NS];
-          settings[NS] = { ...currentNamespace };
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      let timer = null;
+      const timeoutGuard = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          try { controller?.abort(); } catch (_) {}
+          reject(new Error('SETTINGS_FETCH_TIMEOUT'));
+        }, 4500);
+      });
+      try {
+        const fetchPromise = Promise.resolve().then(() => fetch('/api/settings/get', {
+          method: 'POST',
+          headers,
+          cache: 'no-store',
+          credentials: 'same-origin',
+          ...(controller ? { signal: controller.signal } : {}),
+        })).then(async response => (response?.ok ? response.json() : null));
+        fetchPromise.catch(() => {});
+        const payload = await Promise.race([fetchPromise, timeoutGuard]);
+        if (payload) {
+          const raw = typeof payload?.settings === 'string' ? JSON.parse(payload.settings) : payload?.settings;
+          adapter?.mergeNativePersonasFromPayload?.(raw, { context, preferServer: true, deletedIds: knownDeletedPersonaIds() });
+          const extensions = raw?.extension_settings || raw?.extensionSettings;
+          if (extensions?.[NS] && typeof extensions[NS] === 'object') {
+            currentNamespace = extensions[NS];
+            settings[NS] = { ...currentNamespace };
+          }
         }
+      } finally {
+        if (timer) clearTimeout(timer);
       }
-    } catch (_) { /* older Tavern builds may not expose the read endpoint */ }
+    } catch (_) { /* older Tavern builds or slow Tauri IPC bridges may fail or time out */ }
     const current = adapter.normalizeState({ ...defaultState(), ...currentNamespace });
     // Merge against the latest namespace visible to this page, preserving
     // unrelated extension settings. The candidate is the local winner for
@@ -1273,6 +1357,9 @@
   }
 
   async function saveImpl({ syncGallery = true, queuedShared = null } = {}) {
+    if (stateHydratedPromise) {
+      await stateHydratedPromise.catch(() => {});
+    }
     // Gallery bytes still go through SillyTavern's image API. The gallery
     // manifest and all other extension data go to the independent CAS store
     // when available, or the extension namespace through Tavern's own saver
@@ -1471,7 +1558,7 @@
       return;
     }
     const isOpen = Boolean(adapter?.isNativePersonaPanelOpen?.());
-    const openedNow = isOpen && lastNativeOpen === false;
+    const openedNow = isOpen && lastNativeOpen !== true;
     const closedNow = !isOpen && lastNativeOpen === true;
     lastNativeOpen = isOpen;
     if (closedNow && editMode) {
@@ -1505,13 +1592,9 @@
   async function initialize() {
     if (initialized) return;
     initialized = true;
-    await loadModules();
-    // A newer extension runtime can dispose this one while its dynamic
-    // imports are still resolving. Do not let the old instance continue and
-    // emit duplicate startup notices after the new instance has mounted.
+    loadModules();
     if (disposed) return;
-    await loadState();
-    if (disposed) return;
+    seedInitialState();
     registerControlModule();
     app = ui.createApp({ version: VERSION, adapter, storage, actions: {}, report, getState: () => ({ state, target: activeTarget(), current: resolved() }) });
     const actions = {
@@ -1863,14 +1946,7 @@
       state: () => state,
     };
     app.options.actions = actions;
-    pendingGalleryNotice = state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl);
     updateSettingsUi();
-    adapter.on('CHAT_CHANGED', refresh);
-    adapter.on('CHARACTER_CHANGED', refresh);
-    adapter.on('PERSONA_CHANGED', refresh);
-    adapter.on('PERSONA_UPDATED', refresh);
-    adapter.on('PERSONA_CREATED', refresh);
-    adapter.on('PERSONA_RENAMED', refresh);
     const personaDeleted = async payload => {
       const deletedId = typeof payload === 'string'
         ? payload
@@ -1882,7 +1958,31 @@
       await refresh();
       if (deletedId) await save({ syncGallery: false });
     };
-    adapter.on('PERSONA_DELETED', personaDeleted);
+    const onHostReady = async () => {
+      if (disposed) return;
+      const localSettings = readLocalSettings();
+      if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
+      if (state.enabled !== false) await adapter.installEntry();
+      adapter.setNativePresentation?.(state.enabled !== false);
+      installSettingsEntry();
+      updateSettingsUi();
+      await syncNativeDrawer();
+      await refresh();
+    };
+    const bindHostEvents = () => {
+      adapter.on('CHAT_CHANGED', refresh);
+      adapter.on('CHARACTER_CHANGED', refresh);
+      adapter.on('PERSONA_CHANGED', refresh);
+      adapter.on('PERSONA_UPDATED', refresh);
+      adapter.on('PERSONA_CREATED', refresh);
+      adapter.on('PERSONA_RENAMED', refresh);
+      adapter.on('PERSONA_DELETED', personaDeleted);
+      adapter.on('APP_INITIALIZED', onHostReady);
+      adapter.on('EXTENSION_SETTINGS_LOADED', onHostReady);
+      adapter.on('SETTINGS_LOADED', onHostReady);
+      adapter.on('APP_READY', onHostReady);
+    };
+    bindHostEvents();
     if (!resumeListenersCleanup && typeof globalThis.addEventListener === 'function') {
       const onResume = () => {
         if (globalThis.document?.visibilityState === 'hidden') return;
@@ -1897,19 +1997,6 @@
         globalThis.document?.removeEventListener?.('visibilitychange', onResume);
       };
     }
-    const onHostReady = async () => {
-      if (disposed) return;
-      const localSettings = readLocalSettings();
-      if (typeof localSettings.enabled === 'boolean') state.enabled = localSettings.enabled;
-      if (state.enabled !== false) await adapter.installEntry();
-      adapter.setNativePresentation?.(state.enabled !== false);
-      installSettingsEntry();
-      updateSettingsUi();
-      await syncNativeDrawer();
-      await refresh();
-    };
-    adapter.on('APP_READY', onHostReady);
-    adapter.on('SETTINGS_LOADED', onHostReady);
     if (state.enabled !== false) await adapter.installEntry();
     adapter.setNativePresentation?.(state.enabled !== false);
     installSettingsEntry();
@@ -1933,12 +2020,19 @@
           }
         }, 30);
       };
+      const scheduleAvatarListRefresh = () => {
+        if (disposed || avatarListTimer) return;
+        avatarListTimer = setTimeout(() => {
+          avatarListTimer = null;
+          if (!disposed) void refresh();
+        }, 80);
+      };
       const hasPersonaNode = node => {
         if (!node || node.nodeType !== 1) return false;
         const element = /** @type {Element} */ (node);
         return Boolean(
-          element.matches?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu, #extensions_settings, #extensions_settings2')
-          || element.querySelector?.('#PersonaManagement, #persona-management-button, #persona-management-block, #extensionsMenu, #extensions_settings, #extensions_settings2'),
+          element.matches?.('#PersonaManagement, #persona-management-button, #persona-management-block, #user_avatar_block, #extensionsMenu, #extensions_settings, #extensions_settings2')
+          || element.querySelector?.('#PersonaManagement, #persona-management-button, #persona-management-block, #user_avatar_block, #extensionsMenu, #extensions_settings, #extensions_settings2'),
         );
       };
       const attachPanelObserver = () => {
@@ -1947,15 +2041,22 @@
           document.querySelector('#persona-management-button'),
           document.querySelector('#persona-management-button .drawer-icon'),
         ].filter(Boolean);
-        if (!targets.length) return;
-        // The drawer open/close state lives on these small native containers.
-        // Watching them directly avoids observing class/style churn across the
-        // entire chat DOM (which used to run installEntry every few frames).
-        panelObserver ||= new MutationObserver(() => scheduleSync());
-        for (const target of targets) {
-          if (panelObserverTargets.has(target)) continue;
-          panelObserver.observe(target, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
-          panelObserverTargets.add(target);
+        if (targets.length) {
+          // The drawer open/close state lives on these small native containers.
+          // Watching them directly avoids observing class/style churn across the
+          // entire chat DOM (which used to run installEntry every few frames).
+          panelObserver ||= new MutationObserver(() => scheduleSync());
+          for (const target of targets) {
+            if (panelObserverTargets.has(target)) continue;
+            panelObserver.observe(target, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+            panelObserverTargets.add(target);
+          }
+        }
+        const avatarList = document.querySelector('#user_avatar_block');
+        if (avatarList && !panelObserverTargets.has(avatarList)) {
+          avatarListObserver ||= new MutationObserver(() => scheduleAvatarListRefresh());
+          avatarListObserver.observe(avatarList, { childList: true });
+          panelObserverTargets.add(avatarList);
         }
         const toggleButton = document.querySelector('#persona-management-button');
         if (toggleButton && !panelObserverTargets.has(toggleButton.querySelector?.('.drawer-toggle') || toggleButton)) {
@@ -1963,8 +2064,13 @@
           panelObserverTargets.add(clickTarget);
           clickTarget.addEventListener('click', () => {
             scheduleSync();
-            setTimeout(scheduleSync, 180);
-          });
+            // SillyTavern's doNavbarIconClick awaits a 200ms drawer close animation
+            // before opening #PersonaManagement when switching from another drawer.
+            // Schedule staggered follow-up checks across that window on mobile/TT.
+            for (const delayMs of [120, 260, 450]) {
+              setTimeout(scheduleSync, delayMs);
+            }
+          }, { passive: true });
         }
       };
       // Keep the document observer to detect a lazy-mounted native drawer, but
@@ -1977,6 +2083,36 @@
       observer.observe(document.body, { childList: true, subtree: true });
       attachPanelObserver();
     }
+    // Mount and render immediately on frame 1 using synchronous host state so
+    // TauriTavern users never see an unmounted or blank persona panel while
+    // IndexedDB, optional server sync, or /api/settings/get are still pending.
+    await syncNativeDrawer();
+    await refresh();
+
+    for (const delayMs of [350, 1200, 2800]) {
+      const timer = setTimeout(async () => {
+        if (disposed) return;
+        try {
+          bindHostEvents();
+          installSettingsEntry();
+          await syncNativeDrawer();
+          if ((app?.state?.personas?.length || 0) === 0 && (adapter?.readNativePersonas?.()?.length || 0) > 0) {
+            await refresh();
+          }
+        } catch (_) { /* ignore background boot check errors */ }
+      }, delayMs);
+      bootTimers.push(timer);
+    }
+
+    stateHydratedPromise = loadState();
+    try {
+      await stateHydratedPromise;
+    } finally {
+      stateHydratedPromise = null;
+    }
+    if (disposed) return;
+    pendingGalleryNotice = state.gallery.some(item => /^image\//i.test(String(item?.mime || '')) && !item.remoteUrl);
+    updateSettingsUi();
     await syncNativeDrawer();
     await refresh();
   }

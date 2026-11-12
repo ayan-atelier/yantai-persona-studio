@@ -1,4 +1,13 @@
 # Changelog
+## 1.1.1
+
+- **TauriTavern (TT) 偶发刷不出来与抽屉渲染竞态专项根治**：
+  - **首帧瞬时挂载 + 异步水合解耦**：启动阶段不再串行阻塞等待 IndexedDB、同步服务探测与 `/api/settings/get`，改为第 1 帧直接读取酒馆宿主内存设置瞬时挂载人设馆工作区并接管抽屉，图库与远端同步在后台完成后无感刷新（保留用户实时切换的页签状态）。
+  - **全链路硬超时防挂死（兼容无视 `AbortSignal` 的 Tauri IPC 桥接）**：为 `indexedDB.open` 补齐 `onblocked`/`onversionchange` 自动释放与 2.5s 超时回退内存缓存，并为 `sync-client` 与 `/api/settings/get` 请求统一加上 `AbortController` + `Promise.race` 硬超时保护，杜绝移动端下拉刷新、切后台或大体积设置跨 Rust IPC 读取时永久卡死插件启动。
+  - **顶层静态模块预加载 + 原生人设列表 DOM 监听**：将入口改为顶层静态 `import` 并行加载，消除串行动态 `import()` 错过酒馆 `SETTINGS_LOADED` / `APP_READY` 事件的窗口期；新增 `#user_avatar_block` 子节点观察器与启动后 `350 / 1200 / 2800ms` 兜底巡检，TT 异步加载完头像列表后立即自动补刷。
+  - **修复切卡瞬间丢帧与 200ms 抽屉动画竞态**：修复 `refresh()` 在后台异步加载角色卡/存档导致 `activeTarget` 变化时静默 `return` 丢弃渲染的问题（改为自动重试补刷）；点击顶栏人设按钮后的同步检查扩展至 `120 / 260 / 450ms`，完整覆盖酒馆原生切换抽屉的 `200ms` 关闭动画延迟。
+  - **安卓内置 WebView 样式与特殊头像文件名兼容**：外层 `#PersonaManagement` 同步写入 `.ytps-drawer-takeover` 类名与纯变量背景色回退（不强依赖动态 `:has()` 与 `color-mix()`），并统一对带 `#`、`?`、`%`、空格的人设头像文件名做 `encodeURIComponent` 编码防裂图。
+
 ## 1.1.0
 
 - **Milo 人设助手流式重构与独立纯净请求**：

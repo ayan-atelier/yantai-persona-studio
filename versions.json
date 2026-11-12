@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.0",
+  "latest": "1.1.1",
   "releases": [
+    {
+      "version": "1.1.1",
+      "branch": "v1.1.1",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆 TauriTavern (TT) 启动与抽屉渲染稳定性专项修复版。改为顶层静态 ES Module 并行加载与第 1 帧瞬时挂载工作区，彻底消除在 TT WebView 下因 IndexedDB 阻塞、同步探测挂起或大体积 /api/settings/get IPC 慢响应导致的人设馆偶发刷不出来；为所有底层请求补齐 Promise.race 硬超时兜底；修复进卡/切存档瞬间 refresh() 丢弃渲染导致的空白面板、补齐 200ms 抽屉切换动画后的阶梯补刷与 #user_avatar_block 异步加载监听，并兼容旧安卓系统 WebView 样式回退与特殊字符头像文件名编码。包含 v1.1.0 的全部流式生成、一键导入与多端自动合并特性。"
+    },
     {
       "version": "1.1.0",
       "branch": "v1.1.0",

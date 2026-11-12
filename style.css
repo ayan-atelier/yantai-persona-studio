@@ -20,6 +20,7 @@
   --ytps-radius: var(--yt-radius);
   position: relative;
   color: var(--ytps-text);
+  background: var(--ytps-bg);
   background: color-mix(in srgb, var(--ytps-bg) 92%, transparent);
   border: 1px solid var(--ytps-line);
   border-radius: var(--ytps-radius);
@@ -30,11 +31,14 @@
 }
 #yt-persona-native-workspace[hidden] { display: none !important; }
 #persona-management-block.ytps-takeover { display:block !important; grid-column:1 / -1 !important; grid-row:auto !important; flex:1 1 100% !important; width:100% !important; min-width:0 !important; }
+#PersonaManagement.ytps-drawer-takeover > .flex-container,
 #PersonaManagement:has(#persona-management-block.ytps-takeover) > .flex-container { display:block !important; width:100% !important; }
+#PersonaManagement.ytps-drawer-takeover #persona-management-block.ytps-takeover > #yt-persona-native-workspace,
 #PersonaManagement:has(#persona-management-block.ytps-takeover) #persona-management-block.ytps-takeover > #yt-persona-native-workspace { grid-column:1 / -1 !important; }
 #persona-management-block.ytps-takeover > .persona_management_left_column,
 #persona-management-block.ytps-takeover > .persona_management_right_column { display:none !important; }
 #persona-management-block.ytps-takeover > #yt-persona-native-workspace { display:block !important; width:100% !important; max-width:none !important; min-width:0 !important; margin:0; }
+#PersonaManagement.ytps-drawer-takeover :is(.user_stats_button, #personas_backup, #personas_restore),
 #PersonaManagement:has(#persona-management-block.ytps-takeover) :is(.user_stats_button, #personas_backup, #personas_restore) { display:none !important; }
 #persona-management-block.ytps-native-edit { display:block !important; width:100% !important; min-width:0 !important; }
 #persona-management-block.ytps-native-edit > .persona_management_left_column { display:none !important; }

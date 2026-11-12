@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   SyncBackupError,
   SyncConflictError,
+  SyncUnavailableError,
   createSyncClient,
   getOrCreateDeviceId,
   normalizeEnvelope,
@@ -94,4 +95,16 @@ test('backup failures use a typed error', async () => {
 test('invalid server state is rejected before it reaches the caller', () => {
   assert.throws(() => normalizeEnvelope({ state: [] }), /JSON 对象/);
   assert.throws(() => normalizeEnvelope({ schemaVersion: 9, state: {} }), error => error.code === 'UNSUPPORTED_SCHEMA');
+});
+
+test('getState times out cleanly as SyncUnavailableError even if Tauri IPC fetch ignores AbortSignal', async () => {
+  const client = createSyncClient({
+    deviceId: 'test-device-12345678',
+    fetcher: () => new Promise(() => {}),
+  });
+  await assert.rejects(() => client.getState({ timeoutMs: 25 }), error => {
+    assert.ok(error instanceof SyncUnavailableError);
+    assert.equal(error.code, 'SYNC_UNAVAILABLE');
+    return true;
+  });
 });

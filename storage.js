@@ -9,11 +9,33 @@ function canUseIndexedDB() {
   return typeof indexedDB !== 'undefined';
 }
 
-export function openResourceStore({ dbName = DB_NAME, storeName = STORE_NAME } = {}) {
+function withIdbTimeout(promise, fallbackValue, timeoutMs = 2500) {
+  let timer = null;
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => resolve({ __timedOut: true, value: fallbackValue }), timeoutMs);
+  });
+  return Promise.race([
+    Promise.resolve(promise).then(value => ({ __timedOut: false, value })),
+    timeout,
+  ]).then(result => {
+    if (result.__timedOut) dbPromise = null;
+    return result.value;
+  }).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+export function openResourceStore({ dbName = DB_NAME, storeName = STORE_NAME, timeoutMs = 2500 } = {}) {
   if (!canUseIndexedDB()) return Promise.resolve(null);
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(dbName, 1);
+  const rawOpen = new Promise((resolve, reject) => {
+    let request;
+    try {
+      request = indexedDB.open(dbName, 1);
+    } catch (err) {
+      reject(err);
+      return;
+    }
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(storeName)) {
@@ -22,8 +44,25 @@ export function openResourceStore({ dbName = DB_NAME, storeName = STORE_NAME } =
         store.createIndex('updatedAt', 'updatedAt', { unique: false });
       }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onblocked = () => {
+      dbPromise = null;
+      resolve(null);
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      if (db) {
+        db.onversionchange = () => {
+          try { db.close(); } catch (_) { /* ignore close error */ }
+          dbPromise = null;
+        };
+      }
+      resolve(db);
+    };
     request.onerror = () => { dbPromise = null; reject(request.error); };
+  });
+  dbPromise = withIdbTimeout(rawOpen, null, timeoutMs).catch(err => {
+    dbPromise = null;
+    throw err;
   });
   return dbPromise;
 }
@@ -37,43 +76,67 @@ export async function putAsset(asset, options = {}) {
   const item = ensureAsset(asset);
   const db = await openResourceStore(options).catch(() => null);
   if (!db) { memory.set(item.id, item); return item; }
-  return new Promise((resolve, reject) => {
-    const request = db.transaction(options.storeName ?? STORE_NAME, 'readwrite').objectStore(options.storeName ?? STORE_NAME).put(item);
-    request.onsuccess = () => resolve(item);
-    request.onerror = () => reject(request.error);
+  return withIdbTimeout(new Promise((resolve, reject) => {
+    try {
+      const request = db.transaction(options.storeName ?? STORE_NAME, 'readwrite').objectStore(options.storeName ?? STORE_NAME).put(item);
+      request.onsuccess = () => resolve(item);
+      request.onerror = () => reject(request.error);
+    } catch (err) {
+      reject(err);
+    }
+  }), null, 2500).then(saved => {
+    if (!saved) { memory.set(item.id, item); return item; }
+    return saved;
+  }).catch(() => {
+    memory.set(item.id, item);
+    return item;
   });
 }
 
 export async function getAsset(id, options = {}) {
   const db = await openResourceStore(options).catch(() => null);
   if (!db) return memory.get(id) ?? null;
-  return new Promise((resolve, reject) => {
-    const request = db.transaction(options.storeName ?? STORE_NAME, 'readonly').objectStore(options.storeName ?? STORE_NAME).get(id);
-    request.onsuccess = () => resolve(request.result ?? null);
-    request.onerror = () => reject(request.error);
-  });
+  return withIdbTimeout(new Promise((resolve, reject) => {
+    try {
+      const request = db.transaction(options.storeName ?? STORE_NAME, 'readonly').objectStore(options.storeName ?? STORE_NAME).get(id);
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error);
+    } catch (err) {
+      reject(err);
+    }
+  }), memory.get(id) ?? null, 2500).catch(() => memory.get(id) ?? null);
 }
 
 export async function deleteAsset(id, options = {}) {
+  memory.delete(id);
   const db = await openResourceStore(options).catch(() => null);
-  if (!db) return memory.delete(id);
-  return new Promise((resolve, reject) => {
-    const request = db.transaction(options.storeName ?? STORE_NAME, 'readwrite').objectStore(options.storeName ?? STORE_NAME).delete(id);
-    request.onsuccess = () => resolve(true);
-    request.onerror = () => reject(request.error);
-  });
+  if (!db) return true;
+  return withIdbTimeout(new Promise((resolve, reject) => {
+    try {
+      const request = db.transaction(options.storeName ?? STORE_NAME, 'readwrite').objectStore(options.storeName ?? STORE_NAME).delete(id);
+      request.onsuccess = () => resolve(true);
+      request.onerror = () => reject(request.error);
+    } catch (err) {
+      reject(err);
+    }
+  }), true, 2500).catch(() => true);
 }
 
 export async function listAssets({ kind, ...options } = {}) {
+  const memFallback = () => [...memory.values()].filter(item => !kind || item.kind === kind).sort((a, b) => b.updatedAt - a.updatedAt);
   const db = await openResourceStore(options).catch(() => null);
-  if (!db) return [...memory.values()].filter(item => !kind || item.kind === kind).sort((a, b) => b.updatedAt - a.updatedAt);
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(options.storeName ?? STORE_NAME, 'readonly');
-    const store = tx.objectStore(options.storeName ?? STORE_NAME);
-    const request = kind ? store.index('kind').getAll(kind) : store.getAll();
-    request.onsuccess = () => resolve((request.result ?? []).sort((a, b) => b.updatedAt - a.updatedAt));
-    request.onerror = () => reject(request.error);
-  });
+  if (!db) return memFallback();
+  return withIdbTimeout(new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(options.storeName ?? STORE_NAME, 'readonly');
+      const store = tx.objectStore(options.storeName ?? STORE_NAME);
+      const request = kind ? store.index('kind').getAll(kind) : store.getAll();
+      request.onsuccess = () => resolve((request.result ?? []).sort((a, b) => b.updatedAt - a.updatedAt));
+      request.onerror = () => reject(request.error);
+    } catch (err) {
+      reject(err);
+    }
+  }), memFallback(), 2500).catch(memFallback);
 }
 
 export class ResourceStore {

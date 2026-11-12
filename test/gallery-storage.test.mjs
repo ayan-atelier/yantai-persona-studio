@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createStorage } from '../storage.js';
+import { createStorage, openResourceStore, putAsset, listAssets } from '../storage.js';
 
 test('same-file re-import resets stale hosted metadata until upload succeeds', () => {
   const storage = createStorage();
@@ -19,4 +19,24 @@ test('same-file re-import resets stale hosted metadata until upload succeeds', (
   const hosted = storage.mergeGallery([local], [{ ...local, remoteUrl: '/user/images/new.png', url: '/user/images/new.png' }])[0];
   assert.equal(hosted.remoteUrl, '/user/images/new.png');
   assert.equal(hosted.remoteResetAt, 0);
+});
+
+test('openResourceStore and putAsset fall back to memory when WebView indexedDB.open hangs', async () => {
+  const prevIdb = globalThis.indexedDB;
+  try {
+    globalThis.indexedDB = {
+      open() {
+        // Simulate Android/iOS WebView hanging without firing onsuccess/onerror/onblocked
+        return {};
+      },
+    };
+    const db = await openResourceStore({ timeoutMs: 25 });
+    assert.equal(db, null);
+    const saved = await putAsset({ id: 'asset_tt_fallback', name: 'tt.png', updatedAt: 10 }, { timeoutMs: 25 });
+    assert.equal(saved.id, 'asset_tt_fallback');
+    const all = await listAssets({ timeoutMs: 25 });
+    assert.equal(all.some(item => item.id === 'asset_tt_fallback'), true);
+  } finally {
+    globalThis.indexedDB = prevIdb;
+  }
 });

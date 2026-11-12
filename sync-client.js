@@ -292,24 +292,46 @@ export function createSyncClient({
     };
   };
 
-  const request = async (url, { method = 'GET', body, baseRevision = null, requestId = '', signal, headers = {}, backup = false } = {}) => {
+  const request = async (url, { method = 'GET', body, baseRevision = null, requestId = '', signal, headers = {}, backup = false, timeoutMs = method === 'GET' ? 4500 : 12000 } = {}) => {
     const mergedHeaders = { ...makeHeaders(requestId), ...headers };
     if (baseRevision !== null && baseRevision !== undefined) {
       mergedHeaders['If-Match'] = String(baseRevision);
     }
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timedOut = false;
+    let timer = null;
+    const onExternalAbort = () => { try { controller?.abort(); } catch (_) {} };
+    if (signal && controller) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener?.('abort', onExternalAbort, { once: true });
+    }
+    const timeoutGuard = timeoutMs > 0
+      ? new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          try { controller?.abort(); } catch (_) {}
+          reject(new Error('SYNC_TIMEOUT'));
+        }, timeoutMs);
+      })
+      : null;
     let response;
     try {
-      response = await fetcher(url, {
+      const fetchPromise = Promise.resolve().then(() => fetcher(url, {
         method,
         headers: mergedHeaders,
         cache: 'no-store',
         credentials: 'same-origin',
-        signal,
+        signal: controller ? controller.signal : signal,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
+      }));
+      fetchPromise.catch(() => {});
+      response = timeoutGuard ? await Promise.race([fetchPromise, timeoutGuard]) : await fetchPromise;
     } catch (error) {
-      if (error?.name === 'AbortError') throw error;
-      throw new SyncUnavailableError('无法连接人设馆同步服务。', { cause: error });
+      if (error?.name === 'AbortError' && !timedOut) throw error;
+      throw new SyncUnavailableError(timedOut ? '连接人设馆同步服务超时。' : '无法连接人设馆同步服务。', { cause: error });
+    } finally {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onExternalAbort);
     }
     const status = responseStatus(response);
     const payload = await responsePayload(response);
@@ -329,8 +351,8 @@ export function createSyncClient({
     throw new SyncError(errorMessage(payload, `同步请求失败（${status || '未知状态'}）。`), { code: String(payload?.code || 'SYNC_REQUEST_FAILED'), status, details: payload, retryable: status >= 500 });
   };
 
-  const getState = async ({ signal } = {}) => {
-    const payload = await request(stateEndpoint, { signal });
+  const getState = async ({ signal, timeoutMs } = {}) => {
+    const payload = await request(stateEndpoint, { signal, ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
     const envelope = normalizeEnvelope(payload);
     revision = envelope.revision;
     return { ...envelope, deviceId: resolvedDeviceId };

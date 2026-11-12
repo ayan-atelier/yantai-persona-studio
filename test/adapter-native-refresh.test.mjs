@@ -5,6 +5,10 @@ import {
   updateNativePersona,
   isElementVisible,
   isNativePersonaPanelOpen,
+  setNativeTakeover,
+  setNativeEditMode,
+  listNativePersonas,
+  syncNativePersonasFromServer,
   isPlaceholderPersonaName,
   isPlaceholderPersonaBody,
   isPlaceholderPersonaRecord,
@@ -320,5 +324,62 @@ test('mergeNativePersonasFromPayload syncs cross-device edits & tombstoned delet
   assert.equal('persona-deleted-on-phone.png' in context.powerUserSettings.personas, false);
   // Brand-new local persona without tombstone is NEVER deleted
   assert.equal(context.powerUserSettings.personas['persona-local-unsaved.png'], '电脑刚新建尚未落盘的人设');
+});
+
+test('TauriTavern takeover syncs .ytps-drawer-takeover, encodes special avatar filenames, and bounds stalled /api/settings/get fetches', async () => {
+  const prevDoc = globalThis.document;
+  const prevFetch = globalThis.fetch;
+  try {
+    const makeClassList = () => {
+      const set = new Set();
+      return {
+        toggle(name, force) {
+          const active = force === undefined ? !set.has(name) : Boolean(force);
+          if (active) set.add(name); else set.delete(name);
+          return active;
+        },
+        contains(name) { return set.has(name); },
+      };
+    };
+    const drawer = { classList: makeClassList() };
+    const block = {
+      classList: makeClassList(),
+      closest: selector => (selector === '#PersonaManagement' ? drawer : null),
+    };
+    globalThis.document = {
+      querySelectorAll: selector => (selector === '#persona-management-block' ? [block] : []),
+      querySelector: () => null,
+    };
+
+    assert.equal(setNativeTakeover(true), true);
+    assert.equal(block.classList.contains('ytps-takeover'), true);
+    assert.equal(drawer.classList.contains('ytps-drawer-takeover'), true);
+
+    assert.equal(setNativeEditMode(true), true);
+    assert.equal(block.classList.contains('ytps-takeover'), false);
+    assert.equal(block.classList.contains('ytps-native-edit'), true);
+    assert.equal(drawer.classList.contains('ytps-drawer-takeover'), false);
+
+    const personas = listNativePersonas(
+      {
+        powerUserSettings: {
+          user_avatar: '清砚 #1?.png',
+          personas: { '清砚 #1?.png': '清砚' },
+          persona_descriptions: {},
+        },
+      },
+      { getUserAvatar: id => `User Avatars/${id}` },
+    );
+    assert.equal(personas.length, 1);
+    assert.equal(personas[0].avatarRef, '/User Avatars/' + encodeURIComponent('清砚 #1?.png'));
+
+    globalThis.fetch = () => new Promise(() => {});
+    const timedOut = await syncNativePersonasFromServer({ timeoutMs: 25 });
+    assert.equal(timedOut.ok, false);
+    assert.equal(timedOut.changed, false);
+  } finally {
+    globalThis.document = prevDoc;
+    globalThis.fetch = prevFetch;
+  }
 });
 
