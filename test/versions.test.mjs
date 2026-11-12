@@ -1,6 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { PERSONA_VERSION, createVersionManager, releaseCatalog } from '../versions.js';
+
+test('shipped versions.json matches manifest.json, PERSONA_VERSION, and passes legacy v1.0.x~v1.1.1 strict branch validation', () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
+  const rawCatalog = JSON.parse(fs.readFileSync(new URL('../versions.json', import.meta.url), 'utf8'));
+  assert.equal(manifest.version, PERSONA_VERSION);
+  assert.equal(rawCatalog.latest, PERSONA_VERSION);
+
+  const parsed = releaseCatalog(rawCatalog);
+  assert.equal(parsed.latest, PERSONA_VERSION);
+
+  // Legacy v1.0.8~v1.1.1 clients strictly required `release.branch === "v" + release.version`
+  // and `releases.length <= 100`, throwing "版本清单不完整或包含重复版本" otherwise.
+  assert.ok(rawCatalog.releases.length <= 100);
+  for (const entry of rawCatalog.releases) {
+    assert.equal(entry.branch, `v${entry.version}`, `legacy branch field mismatch on ${entry.version}`);
+  }
+});
 
 test('releaseCatalog accepts main-branch releases alongside legacy version records', () => {
   const parsed = releaseCatalog({

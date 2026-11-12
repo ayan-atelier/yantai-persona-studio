@@ -1,4 +1,16 @@
 # Changelog
+## 1.1.3
+
+- **紧急修复修改人设保存后被回滚恢复为旧内容的防抖竞态（含原生面板编辑与关闭接管状态）**：
+  - **根因消除**：酒馆原生的 `saveSettingsDebounced()` 有 `1000ms` 延迟写盘窗口；此前在修改人设后立即保存扩展快照或触发 `PERSONA_UPDATED` / `pointerdown` 时，以 `preferServer: true` 读取尚未落盘的旧 `/api/settings/get`，会把内存里刚改好的人设描述和姓名冲回旧内容。
+  - **四重防回滚加固**：
+    1. `persistHostSharedState` 与 `saveExtensionSettings` 保存前合并改为 `preferServer: false`（仅补齐跨端新增与自愈占位符，绝不用磁盘旧记录覆盖当前内存修改）；
+    2. 新增 15 秒本地人设编辑脏保护窗口（`markPersonaModifiedLocally` + 原生 `#persona-management-block` 输入监听 + `PERSONA_UPDATED` 事件跟踪），并在 `updateNativePersona` 中优先调用酒馆非防抖 `saveSettings()` 立即落盘；
+    3. 移除全局 `pointerdown` 触发唤醒同步，将 `refresh()` 内的快照持久化改为 `2.2s` 延迟防抖（排在酒馆 `1s` 保存之后）；
+    4. 当关闭「启用人设馆接管」（`enabled === false`）时，插件保持 100% 静默旁观，不再响应人设事件或读写任何酒馆设置。
+- **修复旧版（`v1.0.8`~`v1.1.1`）客户端点击插件内「检查更新」提示 `版本清单不完整或包含重复版本`**：
+  - `versions.json` 条目向前兼容旧版 `vX.Y.Z` 字段格式校验，新版（`v1.1.2+`）继续统一拉取 `origin/main` 主线。
+
 ## 1.1.2
 
 - **统一单 `main` 主线与开启酒馆原生自动更新（`auto_update: true`）**：

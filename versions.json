@@ -1,11 +1,18 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.2",
+  "latest": "1.1.3",
   "releases": [
     {
+      "version": "1.1.3",
+      "branch": "v1.1.3",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆紧急修复补丁版。彻底根治酒馆 1 秒延迟保存（saveSettingsDebounced）与多端同步读取撞车导致的「修改人设保存后自动变回旧内容」（含关闭人设馆在原生面板编辑被回滚）问题；新增本地编辑脏保护窗口、立即落盘保存与关闭状态零干预隔离；同时兼容旧版客户端对 versions.json 的校验格式，消除检查更新报错。"
+    },
+    {
       "version": "1.1.2",
-      "branch": "main",
+      "branch": "v1.1.2",
       "settings_schema": 3,
       "minimum_client_version": "1.16.0",
       "notes": "砚台 · 人设馆统一单 main 主线与自动更新版。开启酒馆原生 auto_update 支持并彻底移除冻结历史分支机制，所有更新统一走 main 主线（曾经停留在旧 v1.0.x 分支的用户点击更新会自动切回 main 主线）；同时完整包含 v1.1.1 的 TauriTavern (TT) 秒开防卡死修复与 v1.1.0 的 Milo 流式纯净生成、一键导入酒馆、多端静默自动合并。"

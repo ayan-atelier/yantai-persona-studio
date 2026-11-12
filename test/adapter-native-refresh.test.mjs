@@ -14,6 +14,10 @@ import {
   isPlaceholderPersonaRecord,
   mergeNativePersonasFromPayload,
   markPersonaDeletedLocally,
+  markPersonaModifiedLocally,
+  isPersonaModifiedLocally,
+  hasRecentLocalPersonaMutation,
+  clearLocalPersonaModificationsForTest,
   syncActivePersonaUserName,
 } from '../adapter.js';
 
@@ -379,6 +383,110 @@ test('TauriTavern takeover syncs .ytps-drawer-takeover, encodes special avatar f
     assert.equal(timedOut.changed, false);
   } finally {
     globalThis.document = prevDoc;
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test('local persona edits are never reverted by un-flushed stale /api/settings/get reads during SillyTavern 1s debounce window', async () => {
+  const prevFetch = globalThis.fetch;
+  clearLocalPersonaModificationsForTest();
+  try {
+    // Server still holds the OLD persona because saveSettingsDebounced() delays 1000ms before writing disk.
+    const staleServerSettings = {
+      user_avatar: 'persona-user.png',
+      power_user: {
+        personas: {
+          'persona-user.png': '修改前的旧名字',
+          'persona-other.png': '旁观人设（远端新版）',
+        },
+        persona_descriptions: {
+          'persona-user.png': { description: '修改前的旧人设内容', title: '旧备注', depth: 4 },
+          'persona-other.png': { description: '另一台设备已落盘的新描述', title: '' },
+        },
+      },
+    };
+    globalThis.fetch = async url => {
+      if (String(url).includes('/api/settings/get')) {
+        return {
+          ok: true,
+          json: async () => ({ settings: JSON.stringify(staleServerSettings) }),
+        };
+      }
+      throw new Error(`unexpected url: ${url}`);
+    };
+
+    const context = {
+      powerUserSettings: {
+        user_avatar: 'persona-user.png',
+        persona_description: '修改前的旧人设内容',
+        personas: {
+          'persona-user.png': '修改前的旧名字',
+          'persona-other.png': '旁观人设（本地旧版）',
+        },
+        persona_descriptions: {
+          'persona-user.png': { description: '修改前的旧人设内容', title: '旧备注', depth: 4 },
+          'persona-other.png': { description: '本地缓存旧描述', title: '' },
+        },
+      },
+      saveSettingsDebounced() {
+        // Simulates SillyTavern's 1000ms debounced save: does NOT update staleServerSettings yet!
+      },
+      eventSource: { emit() {} },
+    };
+    const api = {
+      user_avatar: 'persona-user.png',
+      setPersonaDescription() {},
+      getUserAvatars() {},
+    };
+
+    const updated = await updateNativePersona(
+      'persona-user.png',
+      { name: '修改后的新名字', description: '修改后的全新人设设定正文', title: '新备注' },
+      context,
+      api,
+    );
+    assert.equal(updated, true);
+    assert.equal(isPersonaModifiedLocally('persona-user.png'), true);
+    assert.equal(hasRecentLocalPersonaMutation(), true);
+
+    // Immediately afterwards (5ms later), even if a sync runs with preferServer: true against stale disk settings:
+    const syncResult = await syncNativePersonasFromServer({ context, api, preferServer: true });
+    assert.equal(syncResult.ok, true);
+    // Locally edited persona MUST NOT be reverted to stale server values!
+    assert.equal(context.powerUserSettings.personas['persona-user.png'], '修改后的新名字');
+    assert.equal(context.powerUserSettings.persona_descriptions['persona-user.png'].description, '修改后的全新人设设定正文');
+    assert.equal(context.powerUserSettings.persona_descriptions['persona-user.png'].title, '新备注');
+    assert.equal(context.powerUserSettings.persona_description, '修改后的全新人设设定正文');
+    // Unedited persona can still receive genuine cross-device updates when preferServer: true
+    assert.equal(context.powerUserSettings.personas['persona-other.png'], '旁观人设（远端新版）');
+
+    // Also simulate editing directly in SillyTavern's native #persona_description textarea:
+    const now = Date.now();
+    markPersonaModifiedLocally('persona-native-edit.png', now);
+    context.powerUserSettings.personas['persona-native-edit.png'] = '原生面板刚改的名字';
+    context.powerUserSettings.persona_descriptions['persona-native-edit.png'] = { description: '原生面板刚敲入的新设定', title: '' };
+    mergeNativePersonasFromPayload({
+      power_user: {
+        personas: { 'persona-native-edit.png': '磁盘旧名字' },
+        persona_descriptions: { 'persona-native-edit.png': { description: '磁盘未落盘旧设定', title: '' } },
+      },
+    }, { context, preferServer: true });
+    assert.equal(context.powerUserSettings.personas['persona-native-edit.png'], '原生面板刚改的名字');
+    assert.equal(context.powerUserSettings.persona_descriptions['persona-native-edit.png'].description, '原生面板刚敲入的新设定');
+
+    // Once the 15s local edit guard expires, genuine cross-device edits from another device merge normally:
+    markPersonaModifiedLocally('persona-native-edit.png', now - 20000);
+    assert.equal(isPersonaModifiedLocally('persona-native-edit.png', now), false);
+    mergeNativePersonasFromPayload({
+      power_user: {
+        personas: { 'persona-native-edit.png': '手机端20秒后改的新名字' },
+        persona_descriptions: { 'persona-native-edit.png': { description: '手机端20秒后改的新设定', title: '' } },
+      },
+    }, { context, preferServer: true });
+    assert.equal(context.powerUserSettings.personas['persona-native-edit.png'], '手机端20秒后改的新名字');
+    assert.equal(context.powerUserSettings.persona_descriptions['persona-native-edit.png'].description, '手机端20秒后改的新设定');
+  } finally {
+    clearLocalPersonaModificationsForTest();
     globalThis.fetch = prevFetch;
   }
 });

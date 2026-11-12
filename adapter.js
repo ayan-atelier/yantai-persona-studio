@@ -93,7 +93,7 @@ export function resolveBinding(bindings = {}, context = getStContext()) {
 
 export function getExtensionSettings(context = getStContext(), extensionId = EXTENSION_ID) { return context?.extensionSettings?.[extensionId] ?? {}; }
 export async function saveExtensionSettings(patch = {}, context = getStContext(), extensionId = EXTENSION_ID) {
-  await syncNativePersonasFromServer({ context, preferServer: true });
+  await syncNativePersonasFromServer({ context, preferServer: false });
   const settings = context.extensionSettings ?? (context.extensionSettings = {});
   settings[extensionId] = { ...(settings[extensionId] ?? {}), ...patch };
   const saver = context.saveSettingsDebounced ?? context.saveSettings;
@@ -119,10 +119,40 @@ function descriptionRecord(value) {
   if (!value || typeof value !== 'object') return { description: '', title: '' };
   return { ...value, description: String(value.description ?? value.content ?? value.text ?? ''), title: String(value.title ?? ''), position: value.position, depth: value.depth, role: value.role };
 }
+const LOCAL_PERSONA_EDIT_GUARD_MS = 15000;
 const locallyDeletedPersonas = new Set();
+const locallyModifiedPersonas = new Map();
+let lastLocalPersonaMutationAt = 0;
 export function markPersonaDeletedLocally(id) {
   const key = String(id || '').trim();
-  if (key) locallyDeletedPersonas.add(key);
+  if (key) {
+    locallyDeletedPersonas.add(key);
+    locallyModifiedPersonas.delete(key);
+  }
+}
+export function markPersonaModifiedLocally(id, at = Date.now()) {
+  const stamp = Number(at || Date.now()) || Date.now();
+  lastLocalPersonaMutationAt = Math.max(lastLocalPersonaMutationAt, stamp);
+  const key = String(id || '').trim();
+  if (key) locallyModifiedPersonas.set(key, stamp);
+}
+export function isPersonaModifiedLocally(id, now = Date.now(), windowMs = LOCAL_PERSONA_EDIT_GUARD_MS) {
+  const key = String(id || '').trim();
+  if (!key) return false;
+  const stamp = Number(locallyModifiedPersonas.get(key) || 0);
+  if (!stamp) return false;
+  if (now - stamp > windowMs) {
+    locallyModifiedPersonas.delete(key);
+    return false;
+  }
+  return true;
+}
+export function hasRecentLocalPersonaMutation(now = Date.now(), windowMs = LOCAL_PERSONA_EDIT_GUARD_MS) {
+  return lastLocalPersonaMutationAt > 0 && (now - lastLocalPersonaMutationAt) <= windowMs;
+}
+export function clearLocalPersonaModificationsForTest() {
+  locallyModifiedPersonas.clear();
+  lastLocalPersonaMutationAt = 0;
 }
 export function isPlaceholderPersonaName(name) {
   const cleanName = String(name ?? '').trim();
@@ -169,12 +199,15 @@ export function mergeNativePersonasFromPayload(rawSettings, { context = getStCon
     }
   }
   const skipId = String(excludeId || '').trim();
+  const now = Date.now();
   const added = [];
   const updated = [];
   const removed = [];
   for (const [avatarId, remoteNameRaw] of Object.entries(remotePersonas)) {
     const id = String(avatarId || '').trim();
     if (!id || id === skipId || locallyDeletedPersonas.has(id) || tombstoneSet.has(id)) continue;
+    const locallyModified = isPersonaModifiedLocally(id, now);
+    const allowPreferServer = Boolean(preferServer && !locallyModified);
     const remoteName = String(remoteNameRaw ?? id);
     const remoteDescRaw = remoteDescriptions[id];
     const remoteDesc = remoteDescRaw && typeof remoteDescRaw === 'object'
@@ -200,14 +233,14 @@ export function mergeNativePersonasFromPayload(rawSettings, { context = getStCon
     if (localNamePlaceholder && !remoteNamePlaceholder) {
       settings.personas[id] = remoteName;
       itemUpdated = true;
-    } else if (preferServer && !remoteNamePlaceholder && localName !== remoteName) {
+    } else if (allowPreferServer && !remoteNamePlaceholder && localName !== remoteName) {
       settings.personas[id] = remoteName;
       itemUpdated = true;
     }
     if (localBodyPlaceholder && !remoteBodyPlaceholder) {
       settings.persona_descriptions[id] = { ...localDesc, ...remoteDesc };
       itemUpdated = true;
-    } else if (preferServer && !remoteBodyPlaceholder) {
+    } else if (allowPreferServer && !remoteBodyPlaceholder) {
       const localNorm = descriptionRecord(localDesc);
       const remoteNorm = descriptionRecord(remoteDesc);
       const changedBody = String(localNorm.description || '') !== String(remoteNorm.description || '')
@@ -225,7 +258,7 @@ export function mergeNativePersonasFromPayload(rawSettings, { context = getStCon
   }
   const currentId = String(currentNativeId(context, api) || rawSettings?.user_avatar || '');
   for (const localId of Object.keys(settings.personas)) {
-    if (!localId || localId === skipId || localId === currentId) continue;
+    if (!localId || localId === skipId || localId === currentId || isPersonaModifiedLocally(localId, now)) continue;
     if (Object.prototype.hasOwnProperty.call(remotePersonas, localId)) continue;
     if (locallyDeletedPersonas.has(localId) || tombstoneSet.has(localId)) {
       delete settings.personas[localId];
@@ -526,6 +559,7 @@ export async function createNativePersona({ name, title = '', description = '', 
   let avatarId = `${Date.now()}-${slug}.png`;
   while (settings.personas?.[avatarId]) avatarId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}-${slug}.png`;
   locallyDeletedPersonas.delete(avatarId);
+  markPersonaModifiedLocally(avatarId);
   const descriptor = { description: String(description || ''), title: String(title || ''), position, depth, role, lorebook: String(lorebook || '') };
 
   const response = await fetch('/img/user-default.png', { cache: 'no-cache' });
@@ -544,6 +578,7 @@ export async function createNativePersona({ name, title = '', description = '', 
     const saver = context.saveSettingsDebounced ?? context.saveSettings;
     if (typeof saver === 'function') await Promise.resolve(saver.call(context));
   }
+  markPersonaModifiedLocally(avatarId);
   await native?.getUserAvatars?.(false, avatarId);
   await emitNativeEvent(context, 'PERSONA_CREATED', { avatarId, name: personaName, description: descriptor.description, title: descriptor.title });
   return { id: avatarId, avatarId, name: personaName };
@@ -729,9 +764,15 @@ export async function setNativeDefaultPersona(id, context = getStContext(), api 
  */
 export async function updateNativePersona(id, patch = {}, context = getStContext(), api = null) {
   const avatarId = String(id || '');
+  if (!avatarId) return false;
+  const wasModified = isPersonaModifiedLocally(avatarId);
+  markPersonaModifiedLocally(avatarId);
   await syncNativePersonasFromServer({ context, api, preferServer: true, excludeId: avatarId });
   const settings = powerSettings(context);
-  if (!avatarId || !settings.personas || !(avatarId in settings.personas)) return false;
+  if (!settings.personas || !(avatarId in settings.personas)) {
+    if (!wasModified) locallyModifiedPersonas.delete(avatarId);
+    return false;
+  }
   const descriptor = settings.persona_descriptions?.[avatarId] || {
     description: '', position: 0, depth: 4, role: 0, lorebook: '', title: '',
   };
@@ -750,6 +791,7 @@ export async function updateNativePersona(id, patch = {}, context = getStContext
   if (!isPlaceholderPersonaRecord(settings.personas[avatarId], settings.persona_descriptions[avatarId])) {
     locallyDeletedPersonas.delete(avatarId);
   }
+  markPersonaModifiedLocally(avatarId);
   const native = api || await nativeApi();
   const current = currentNativeId(context, native);
   if (String(current || '') === avatarId) {
@@ -764,6 +806,10 @@ export async function updateNativePersona(id, patch = {}, context = getStContext
   }
   const saver = context.saveSettingsDebounced ?? context.saveSettings;
   if (typeof saver === 'function') await Promise.resolve(saver.call(context));
+  const scriptMod = cachedScriptModule || await scriptApi();
+  if (typeof scriptMod?.saveSettings === 'function') {
+    try { await Promise.resolve(scriptMod.saveSettings()); } catch (_) { /* debounced saver remains active */ }
+  }
   // SillyTavern keeps the persona editor textarea and the rendered avatar
   // list separate from the power-user records above.  A plain
   // getUserAvatars(false) only reads the list; it does not repaint either
@@ -840,6 +886,7 @@ export async function duplicateNativePersona(id, context = getStContext(), api =
   // option. Reproduce its public operation without changing the active persona.
   const newAvatarId = `${Date.now()}-${personaName.replace(/[^a-zA-Z0-9]/g, '')}.png`;
   locallyDeletedPersonas.delete(newAvatarId);
+  markPersonaModifiedLocally(newAvatarId);
   const descriptor = settings.persona_descriptions?.[avatarId] || {};
   const rawAvatarUrl = typeof native?.getUserAvatar === 'function' ? String(native.getUserAvatar(avatarId) || '') : '';
   const sourceUrl = /^(?:https?:|data:|blob:)/i.test(rawAvatarUrl)
@@ -875,6 +922,7 @@ export async function duplicateNativePersona(id, context = getStContext(), api =
     const saver = context.saveSettingsDebounced ?? context.saveSettings;
     if (typeof saver === 'function') await Promise.resolve(saver.call(context));
   }
+  markPersonaModifiedLocally(newAvatarId);
   await native?.getUserAvatars?.(false, newAvatarId);
   await emitNativeEvent(context, 'PERSONA_CREATED', { avatarId: newAvatarId, name: personaName, description: descriptor.description || '', title: descriptor.title || '', duplicatedFromAvatarId: avatarId });
   const toast = globalThis.toastr?.success;
@@ -1206,6 +1254,19 @@ export async function snapshot(context = getStContext(), { includeWorld = true }
 export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', report = () => {} } = {}) {
   const context = () => getStContext(); const listeners = new Map(); const hookedButtons = new Set(); const ownedQuickEntries = new Set(); let native = null;
   const loadNativeApi = async () => { if (!native) native = await nativeApi(); return native; };
+  const onNativeDomInput = event => {
+    const target = event?.target;
+    if (!target || typeof target.matches !== 'function') return;
+    if (
+      target.matches('#persona_description, #your_name, #persona_depth_value, #persona_depth_role, #persona_description_position')
+      || (typeof target.closest === 'function' && target.closest('#persona-management-block') && !target.closest('.ytps-root'))
+    ) {
+      const activeId = String(currentNativeId(context(), native) || '').trim();
+      markPersonaModifiedLocally(activeId);
+    }
+  };
+  globalThis.document?.addEventListener?.('input', onNativeDomInput, { passive: true, capture: true });
+  globalThis.document?.addEventListener?.('change', onNativeDomInput, { passive: true, capture: true });
   const on = (name, fn) => {
     const ctx = context(); const source = ctx.eventSource; const types = ctx.eventTypes || ctx.event_types || {}; const type = types[name] || name;
     if (!source?.on || typeof fn !== 'function') return;
@@ -1225,6 +1286,8 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     listeners.delete(key);
   };
   const dispose = () => {
+    globalThis.document?.removeEventListener?.('input', onNativeDomInput, { capture: true });
+    globalThis.document?.removeEventListener?.('change', onNativeDomInput, { capture: true });
     for (const [key, [source, type, fn]] of listeners) {
       if (source?.removeListener) source.removeListener(type, fn); else source?.off?.(type, fn);
       listeners.delete(key);
@@ -1266,6 +1329,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), native, explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async id => deleteNativePersona(id, context(), await loadNativeApi()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, markPersonaModifiedLocally, isPersonaModifiedLocally, hasRecentLocalPersonaMutation, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), native, explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

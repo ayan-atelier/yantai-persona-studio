@@ -74,6 +74,7 @@ import { createSyncClient } from './sync-client.js';
   let editMode = false;
   let lastNativeOpen = null;
   let syncTimer = null;
+  let snapshotSaveTimer = null;
   let controlModule = null;
   let versionManager = null;
   let gallerySync = null;
@@ -170,8 +171,11 @@ import { createSyncClient } from './sync-client.js';
       async setEnabled(value) {
         state.enabled = Boolean(value);
         writeLocalSettings({ enabled: state.enabled });
+        if (!state.enabled && snapshotSaveTimer) {
+          clearTimeout(snapshotSaveTimer);
+          snapshotSaveTimer = null;
+        }
         try { await adapter?.saveExtensionState?.({ enabled: state.enabled }); } catch (_) { /* local setting remains authoritative */ }
-        await refresh();
         if (!state.enabled) {
           lastNativeOpen = null;
           editMode = false;
@@ -180,6 +184,7 @@ import { createSyncClient } from './sync-client.js';
           adapter?.setNativeEditMode?.(false);
           adapter?.setNativePresentation?.(false);
         } else {
+          await refresh();
           adapter?.setNativePresentation?.(true);
           await adapter?.installEntry?.();
           // The native drawer may already be open when the user re-enables
@@ -267,6 +272,8 @@ import { createSyncClient } from './sync-client.js';
     resumeListenersCleanup = null;
     if (syncTimer) clearTimeout(syncTimer);
     syncTimer = null;
+    if (snapshotSaveTimer) clearTimeout(snapshotSaveTimer);
+    snapshotSaveTimer = null;
     versionManager?.dispose?.();
     versionManager = null;
     adapter?.dispose?.();
@@ -688,9 +695,13 @@ import { createSyncClient } from './sync-client.js';
     if (repairedTurns && pending) {
       queuePendingState(sharedState(state));
     }
-    await healPlaceholderPersonas({ force: true });
-    await adapter?.syncActivePersonaUserName?.();
-    const seededSnapshots = capturePersonaSnapshots(adapter.readNativePersonas?.() || [], { initialSeed: true });
+    if (state.enabled !== false) {
+      await healPlaceholderPersonas({ force: true });
+      await adapter?.syncActivePersonaUserName?.();
+    }
+    const seededSnapshots = state.enabled !== false
+      ? capturePersonaSnapshots(adapter.readNativePersonas?.() || [], { initialSeed: true })
+      : false;
     stateHydratedPromise = null;
     if ((seededSnapshots || repairedTurns || shouldFlushPending) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       void save({ syncGallery: shouldFlushPending });
@@ -1040,8 +1051,19 @@ import { createSyncClient } from './sync-client.js';
     }
     return ids;
   }
+  function scheduleSnapshotSave(delayMs = 2200) {
+    if (disposed || state?.enabled === false) return;
+    if (snapshotSaveTimer) clearTimeout(snapshotSaveTimer);
+    snapshotSaveTimer = setTimeout(() => {
+      snapshotSaveTimer = null;
+      if (disposed || state?.enabled === false) return;
+      if (syncStatus === 'ready' || syncStatus === 'host-ready') {
+        void save({ syncGallery: false });
+      }
+    }, delayMs);
+  }
   async function syncNativePersonasOnResume({ force = false, preferServer = true } = {}) {
-    if (disposed || !adapter) return false;
+    if (disposed || !adapter || state?.enabled === false || editMode) return false;
     const now = Date.now();
     if (!force && now - lastResumeSyncAt < 4000) return false;
     lastResumeSyncAt = now;
@@ -1078,7 +1100,20 @@ import { createSyncClient } from './sync-client.js';
             if (pendingLocal) void save({ syncGallery: false });
           }
         }
-        const synced = await adapter.syncNativePersonasFromServer?.({ preferServer, deletedIds: knownDeletedPersonaIds() });
+        const activeEl = globalThis.document?.activeElement;
+        const typingInEditor = Boolean(
+          activeEl?.matches?.('input, textarea, select, [contenteditable="true"]')
+          && (activeEl.matches('#persona_description, #your_name') || activeEl.closest?.('#persona-management-block')),
+        );
+        const effectivePreferServer = Boolean(
+          preferServer
+          && !typingInEditor
+          && !adapter.hasRecentLocalPersonaMutation?.(),
+        );
+        const synced = await adapter.syncNativePersonasFromServer?.({
+          preferServer: effectivePreferServer,
+          deletedIds: knownDeletedPersonaIds(),
+        });
         if (synced?.raw) {
           const ext = synced.raw?.extension_settings?.[NS] || synced.raw?.extensionSettings?.[NS];
           if (ext?.personaMeta && typeof ext.personaMeta === 'object') {
@@ -1092,8 +1127,8 @@ import { createSyncClient } from './sync-client.js';
         const healed = await healPlaceholderPersonas({ force });
         const nameSynced = await adapter.syncActivePersonaUserName?.();
         const snapshotChanged = capturePersonaSnapshots(adapter.readNativePersonas?.() || []);
-        if (snapshotChanged && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
-          void save({ syncGallery: false });
+        if (snapshotChanged) {
+          scheduleSnapshotSave();
         }
         if (synced?.changed || healed || nameSynced || remoteStateChanged) {
           await refresh();
@@ -1109,7 +1144,7 @@ import { createSyncClient } from './sync-client.js';
     return resumeSyncInFlight;
   }
   async function refresh(retryCount = 0) {
-    if (!app || disposed) return;
+    if (!app || disposed || state?.enabled === false) return;
     const sequence = ++refreshSequence;
     const target = activeTarget();
     const targetIdentity = targetKey(target);
@@ -1129,11 +1164,11 @@ import { createSyncClient } from './sync-client.js';
       if (healed) personas = adapter.readNativePersonas();
     }
     await adapter?.syncActivePersonaUserName?.();
-    if (capturePersonaSnapshots(personas) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
-      void save({ syncGallery: false });
+    if (capturePersonaSnapshots(personas)) {
+      scheduleSnapshotSave();
     }
     const contextSnapshot = await adapter.contextSnapshot({ includeWorld: false });
-    if (sequence !== refreshSequence || !app || disposed) return;
+    if (sequence !== refreshSequence || !app || disposed || state?.enabled === false) return;
     if (targetKey(activeTarget()) !== targetIdentity && retryCount < 2) {
       return refresh(retryCount + 1);
     }
@@ -1175,7 +1210,7 @@ import { createSyncClient } from './sync-client.js';
         const payload = await Promise.race([fetchPromise, timeoutGuard]);
         if (payload) {
           const raw = typeof payload?.settings === 'string' ? JSON.parse(payload.settings) : payload?.settings;
-          adapter?.mergeNativePersonasFromPayload?.(raw, { context, preferServer: true, deletedIds: knownDeletedPersonaIds() });
+          adapter?.mergeNativePersonasFromPayload?.(raw, { context, preferServer: false, deletedIds: knownDeletedPersonaIds() });
           const extensions = raw?.extension_settings || raw?.extensionSettings;
           if (extensions?.[NS] && typeof extensions[NS] === 'object') {
             currentNamespace = extensions[NS];
@@ -1357,6 +1392,10 @@ import { createSyncClient } from './sync-client.js';
   }
 
   async function saveImpl({ syncGallery = true, queuedShared = null } = {}) {
+    if (snapshotSaveTimer) {
+      clearTimeout(snapshotSaveTimer);
+      snapshotSaveTimer = null;
+    }
     if (stateHydratedPromise) {
       await stateHydratedPromise.catch(() => {});
     }
@@ -1955,8 +1994,22 @@ import { createSyncClient } from './sync-client.js';
       if (state.personaMeta && typeof state.personaMeta === 'object' && deletedId) {
         state.personaMeta[String(deletedId)] = { deletedAt: Date.now() };
       }
+      if (state?.enabled === false) return;
       await refresh();
       if (deletedId) await save({ syncGallery: false });
+    };
+    const onNativePersonaMutated = async payload => {
+      const mutatedId = typeof payload === 'string'
+        ? payload.trim()
+        : String(payload?.avatarId ?? payload?.personaId ?? payload?.id ?? '').trim();
+      const fallbackId = mutatedId || String(adapter?.readNativePersona?.()?.id || '').trim();
+      adapter?.markPersonaModifiedLocally?.(fallbackId);
+      if (state?.enabled === false) return;
+      await refresh();
+    };
+    const onHostContextChanged = async () => {
+      if (state?.enabled === false) return;
+      await refresh();
     };
     const onHostReady = async () => {
       if (disposed) return;
@@ -1970,12 +2023,12 @@ import { createSyncClient } from './sync-client.js';
       await refresh();
     };
     const bindHostEvents = () => {
-      adapter.on('CHAT_CHANGED', refresh);
-      adapter.on('CHARACTER_CHANGED', refresh);
-      adapter.on('PERSONA_CHANGED', refresh);
-      adapter.on('PERSONA_UPDATED', refresh);
-      adapter.on('PERSONA_CREATED', refresh);
-      adapter.on('PERSONA_RENAMED', refresh);
+      adapter.on('CHAT_CHANGED', onHostContextChanged);
+      adapter.on('CHARACTER_CHANGED', onHostContextChanged);
+      adapter.on('PERSONA_CHANGED', onHostContextChanged);
+      adapter.on('PERSONA_UPDATED', onNativePersonaMutated);
+      adapter.on('PERSONA_CREATED', onNativePersonaMutated);
+      adapter.on('PERSONA_RENAMED', onNativePersonaMutated);
       adapter.on('PERSONA_DELETED', personaDeleted);
       adapter.on('APP_INITIALIZED', onHostReady);
       adapter.on('EXTENSION_SETTINGS_LOADED', onHostReady);
@@ -1985,15 +2038,13 @@ import { createSyncClient } from './sync-client.js';
     bindHostEvents();
     if (!resumeListenersCleanup && typeof globalThis.addEventListener === 'function') {
       const onResume = () => {
-        if (globalThis.document?.visibilityState === 'hidden') return;
+        if (state?.enabled === false || editMode || globalThis.document?.visibilityState === 'hidden') return;
         void syncNativePersonasOnResume({ preferServer: true });
       };
       globalThis.addEventListener('focus', onResume, { passive: true });
-      globalThis.addEventListener('pointerdown', onResume, { passive: true, capture: true });
       globalThis.document?.addEventListener?.('visibilitychange', onResume, { passive: true });
       resumeListenersCleanup = () => {
         globalThis.removeEventListener('focus', onResume);
-        globalThis.removeEventListener('pointerdown', onResume, { capture: true });
         globalThis.document?.removeEventListener?.('visibilitychange', onResume);
       };
     }
@@ -2021,10 +2072,10 @@ import { createSyncClient } from './sync-client.js';
         }, 30);
       };
       const scheduleAvatarListRefresh = () => {
-        if (disposed || avatarListTimer) return;
+        if (disposed || avatarListTimer || state?.enabled === false) return;
         avatarListTimer = setTimeout(() => {
           avatarListTimer = null;
-          if (!disposed) void refresh();
+          if (!disposed && state?.enabled !== false) void refresh();
         }, 80);
       };
       const hasPersonaNode = node => {
@@ -2096,7 +2147,7 @@ import { createSyncClient } from './sync-client.js';
           bindHostEvents();
           installSettingsEntry();
           await syncNativeDrawer();
-          if ((app?.state?.personas?.length || 0) === 0 && (adapter?.readNativePersonas?.()?.length || 0) > 0) {
+          if (state?.enabled !== false && (app?.state?.personas?.length || 0) === 0 && (adapter?.readNativePersonas?.()?.length || 0) > 0) {
             await refresh();
           }
         } catch (_) { /* ignore background boot check errors */ }
