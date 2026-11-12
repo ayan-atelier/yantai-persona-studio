@@ -1,11 +1,9 @@
-/* Explicit, user-triggered release switching for the native persona extension. */
-export const PERSONA_VERSION = '1.1.1';
+/* Single-main-branch update & legacy-branch recovery manager for 砚台 · 人设馆. */
+export const PERSONA_VERSION = '1.1.2';
 export const PERSONA_ID = 'yantai-persona-studio';
 export const SETTINGS_SCHEMA = 3;
 export const DEFAULT_REPOSITORY = 'https://github.com/ayan-atelier/yantai-persona-studio';
 
-// Persona releases use the same frozen vX branches as the bookshelf, while
-// development builds carry a prerelease suffix (for example -dev18).
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 function parts(value) {
   const match = String(value).match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
@@ -38,13 +36,15 @@ export function repositoryURL(value) {
   return `https://github.com/${match[1]}/${repo}`;
 }
 export function releaseCatalog(value) {
-  if (!value || value.schema !== 1 || value.extension !== PERSONA_ID || !Array.isArray(value.releases) || value.releases.length > 100) throw new Error('这个仓库没有可识别的砚台人设馆版本清单。');
+  if (!value || value.schema !== 1 || value.extension !== PERSONA_ID || !Array.isArray(value.releases) || value.releases.length > 200) throw new Error('这个仓库没有可识别的砚台人设馆版本清单。');
   const seen = new Set();
   const releases = value.releases.map(release => {
-    if (!release || !VERSION_PATTERN.test(release.version) || seen.has(release.version) || release.branch !== `v${release.version}` || !Number.isSafeInteger(release.settings_schema) || !VERSION_PATTERN.test(release.minimum_client_version)) throw new Error('版本清单不完整或包含重复版本，请等待作者修复。');
+    const branch = release?.branch ? String(release.branch) : 'main';
+    const validBranch = branch === 'main' || branch === `v${release?.version}`;
+    if (!release || !VERSION_PATTERN.test(release.version) || seen.has(release.version) || !validBranch || !Number.isSafeInteger(release.settings_schema) || !VERSION_PATTERN.test(release.minimum_client_version)) throw new Error('版本清单不完整或包含重复版本，请等待作者修复。');
     if (release.commit !== undefined && release.commit !== '' && !/^[a-f0-9]{7,64}$/i.test(String(release.commit))) throw new Error('版本清单的提交校验值无效。');
     seen.add(release.version);
-    return { ...release, notes: String(release.notes || '').slice(0, 4000), commit: String(release.commit || '') };
+    return { ...release, branch, notes: String(release.notes || '').slice(0, 4000), commit: String(release.commit || '') };
   }).sort((a, b) => compareVersions(b.version, a.version));
   if (!releases.some(release => release.version === value.latest)) throw new Error('版本清单缺少最新版。');
   return { latest: value.latest, releases };
@@ -56,8 +56,9 @@ export function versionSnapshot(settings, version) {
 }
 
 /**
- * Update manager for an installed native SillyTavern extension. It never
- * polls or mutates files until the user explicitly clicks a version action.
+ * Single-main update manager for an installed native SillyTavern extension.
+ * Updates always track `origin/main` (migrating users off legacy `vX.Y.Z`
+ * frozen branches automatically when triggered).
  */
 export function createVersionManager({ settings, save, flush = save, context, moduleURL, apiRoot, beforeChange = async () => {}, fetcher = (...args) => fetch(...args), currentVersion = PERSONA_VERSION }) {
   let busy = false, disposed = false, reloadNeeded = false, clientVersion = '';
@@ -78,7 +79,7 @@ export function createVersionManager({ settings, save, flush = save, context, mo
       if (!response.ok) throw new Error(response.status === 403 ? '没有修改此扩展的权限，请由酒馆管理员操作。' : `请求失败（${response.status}），请检查网络和仓库发布状态。`);
       return await response.text();
     } catch (error) {
-      if (error.name === 'AbortError') throw new Error(mutating ? '版本切换尚未确认完成，请刷新后查看版本号，不要连续重试。' : '检查超时或已取消，请稍后重试。');
+      if (error.name === 'AbortError') throw new Error(mutating ? '更新尚未确认完成，请刷新后查看版本号，不要连续重试。' : '检查超时或已取消，请稍后重试。');
       throw error;
     } finally { clearTimeout(timer); readControllers.delete(controller); }
   };
@@ -98,52 +99,73 @@ export function createVersionManager({ settings, save, flush = save, context, mo
     if (!found) throw new Error('找不到当前人设馆的安装位置，请刷新酒馆后重试。');
     const install = { mode: 'native', extensionName, global: found.type === 'global' };
     const version = await native('version', install);
-    if (!version?.remoteUrl || !version.currentCommitHash) throw new Error('这份人设馆是解压安装的。在线更新需要先改用仓库网址安装，现有人设馆设置和图库会保留。');
+    if (!version?.remoteUrl || !version.currentCommitHash) throw new Error('这份人设馆是手动解压或软链接安装的；在线更新请通过酒馆“安装扩展”使用 GitHub 仓库网址安装。');
     return { ...install, ...version, repository: repositoryURL(version.remoteUrl) };
   };
-  const compatible = release => release.settings_schema === SETTINGS_SCHEMA && VERSION_PATTERN.test(clientVersion) && compareVersions(clientVersion, release.minimum_client_version) >= 0;
+  const compatible = release => release.settings_schema === SETTINGS_SCHEMA && (!clientVersion || !VERSION_PATTERN.test(clientVersion) || compareVersions(clientVersion, release.minimum_client_version) >= 0);
   return {
     get busy() { return busy; }, get reloadNeeded() { return reloadNeeded; }, get mode() { return 'native'; },
     get repository() { return state().repository || DEFAULT_REPOSITORY; },
     setRepository(value) { if (busy) throw new Error('请等待当前检查结束。'); const repo = repositoryURL(value); state().repository = repo; save(); return repo; },
     async check() {
       if (busy) throw new Error('正在处理版本，请稍候。');
-      if (reloadNeeded) throw new Error('版本已切换，请先刷新酒馆。');
+      if (reloadNeeded) throw new Error('更新已完成，请先刷新酒馆。');
       busy = true;
       try {
         const install = await resolveInstall();
-        const client = await json(new URL('version', apiRoot).href, { cache: 'no-store' });
-        clientVersion = String(client?.pkgVersion || '').match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0] || '';
-        if (!clientVersion) throw new Error('无法确认酒馆版本，暂不提供版本切换。');
+        try {
+          const client = await json(new URL('version', apiRoot).href, { cache: 'no-store' });
+          clientVersion = String(client?.pkgVersion || '').match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0] || '';
+        } catch (_) { clientVersion = ''; }
         const catalog = releaseCatalog(await remoteJSON(install.repository, 'versions.json'));
-        install.branches = await native('branches', install);
-        if (!Array.isArray(install.branches)) throw new Error('当前酒馆未返回可切换版本，请先更新酒馆。');
         checkAlive();
-        const available = catalog.releases.filter(release => compatible(release) && install.branches.some(branch => branch.name === `origin/${release.branch}`));
-        const latest = available.find(release => release.version === catalog.latest);
-        const previous = available.filter(release => compareVersions(release.version, currentVersion) < 0).at(0);
-        return { install, catalog, latest: latest && compareVersions(latest.version, currentVersion) > 0 ? latest : null, previous, unavailableLatest: compareVersions(catalog.latest, currentVersion) > 0 && !latest, checkedAt: Date.now() };
+        const latestEntry = catalog.releases.find(release => release.version === catalog.latest) || null;
+        const isCompatible = latestEntry ? compatible(latestEntry) : false;
+        const needsMainSwitch = Boolean(install.currentBranchName && install.currentBranchName !== 'main');
+        const newerVersion = Boolean(latestEntry && compareVersions(latestEntry.version, currentVersion) > 0);
+        const remoteAhead = install.currentBranchName === 'main' && install.isUpToDate === false;
+        const canUpdate = Boolean(latestEntry && isCompatible && (needsMainSwitch || newerVersion || remoteAhead));
+        return {
+          install,
+          catalog,
+          needsMainSwitch,
+          currentBranchName: install.currentBranchName || 'main',
+          latest: canUpdate ? { ...latestEntry, branch: 'main' } : null,
+          latestInfo: latestEntry,
+          unavailableLatest: Boolean(latestEntry && !isCompatible && newerVersion),
+          checkedAt: Date.now(),
+        };
       } finally { busy = false; }
     },
-    async apply(checked, target) {
+    async apply(checked, target = checked?.latest) {
       if (busy) throw new Error('正在处理版本，请稍候。');
-      if (reloadNeeded) throw new Error('版本已切换，请先刷新酒馆。');
+      if (reloadNeeded) throw new Error('更新已完成，请先刷新酒馆。');
       checkAlive();
-      if (!checked || Date.now() - checked.checkedAt > 10 * 60 * 1000 || ![checked.latest, checked.previous].includes(target) || !target || !compatible(target)) throw new Error('版本信息已过期或不兼容，请重新检查。');
+      if (!checked || Date.now() - checked.checkedAt > 10 * 60 * 1000 || !target || !compatible(target)) throw new Error('版本信息已过期或不兼容，请重新检查。');
       busy = true; let mutationStarted = false;
       try {
         const install = await resolveInstall();
-        if (install.repository !== checked.install.repository || install.mode !== checked.install.mode || install.currentCommitHash !== checked.install.currentCommitHash || install.currentBranchName !== checked.install.currentBranchName) throw new Error('安装来源或当前版本发生变化，请重新检查。');
+        if (install.repository !== checked.install.repository || install.mode !== checked.install.mode) throw new Error('安装来源发生变化，请重新检查。');
         await beforeChange();
         const value = settings(); value.versionBackup = versionSnapshot(value, currentVersion);
         await flush(); checkAlive();
         mutationStarted = true;
-        await native('switch', install, { branch: `origin/${target.branch}` }, true);
-        const [manifest, actual] = await Promise.all([json(new URL('manifest.json', moduleURL).href, { cache: 'no-store' }), native('version', install)]);
-        const expected = checked.install.branches.find(branch => branch.name === `origin/${target.branch}`);
-        if (manifest?.version !== target.version || actual?.currentBranchName !== target.branch || (target.commit && !actual?.currentCommitHash?.startsWith(target.commit)) || (expected?.commit && !actual?.currentCommitHash?.startsWith(expected.commit))) throw new Error('切换后的版本未能通过核对，请刷新后检查扩展版本。');
-        const s = state(); s.repository = install.repository; s.previousVersion = currentVersion; s.chosenVersion = target.version;
-        await save(); await flush(); reloadNeeded = true; return target.version;
+        if (install.currentBranchName && install.currentBranchName !== 'main') {
+          // Unshallow & fetch all remote branches via /branches before switching back to main.
+          await native('branches', install).catch(() => {});
+          await native('switch', install, { branch: 'origin/main' }, true);
+        }
+        await native('update', install, {}, true);
+        const [manifest, actual] = await Promise.all([
+          json(new URL('manifest.json', moduleURL).href, { cache: 'no-store' }).catch(() => null),
+          native('version', install).catch(() => null),
+        ]);
+        if (actual?.currentBranchName && actual.currentBranchName !== 'main') {
+          throw new Error('尚未切回 main 主线分支，请在酒馆“管理扩展”中将分支切换为 main。');
+        }
+        const finalVersion = manifest?.version || target.version;
+        const s = state(); s.repository = install.repository; s.previousVersion = currentVersion; s.chosenVersion = finalVersion;
+        await save(); await flush(); reloadNeeded = true; return finalVersion;
       } catch (error) {
         if (mutationStarted) { reloadNeeded = true; throw new Error(`${error.message} 请刷新酒馆确认当前版本；人设馆设置备份已保留。`); }
         throw error;
