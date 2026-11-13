@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 
 import {
   updateNativePersona,
+  uploadNativeAvatar,
+  bustPersonaAvatarCache,
+  getPersonaAvatarCacheBust,
+  clearPersonaAvatarCacheBustForTest,
   isElementVisible,
   isNativePersonaPanelOpen,
   setNativeTakeover,
@@ -20,6 +24,7 @@ import {
   clearLocalPersonaModificationsForTest,
   syncActivePersonaUserName,
 } from '../adapter.js';
+import { createApp } from '../ui.js';
 
 function contextFor({ current = 'persona-a' } = {}) {
   const events = [];
@@ -490,4 +495,109 @@ test('local persona edits are never reverted by un-flushed stale /api/settings/g
     globalThis.fetch = prevFetch;
   }
 });
+
+test('overwriting an existing persona avatar busts WebView image cache and updates chat/drawer DOM thumbnails', async () => {
+  const prevFetch = globalThis.fetch;
+  const prevDoc = globalThis.document;
+  clearPersonaAvatarCacheBustForTest();
+  clearLocalPersonaModificationsForTest();
+  try {
+    const uploadedForms = [];
+    const drawerImg = { src: '/thumbnail?type=persona&file=persona-a.png' };
+    const chatUserImg = { src: '/thumbnail?type=persona&file=persona-a.png' };
+    globalThis.document = {
+      querySelectorAll(selector) {
+        if (selector === '#user_avatar_block .avatar-container') {
+          return [{
+            getAttribute: name => (name === 'data-avatar-id' ? 'persona-a.png' : null),
+            querySelector: tag => (tag === 'img' ? drawerImg : null),
+          }];
+        }
+        if (selector === '.mes[is_user="true"]:not([force_avatar="true"]) .avatar img') {
+          return [chatUserImg];
+        }
+        return [];
+      },
+      querySelector: () => null,
+    };
+    globalThis.fetch = async (url, options = {}) => {
+      if (String(url).startsWith('/api/avatars/upload')) {
+        uploadedForms.push({ url, body: options.body });
+        return {
+          ok: true,
+          json: async () => ({ path: 'persona-a.png' }),
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    };
+
+    const events = [];
+    const context = {
+      user_avatar: 'persona-a.png',
+      powerUserSettings: {
+        user_avatar: 'persona-a.png',
+        personas: {
+          'persona-a.png': '清砚',
+          'persona-b.png': '未换头像的人设',
+        },
+        persona_descriptions: {
+          'persona-a.png': { description: '描述A', title: '' },
+          'persona-b.png': { description: '描述B', title: '' },
+        },
+      },
+      eventSource: { emit(type, payload) { events.push({ type, payload }); } },
+    };
+
+    const beforeList = listNativePersonas(context, { getUserAvatar: id => `User Avatars/${id}` });
+    assert.equal(beforeList.find(p => p.id === 'persona-a.png')?.avatarRef, '/User Avatars/persona-a.png');
+
+    const fakeBlob = new Blob([new Uint8Array([137, 80, 78, 71])], { type: 'image/png' });
+    const res = await uploadNativeAvatar(fakeBlob, {
+      resizePrompt: false,
+      overwriteName: 'persona-a.png',
+      createPersona: false,
+      context,
+    });
+
+    assert.equal(res.avatarId, 'persona-a.png');
+    assert.equal(res.created, false);
+    assert.ok(res.bust > 0);
+    assert.equal(getPersonaAvatarCacheBust('persona-a.png'), res.bust);
+
+    const afterList = listNativePersonas(context, { getUserAvatar: id => `User Avatars/${id}` });
+    assert.equal(afterList.find(p => p.id === 'persona-a.png')?.avatarRef, `/User Avatars/persona-a.png?v=${res.bust}`);
+    assert.equal(afterList.find(p => p.id === 'persona-b.png')?.avatarRef, '/User Avatars/persona-b.png');
+    assert.equal(drawerImg.src, `/thumbnail?type=persona&file=persona-a.png&v=${res.bust}`);
+    assert.equal(chatUserImg.src, `/thumbnail?type=persona&file=persona-a.png&v=${res.bust}`);
+    assert.deepEqual(events, [{ type: 'PERSONA_UPDATED', payload: 'persona-a.png' }]);
+
+    // Monotonic bump if user replaces avatar twice within the same millisecond:
+    const secondBust = bustPersonaAvatarCache('persona-a.png', res.bust);
+    assert.ok(secondBust > res.bust);
+  } finally {
+    clearPersonaAvatarCacheBustForTest();
+    clearLocalPersonaModificationsForTest();
+    globalThis.fetch = prevFetch;
+    globalThis.document = prevDoc;
+  }
+});
+
+test('gallery view resolves active editor persona even when entered from top Editor tab without explicit editingPersonaId', () => {
+  const ui = createApp({});
+  ui.setLocalUi({ tab: 'gallery', gallerySheet: 'avatars', selectedAssetId: 'asset-1', editingPersonaId: '' });
+  ui.update({
+    personas: [{ id: 'persona-cur.png', name: '清砚', description: '当前人设', avatarRef: '/User Avatars/persona-cur.png?v=123' }],
+    current: { scope: 'global', persona: { id: 'persona-cur.png', name: '清砚', description: '当前人设', avatarRef: '/User Avatars/persona-cur.png?v=123' } },
+    state: {
+      gallery: [{ id: 'asset-1', name: '新头像.png', kind: 'avatar', remoteUrl: '/user/images/ytps-asset-1.png' }],
+    },
+  });
+
+  assert.equal(ui.galleryTargetPersona()?.id, 'persona-cur.png');
+  const html = ui.gallery();
+  assert.match(html, /data-action="upload-gallery-avatar"/);
+  assert.match(html, /设为头像/);
+  assert.match(html, /取消并返回编辑/);
+});
+
 

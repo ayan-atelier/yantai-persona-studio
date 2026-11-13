@@ -44,7 +44,10 @@ function galleryFallbackUrl(url, type = 'persona') {
   if (!url || /\/thumbnail(?:\?|$)/i.test(String(url))) return '';
   if (type !== 'avatar' && !/\/User(?:%20|\s)Avatars\//i.test(String(url))) return '';
   const file = galleryFileName(url);
-  return file ? '/thumbnail?type=' + encodeURIComponent(type) + '&file=' + encodeURIComponent(file) : '';
+  if (!file) return '';
+  const verMatch = String(url).match(/[?&]v=([^&#]+)/);
+  const verSuffix = verMatch?.[1] ? '&v=' + encodeURIComponent(verMatch[1]) : '';
+  return '/thumbnail?type=' + encodeURIComponent(type) + '&file=' + encodeURIComponent(file) + verSuffix;
 }
 
 class App {
@@ -204,7 +207,8 @@ class App {
     const name = p.name || '尚未选择人设';
     const desc = p.description || '暂无描述';
     const rows = [['global', '默认'], ['card', '当前角色卡'], ['chat', '当前存档']];
-    return '<div class="ytps-current"><div class="ytps-current-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '" alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-current-copy"><div class="ytps-kicker">当前生效 · ' + esc(this.sourceLabel(this.state.current?.scope)) + '</div><h2>' + esc(name) + '</h2><p>' + esc(short(desc, 260)) + '</p></div></div>' +
+    const curFallback = galleryFallbackUrl(p.avatarRef, 'persona');
+    return '<div class="ytps-current"><div class="ytps-current-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '"' + (curFallback ? ' data-fallback-src="' + esc(curFallback) + '"' : '') + ' alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-current-copy"><div class="ytps-kicker">当前生效 · ' + esc(this.sourceLabel(this.state.current?.scope)) + '</div><h2>' + esc(name) + '</h2><p>' + esc(short(desc, 260)) + '</p></div></div>' +
       '<div class="ytps-section-title"><strong>绑定到：</strong></div>' +
       '<div class="ytps-binding-grid" role="group" aria-label="绑定到">' + rows.map(([scope, label]) => { const active = this.state.current?.scope === scope; return '<button class="ytps-choice ' + (active ? 'is-active' : '') + '" data-action="bind-current" data-scope="' + scope + '" data-mode="' + (active ? 'none' : 'bind') + '" aria-pressed="' + active + '" title="' + (active ? '再次点击解除绑定' : '绑定到' + label) + '">' + label + (active ? ' <i class="fa-solid fa-link" aria-hidden="true"></i>' : '') + '</button>'; }).join('') + '</div>';
   }
@@ -265,12 +269,20 @@ class App {
     const useAction = p.isCurrent
       ? '<span class="ytps-current-state" role="status" title="当前正在使用的人设">当前</span>'
       : '<button class="ytps-btn ytps-primary" data-action="use" data-id="' + esc(p.id) + '">设为当前</button>';
-    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + '"><div class="ytps-row-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '" alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + '</div><div class="ytps-row-meta"><small>' + esc(note) + '</small><div class="ytps-row-primary">' + useAction + '</div></div><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><label class="ytps-persona-group"><select data-field="personaGroup" data-id="' + esc(p.id) + '" aria-label="移动' + esc(p.name) + '到分组">' + groupOptions + '</select></label><div class="ytps-row-tools"><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></div></article>';
+    const rowFallback = galleryFallbackUrl(p.avatarRef, 'persona');
+    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + '"><div class="ytps-row-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '"' + (rowFallback ? ' data-fallback-src="' + esc(rowFallback) + '"' : '') + ' alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + '</div><div class="ytps-row-meta"><small>' + esc(note) + '</small><div class="ytps-row-primary">' + useAction + '</div></div><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><label class="ytps-persona-group"><select data-field="personaGroup" data-id="' + esc(p.id) + '" aria-label="移动' + esc(p.name) + '到分组">' + groupOptions + '</select></label><div class="ytps-row-tools"><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></div></article>';
   }
   editorPersona() {
     if (this.state.activeTab === 'create' || this.state.creatingPersona) return {};
     const wanted = String(this.state.editingPersonaId || this.state.current?.persona?.id || '');
     return this.state.personas.find(item => String(item.id) === wanted) || this.state.current?.persona || {};
+  }
+  galleryTargetPersona() {
+    if (this.state.creatingPersona) return {};
+    const wanted = String(this.state.editingPersonaId || this.state.current?.persona?.id || '');
+    if (!wanted) return {};
+    return this.state.personas.find(item => String(item.id) === wanted)
+      || (String(this.state.current?.persona?.id || '') === wanted ? this.state.current.persona : {});
   }
   personaScope(id) {
     const wanted = String(id || '');
@@ -295,7 +307,8 @@ class App {
     const draft = existing || { id, name: persona.name || '', note: persona.title || '', description: persona.description || '', lorebook: persona.lorebook || '' };
     if (!existing && (id || creating)) this.state.editorDraft = draft;
     const avatar = persona.avatarRef || '';
-    const image = avatar ? '<img src="' + esc(avatar) + '" alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
+    const avatarFallback = galleryFallbackUrl(avatar, 'persona');
+    const image = avatar ? '<img src="' + esc(avatar) + '"' + (avatarFallback ? ' data-fallback-src="' + esc(avatarFallback) + '"' : '') + ' alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
     if (creating) {
       const createButton = '<button class="ytps-btn ytps-primary ytps-editor-save" data-action="save-new-persona"><i class="fa-solid fa-check"></i> 创建人设</button>';
       const recent = this.state.recentCreatedPersona;
@@ -319,11 +332,23 @@ class App {
     const sheetTabs = '<div class="ytps-gallery-tabs" role="tablist"><button class="ytps-gallery-tab ' + (sheet === 'avatars' ? 'is-active' : '') + '" data-action="gallery-sheet" data-sheet="avatars" role="tab" aria-selected="' + (sheet === 'avatars') + '"><i class="fa-solid fa-user"></i><span>人设头像</span><small>上传、选择、裁切</small></button><button class="ytps-gallery-tab ' + (sheet === 'cards' ? 'is-active' : '') + '" data-action="gallery-sheet" data-sheet="cards" role="tab" aria-selected="' + (sheet === 'cards') + '"><i class="fa-solid fa-address-card"></i><span>角色卡图库</span><small>为书架联动预留</small></button></div>';
     const uploadLabel = sheet === 'avatars' ? '从相册导入素材' : '导入角色卡文件';
     const empty = sheet === 'avatars' ? '还没有头像素材。导入后会保存在图库，不会自动新建人设。' : '还没有角色卡素材；当前酒馆角色卡会自动汇总到这里。';
-    const galleryTargetId = String(this.state.editingPersonaId || '');
+    const targetPersona = this.galleryTargetPersona();
+    const galleryTargetId = String(targetPersona?.id || '');
+    const targetName = short(targetPersona?.name || '当前人设', 18);
+    const applyLabel = '裁切并设为“' + esc(targetName) + '”头像';
+    const topApplyBtn = selected && sheet === 'avatars' && galleryTargetId
+      ? '<button class="ytps-btn ytps-primary" data-action="upload-gallery-avatar" data-id="' + esc(selected.id) + '"><i class="fa-solid fa-crop-simple"></i> ' + applyLabel + '</button>'
+      : '';
+    const backLabel = galleryTargetId ? '取消并返回编辑' : '返回新建 / 编辑';
     const selectedBar = selected && sheet === 'avatars' ? '<div class="ytps-gallery-selection"><span><i class="fa-solid fa-check"></i> 已选：' + esc(selected.name || '这张图片') + '</span>' + (galleryTargetId
-      ? '<button class="ytps-btn ytps-primary" data-action="upload-gallery-avatar" data-id="' + esc(selected.id) + '"><i class="fa-solid fa-crop-simple"></i> 裁切并应用到当前人设</button>'
-      : '<small class="ytps-muted">请从已有的人设编辑页进入图库，再应用这张图片；导入素材不会创建人设。</small>') + '</div>' : '';
-    return '<div class="ytps-gallery-back"><button class="ytps-btn ytps-quiet" data-action="gallery-back-editor"><i class="fa-solid fa-arrow-left"></i> 返回新建 / 编辑</button></div>' + sheetTabs + '<div class="ytps-toolbar"><input class="ytps-input" data-field="assetQuery" value="' + esc(this.state.assetQuery || '') + '" placeholder="搜索' + (sheet === 'avatars' ? '头像' : '角色卡') + '…"><button class="ytps-btn ytps-primary" data-action="import-assets"><i class="fa-solid fa-' + (sheet === 'avatars' ? 'images' : 'upload') + '"></i> ' + uploadLabel + '</button><span class="ytps-count">' + list.length + ' 项</span></div><div class="ytps-gallery-help"><i class="fa-solid fa-circle-info"></i><span>' + (sheet === 'avatars' ? '点击图片即可选中；右上角可查看原图。图片只会进入图库，不会自动创建人设；应用时仍会走酒馆原生裁切。' : '角色卡图片单独放置，后续可与砚台书架的封面管理联动。') + '</span></div>' + selectedBar + '<div class="ytps-dropzone" data-action="import-assets"><i class="fa-solid fa-cloud-arrow-up"></i><span>拖入' + (sheet === 'avatars' ? '头像图片' : 'PNG 角色卡或 JSON') + '</span></div>' + (list.length ? '<div class="ytps-gallery-grid ' + (sheet === 'cards' ? 'is-card-sheet' : 'is-avatar-sheet') + '">' + list.map(a => this.assetCard(a)).join('') + '</div>' : '<div class="ytps-empty">' + empty + '</div>');
+      ? '<button class="ytps-btn ytps-primary" data-action="upload-gallery-avatar" data-id="' + esc(selected.id) + '"><i class="fa-solid fa-crop-simple"></i> ' + applyLabel + '</button>'
+      : '<small class="ytps-muted">请先创建或选择一份人设后再应用头像；导入素材不会自动创建人设。</small>') + '</div>' : '';
+    const helpText = sheet === 'avatars'
+      ? (galleryTargetId
+        ? '点击任意图片下方的「设为头像」（或勾选图片后点「裁切并设为头像」）即可裁切更换；直接点左上角返回不会修改原头像。'
+        : '点击图片即可选中；右上角可查看原图。图片只会进入图库，不会自动创建人设；应用时仍会走酒馆原生裁切。')
+      : '角色卡图片单独放置，后续可与砚台书架的封面管理联动。';
+    return '<div class="ytps-gallery-back"><button class="ytps-btn ytps-quiet" data-action="gallery-back-editor"><i class="fa-solid fa-arrow-left"></i> ' + backLabel + '</button>' + topApplyBtn + '</div>' + sheetTabs + '<div class="ytps-toolbar"><input class="ytps-input" data-field="assetQuery" value="' + esc(this.state.assetQuery || '') + '" placeholder="搜索' + (sheet === 'avatars' ? '头像' : '角色卡') + '…"><button class="ytps-btn ytps-primary" data-action="import-assets"><i class="fa-solid fa-' + (sheet === 'avatars' ? 'images' : 'upload') + '"></i> ' + uploadLabel + '</button><span class="ytps-count">' + list.length + ' 项</span></div><div class="ytps-gallery-help"><i class="fa-solid fa-circle-info"></i><span>' + helpText + '</span></div>' + selectedBar + '<div class="ytps-dropzone" data-action="import-assets"><i class="fa-solid fa-cloud-arrow-up"></i><span>拖入' + (sheet === 'avatars' ? '头像图片' : 'PNG 角色卡或 JSON') + '</span></div>' + (list.length ? '<div class="ytps-gallery-grid ' + (sheet === 'cards' ? 'is-card-sheet' : 'is-avatar-sheet') + '">' + list.map(a => this.assetCard(a)).join('') + '</div>' : '<div class="ytps-empty">' + empty + '</div>');
   }
   async importFiles(files) {
     if (!files?.length) return;
@@ -354,7 +379,9 @@ class App {
     const fallback = galleryFallbackUrl(imageUrl, isNative ? 'avatar' : 'persona');
     const preview = imageUrl ? '<button class="ytps-asset-preview" data-action="preview-asset" data-url="' + esc(imageUrl) + '" data-fallback="' + esc(fallback) + '" data-name="' + esc(a.name || '') + '" title="查看原图"><i class="fa-solid fa-expand"></i></button>' : '';
     const image = imageUrl ? '<img src="' + esc(imageUrl) + '"' + (fallback ? ' data-fallback-src="' + esc(fallback) + '"' : '') + ' alt="">' : '<i class="fa-solid ' + (a.kind === 'card' ? 'fa-address-card' : 'fa-image') + '"></i>';
-    return '<article class="ytps-asset ' + (selected ? 'is-selected' : '') + ' ' + (isNative ? 'is-native' : '') + '"><button class="ytps-asset-select" data-action="select-asset" data-id="' + esc(a.id) + '" title="' + (isNative ? '选择此图' : '选用此图') + '">' + (selected ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-' + (isNative ? 'eye' : 'check') + '"></i>') + '</button>' + preview + '<div class="ytps-asset-thumb" data-action="select-asset" data-id="' + esc(a.id) + '" title="点击选择这张图">' + image + '</div><div class="ytps-asset-meta"><b>' + esc(a.name) + '</b><small>' + (isNative ? '酒馆角色卡' : a.kind === 'card' ? '角色卡文件' : '头像素材') + '</small></div>' + (!isNative ? '<button class="ytps-remove" data-action="remove-asset" data-id="' + esc(a.id) + '" title="移除素材"><i class="fa-solid fa-xmark"></i></button>' : '') + '</article>';
+    const canApplyAvatar = !isNative && a.kind !== 'card' && Boolean(this.galleryTargetPersona()?.id);
+    const applyBtn = canApplyAvatar ? '<button class="ytps-asset-use" data-action="upload-gallery-avatar" data-id="' + esc(a.id) + '" title="裁切并设为当前编辑人设的头像"><i class="fa-solid fa-crop-simple"></i> 设为头像</button>' : '';
+    return '<article class="ytps-asset ' + (selected ? 'is-selected' : '') + ' ' + (isNative ? 'is-native' : '') + '"><button class="ytps-asset-select" data-action="select-asset" data-id="' + esc(a.id) + '" title="' + (isNative ? '选择此图' : '选用此图') + '">' + (selected ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-' + (isNative ? 'eye' : 'check') + '"></i>') + '</button>' + preview + '<div class="ytps-asset-thumb" data-action="select-asset" data-id="' + esc(a.id) + '" title="点击选择这张图">' + image + '</div><div class="ytps-asset-meta"><b>' + esc(a.name) + '</b><small>' + (isNative ? '酒馆角色卡' : a.kind === 'card' ? '角色卡文件' : '头像素材') + '</small>' + applyBtn + '</div>' + (!isNative ? '<button class="ytps-remove" data-action="remove-asset" data-id="' + esc(a.id) + '" title="移除素材"><i class="fa-solid fa-xmark"></i></button>' : '') + '</article>';
   }
   assistantTurns() {
     const threads = this.state.assistantThreads && typeof this.state.assistantThreads === 'object' ? this.state.assistantThreads : {};
@@ -555,11 +582,22 @@ class App {
     }
     if (action === 'tab') {
       this.state.activeTab = el.dataset.tab;
-      this.setLocalUi({ tab: this.state.activeTab });
       this.state.creatingPersona = this.state.activeTab === 'create';
-      if (this.state.creatingPersona) { this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; }
+      if (this.state.creatingPersona) {
+        this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' };
+        this.state.recentCreatedPersona = null;
+        this.setLocalUi({ tab: 'create', editingPersonaId: '' });
+      } else if (this.state.activeTab === 'editor' && !this.state.editingPersonaId) {
+        const fallbackId = String(this.editorPersona()?.id || '');
+        this.state.editingPersonaId = fallbackId;
+        this.setLocalUi({ tab: 'editor', editingPersonaId: fallbackId });
+      } else {
+        this.setLocalUi({ tab: this.state.activeTab });
+      }
       this.render();
-      if (this.state.creatingPersona) await this.call('startNewPersona'); else await this.call('setTab', el.dataset.tab);
+      if (this.state.creatingPersona) await this.call('startNewPersona');
+      else if (this.state.activeTab === 'editor' && this.state.editingPersonaId) await this.call('setEditingPersona', this.state.editingPersonaId, 'editor');
+      else await this.call('setTab', el.dataset.tab);
       return;
     }
     if (action === 'gallery-sheet') { this.state.gallerySheet = el.dataset.sheet === 'cards' ? 'cards' : 'avatars'; this.setLocalUi({ gallerySheet: this.state.gallerySheet }); this.state.assetQuery = ''; this.render(); await this.call('setGallerySheet', this.state.gallerySheet); return; }
@@ -568,12 +606,16 @@ class App {
     if (action === 'select-asset') { this.state.selectedAssetId = el.dataset.id || ''; this.setLocalUi({ selectedAssetId: this.state.selectedAssetId }); this.render(); return this.call('selectGalleryAsset', el.dataset.id); }
     if (action === 'upload-gallery-avatar') {
       try {
-        const result = await this.call('uploadGalleryAvatar', el.dataset.id, this.state.editingPersonaId || '');
+        const targetId = String(this.state.editingPersonaId || this.galleryTargetPersona()?.id || '');
+        const result = await this.call('uploadGalleryAvatar', el.dataset.id, targetId);
         if (!result?.cancelled) {
           this.state.selectedAssetId = '';
+          this.state.editingPersonaId = targetId;
           this.state.activeTab = 'editor';
+          this.setLocalUi({ tab: 'editor', selectedAssetId: '', editingPersonaId: targetId });
           await this.call('setTab', 'editor');
           this.render();
+          this.options.report?.('人设头像已更新！', 'success');
         }
         return result;
       } catch (error) {
@@ -603,8 +645,27 @@ class App {
     if (action === 'editor-back') { this.state.activeTab = 'current'; this.setLocalUi({ tab: 'current', editingPersonaId: '' }); this.render(); await this.call('setTab', 'current'); return; }
     if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.setLocalUi({ tab: 'create', editingPersonaId: '' }); this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; this.render(); await this.call('startNewPersona'); return; }
     if (action === 'continue-new-persona') { this.state.recentCreatedPersona = null; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.render(); this.root?.querySelector('[data-field="editorName"]')?.focus(); return; }
-    if (action === 'editor-avatar-gallery') { this.state.activeTab = 'gallery'; this.setLocalUi({ tab: 'gallery', gallerySheet: 'avatars' }); this.state.gallerySheet = 'avatars'; this.render(); await this.call('setGallerySheet', 'avatars'); await this.call('setTab', 'gallery'); return; }
-    if (action === 'gallery-back-editor') { this.state.activeTab = 'editor'; this.setLocalUi({ tab: 'editor' }); this.render(); await this.call('setTab', 'editor'); return; }
+    if (action === 'editor-avatar-gallery') {
+      const targetId = String(this.state.editingPersonaId || this.editorPersona()?.id || '');
+      this.state.creatingPersona = false;
+      this.state.editingPersonaId = targetId;
+      this.state.activeTab = 'gallery';
+      this.state.gallerySheet = 'avatars';
+      this.setLocalUi({ tab: 'gallery', gallerySheet: 'avatars', editingPersonaId: targetId });
+      this.render();
+      if (targetId) await this.call('setEditingPersona', targetId, 'gallery');
+      await this.call('setGallerySheet', 'avatars');
+      await this.call('setTab', 'gallery');
+      return;
+    }
+    if (action === 'gallery-back-editor') {
+      const targetId = String(this.state.editingPersonaId || this.galleryTargetPersona()?.id || '');
+      this.state.activeTab = 'editor';
+      this.setLocalUi({ tab: 'editor', ...(targetId ? { editingPersonaId: targetId } : {}) });
+      this.render();
+      await this.call('setTab', 'editor');
+      return;
+    }
     if (action === 'editor-use') { await this.call('usePersona', el.dataset.id); this.state.activeTab = 'editor'; this.render(); return; }
     if (action === 'editor-bind') { await this.call('setBinding', el.dataset.scope, 'bind', el.dataset.id); this.render(); return; }
     if (action === 'editor-unbind') { for (const scope of ['chat', 'card', 'global']) await this.call('setBinding', scope, 'none', null); this.render(); return; }

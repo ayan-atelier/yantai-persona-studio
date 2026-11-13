@@ -1641,9 +1641,10 @@ import { createSyncClient } from './sync-client.js';
       close: () => { editMode = false; app?.close(); adapter.setNativeTakeover(false); adapter.setNativeEditMode(false); },
       refresh,
       async setTab(tab) { state.ui = { ...(state.ui || {}), tab }; app?.setLocalUi?.({ tab }); },
-      async setEditingPersona(id) {
-        state.ui = { ...(state.ui || {}), tab: 'editor', editingPersonaId: String(id || '') };
-        app?.setLocalUi?.({ tab: 'editor', editingPersonaId: String(id || '') });
+      async setEditingPersona(id, tab = 'editor') {
+        const nextTab = String(tab || 'editor');
+        state.ui = { ...(state.ui || {}), tab: nextTab, editingPersonaId: String(id || '') };
+        app?.setLocalUi?.({ tab: nextTab, editingPersonaId: String(id || '') });
       },
       async startNewPersona() {
         state.ui = { ...(state.ui || {}), tab: 'create', editingPersonaId: '' };
@@ -1855,14 +1856,18 @@ import { createSyncClient } from './sync-client.js';
         // Applying an avatar is only valid from an existing editor target.
         // Never fall back to the active persona: an empty target must fail
         // safely instead of entering the native create-persona flow.
-        const overwriteName = String(targetPersonaId || '');
+        const overwriteName = String(targetPersonaId || state?.ui?.editingPersonaId || '');
         if (!overwriteName) throw new Error('请先从已有的人设编辑页进入图库，再应用头像；图片已保留在图库中。');
         const personas = adapter.readNativePersonas?.() || [];
         if (personas.length && !personas.some(persona => String(persona?.id || '') === overwriteName)) throw new Error('找不到要应用头像的人设，请重新打开编辑页后再试。');
         // Gallery application always overwrites an existing persona avatar.
         // It must never fall through to the native “create persona” branch.
         const result = await adapter.uploadNativeAvatar(blob, { resizePrompt: true, overwriteName, createPersona: false });
-        if (!result?.cancelled) await refresh();
+        if (!result?.cancelled) {
+          state.ui = { ...(state.ui || {}), tab: 'editor', selectedAssetId: '', editingPersonaId: overwriteName };
+          app?.setLocalUi?.({ tab: 'editor', selectedAssetId: '', editingPersonaId: overwriteName });
+          await refresh();
+        }
         return result;
       },
       async createDraft(input = {}) {

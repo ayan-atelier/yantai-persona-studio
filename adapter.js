@@ -365,6 +365,68 @@ function avatarFileName(value) {
   return raw;
 }
 
+const AVATAR_BUST_STORAGE_KEY = 'yantai-persona-studio.avatar-bust.v1';
+const avatarBustMemory = new Map();
+let avatarBustHydrated = false;
+function hydrateAvatarBustMemory() {
+  if (avatarBustHydrated) return;
+  avatarBustHydrated = true;
+  try {
+    const raw = globalThis.sessionStorage?.getItem?.(AVATAR_BUST_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === 'object') {
+      for (const [key, value] of Object.entries(parsed)) {
+        const num = Number(value) || 0;
+        if (key && num > 0) avatarBustMemory.set(key, num);
+      }
+    }
+  } catch (_) { /* ignore storage quota or private-mode errors */ }
+}
+function persistAvatarBustMemory() {
+  try {
+    const payload = {};
+    for (const [key, value] of avatarBustMemory.entries()) payload[key] = value;
+    globalThis.sessionStorage?.setItem?.(AVATAR_BUST_STORAGE_KEY, JSON.stringify(payload));
+  } catch (_) { /* ignore storage quota or private-mode errors */ }
+}
+export function bustPersonaAvatarCache(file, stamp = Date.now()) {
+  hydrateAvatarBustMemory();
+  const key = avatarFileName(file) || String(file || '').trim();
+  if (!key) return 0;
+  const prev = avatarBustMemory.get(key) || 0;
+  const next = Math.max(Number(stamp) || Date.now(), prev + 1);
+  avatarBustMemory.set(key, next);
+  persistAvatarBustMemory();
+  return next;
+}
+export function getPersonaAvatarCacheBust(file) {
+  hydrateAvatarBustMemory();
+  const key = avatarFileName(file) || String(file || '').trim();
+  return key ? (avatarBustMemory.get(key) || 0) : 0;
+}
+export function clearPersonaAvatarCacheBustForTest() {
+  avatarBustMemory.clear();
+  avatarBustHydrated = true;
+  try { globalThis.sessionStorage?.removeItem?.(AVATAR_BUST_STORAGE_KEY); } catch (_) {}
+}
+function refreshNativeDomAvatarImages(avatarId, bust, context, native) {
+  const cleanId = avatarFileName(avatarId) || String(avatarId || '').trim();
+  if (!cleanId || !bust) return;
+  const thumbSrc = '/thumbnail?type=persona&file=' + encodeURIComponent(cleanId) + '&v=' + bust;
+  const blocks = globalThis.document?.querySelectorAll?.('#user_avatar_block .avatar-container') || [];
+  for (const container of blocks) {
+    if (String(container?.getAttribute?.('data-avatar-id') || '') !== cleanId) continue;
+    const img = container.querySelector?.('img');
+    if (img) img.src = thumbSrc;
+  }
+  if (String(currentNativeId(context, native) || '') === cleanId) {
+    const chatImgs = globalThis.document?.querySelectorAll?.('.mes[is_user="true"]:not([force_avatar="true"]) .avatar img') || [];
+    for (const img of chatImgs) {
+      img.src = thumbSrc;
+    }
+  }
+}
+
 async function nativeAvatarUrl(file, context = {}, native = null) {
   const avatarId = avatarFileName(file);
   if (!avatarId) return '';
@@ -411,7 +473,7 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
     nativeApi(),
     import('/scripts/popup.js').catch(() => ({})),
     import('/scripts/utils.js').catch(() => ({})),
-    import('/scripts/script.js').catch(() => ({})),
+    scriptApi().then(mod => mod || {}),
   ]);
   const { Popup, POPUP_TYPE } = popupModule;
   const getBase64Async = utilsModule.getBase64Async;
@@ -436,9 +498,17 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
   const data = await response.json().catch(() => ({}));
   const avatarId = String(data?.path || data?.file || overwriteName || '');
   if (!avatarId) throw new Error('酒馆没有返回头像文件名。');
+  let bust = 0;
   if (overwriteName) {
+    const cleanKey = avatarFileName(avatarId) || avatarId;
+    const isExistingPersona = Boolean(resizePrompt || Object.prototype.hasOwnProperty.call(power?.personas || {}, cleanKey));
+    if (isExistingPersona) {
+      bust = bustPersonaAvatarCache(cleanKey);
+      markPersonaModifiedLocally(cleanKey);
+    }
     await fetch('/User Avatars/' + encodeURIComponent(avatarId), { cache: 'reload' }).catch(() => {});
     await fetch('/thumbnail?type=persona&file=' + encodeURIComponent(avatarId), { cache: 'reload' }).catch(() => {});
+    if (bust) refreshNativeDomAvatarImages(cleanKey, bust, context, native);
   } else {
     // Match changeUserAvatar(): refresh the native list before opening the
     // name/description prompt, then focus the newly-created persona.
@@ -450,7 +520,8 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
   // the raw list here; this avoids turning an unrelated gallery file into a
   // new [Unnamed Persona].
   await native?.getUserAvatars?.(false, avatarId);
-  return { avatarId, created: !overwriteName && createPersona };
+  if (bust) await emitNativeEvent(context, 'PERSONA_UPDATED', avatarId);
+  return { avatarId, bust, created: !overwriteName && createPersona };
 }
 
 /**
@@ -463,7 +534,7 @@ export async function uploadNativeAvatar(file, { resizePrompt = true, overwriteN
 export async function uploadGalleryAsset(file, { assetId = '', context = getStContext() } = {}) {
   if (!file || typeof file.arrayBuffer !== 'function') throw new Error('请选择一个图片文件。');
   const utilsModule = await import('/scripts/utils.js').catch(() => ({}));
-  const scriptModule = await import('/scripts/script.js').catch(() => ({}));
+  const scriptModule = (await scriptApi()) || {};
   const ensureImageFormatSupported = utilsModule.ensureImageFormatSupported;
   const convertImageFile = utilsModule.convertImageFile;
   let uploadFile = typeof ensureImageFormatSupported === 'function' ? await ensureImageFormatSupported(file) : file;
@@ -502,7 +573,7 @@ export async function uploadGalleryAsset(file, { assetId = '', context = getStCo
 export async function deleteGalleryAsset(remoteUrl, { context = getStContext() } = {}) {
   const value = String(remoteUrl || '').trim();
   if (!/^\/?user\/images\//i.test(value)) return false;
-  const scriptModule = await import('/scripts/script.js').catch(() => ({}));
+  const scriptModule = (await scriptApi()) || {};
   const getHeaders = scriptModule.getRequestHeaders || context?.getRequestHeaders || globalThis.getRequestHeaders;
   const headers = typeof getHeaders === 'function' ? getHeaders() : {};
   headers['Content-Type'] = 'application/json';
@@ -525,7 +596,7 @@ export async function removeLegacyGalleryAvatar(file, { context = getStContext()
   // addMissingPersonas(), is safe to clean after its gallery copy is moved.
   if (String(current || '') === avatar || String(defaultId || '') === avatar) return false;
   if (personaName && personaName !== '[Unnamed Persona]') return false;
-  const scriptModule = await import('/scripts/script.js').catch(() => ({}));
+  const scriptModule = (await scriptApi()) || {};
   const getHeaders = scriptModule.getRequestHeaders || context?.getRequestHeaders || globalThis.getRequestHeaders;
   const headers = typeof getHeaders === 'function' ? getHeaders() : {};
   headers['Content-Type'] = 'application/json';
@@ -664,7 +735,8 @@ function personaImageUrl(context, avatarId, api = null) {
   // raw string concatenation (`User Avatars/${id}`), which breaks on `#`, `?`,
   // `%` or spaces in TauriTavern WebViews.
   const file = avatarFileName(id) || id;
-  return '/User Avatars/' + encodeURIComponent(file);
+  const bust = getPersonaAvatarCacheBust(file);
+  return '/User Avatars/' + encodeURIComponent(file) + (bust ? '?v=' + bust : '');
 }
 
 /** Read every persona already present in the native store. No import step. */
@@ -1062,7 +1134,10 @@ export async function openNativePersonaPanel() {
   const panel = () => findNativePersonaPanel();
   const isOpen = () => isNativePersonaPanelOpen();
   if (!isOpen()) {
-    const button = document.querySelector('#persona-management-button .drawer-toggle, #persona-management-button, [data-i18n="Persona Management"]');
+    const button = document.querySelector('#persona-management-button > .drawer-toggle')
+      || document.querySelector('#persona-management-button .drawer-toggle')
+      || document.querySelector('[data-i18n="Persona Management"]')
+      || document.querySelector('#persona-management-button');
     button?.click();
   }
   // The native drawer may render after the click on mobile layouts. Wait for

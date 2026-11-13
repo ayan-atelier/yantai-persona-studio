@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.3",
+  "latest": "1.1.4",
   "releases": [
+    {
+      "version": "1.1.4",
+      "branch": "v1.1.4",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆更换头像专项修复版。修复从顶部「编辑」页签进入「更换头像」时漏传目标人设 ID 导致无法应用新图的问题；在每张图库卡片底部与顶部导航新增直达「✂️ 设为头像」按钮，消除点选图片后直接点左上角返回未触发裁切上传的操作断层；并为覆盖同名头像文件新增 ?v=时间戳 内存破缓存机制与聊天楼层缩略图即时同步，无需强刷网页即可在手机/TauriTavern/电脑端当场显示新头像。"
+    },
     {
       "version": "1.1.3",
       "branch": "v1.1.3",

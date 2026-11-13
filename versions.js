@@ -1,5 +1,5 @@
 /* Single-main-branch update & legacy-branch recovery manager for 砚台 · 人设馆. */
-export const PERSONA_VERSION = '1.1.3';
+export const PERSONA_VERSION = '1.1.4';
 export const PERSONA_ID = 'yantai-persona-studio';
 export const SETTINGS_SCHEMA = 3;
 export const DEFAULT_REPOSITORY = 'https://github.com/ayan-atelier/yantai-persona-studio';
