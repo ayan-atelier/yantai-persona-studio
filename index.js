@@ -695,7 +695,17 @@ import { createSyncClient } from './sync-client.js';
     if (repairedTurns && pending) {
       queuePendingState(sharedState(state));
     }
+    let bootRemovedGhosts = false;
     if (state.enabled !== false) {
+      const reconciledOnBoot = await adapter?.reconcileMissingAvatarPersonas?.();
+      if (reconciledOnBoot?.removedPlaceholders?.length) {
+        state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
+        const stamp = Date.now();
+        for (const ghostId of reconciledOnBoot.removedPlaceholders) {
+          state.personaMeta[String(ghostId)] = { deletedAt: stamp };
+        }
+        bootRemovedGhosts = true;
+      }
       await healPlaceholderPersonas({ force: true });
       await adapter?.syncActivePersonaUserName?.();
     }
@@ -703,7 +713,7 @@ import { createSyncClient } from './sync-client.js';
       ? capturePersonaSnapshots(adapter.readNativePersonas?.() || [], { initialSeed: true })
       : false;
     stateHydratedPromise = null;
-    if ((seededSnapshots || repairedTurns || shouldFlushPending) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
+    if ((seededSnapshots || bootRemovedGhosts || repairedTurns || shouldFlushPending) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       void save({ syncGallery: shouldFlushPending });
     }
     return state;
@@ -946,7 +956,7 @@ import { createSyncClient } from './sync-client.js';
       const id = String(persona?.id || '').trim();
       if (!id || isPlaceholderSnapshot(persona)) continue;
       const currentMeta = state.personaMeta[id] && typeof state.personaMeta[id] === 'object' ? state.personaMeta[id] : {};
-      if (Number(currentMeta.deletedAt || 0) > 0 && initialSeed) continue;
+      if (Number(currentMeta.deletedAt || 0) > 0 && (initialSeed || adapter?.isPersonaDeletedLocally?.(id) || persona?.avatarMissing)) continue;
       const existingSnap = !isPlaceholderSnapshot(currentMeta.snapshot) ? currentMeta.snapshot : null;
       const candidate = {
         ...persona,
@@ -994,7 +1004,7 @@ import { createSyncClient } from './sync-client.js';
               }
             } catch (_) { /* continue with local and host settings */ }
           }
-          const serverSync = await adapter?.syncNativePersonasFromServer?.({ preferServer: true });
+          const serverSync = await adapter?.syncNativePersonasFromServer?.({ preferServer: true, deletedIds: knownDeletedPersonaIds() });
           if (serverSync?.raw) {
             const ext = serverSync.raw?.extension_settings?.[NS] || serverSync.raw?.extensionSettings?.[NS];
             if (ext?.personaMeta && typeof ext.personaMeta === 'object') {
@@ -1124,13 +1134,25 @@ import { createSyncClient } from './sync-client.js';
             });
           }
         }
+        const prevMissingCount = (app?.state?.personas || []).filter(p => p?.avatarMissing).length;
+        const reconciled = await adapter.reconcileMissingAvatarPersonas?.();
+        let removedGhostCount = 0;
+        if (reconciled?.removedPlaceholders?.length) {
+          state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
+          const stamp = Date.now();
+          for (const ghostId of reconciled.removedPlaceholders) {
+            state.personaMeta[String(ghostId)] = { deletedAt: stamp };
+            removedGhostCount += 1;
+          }
+        }
+        const nextMissingCount = Array.isArray(reconciled?.orphanIds) ? reconciled.orphanIds.length : prevMissingCount;
         const healed = await healPlaceholderPersonas({ force });
         const nameSynced = await adapter.syncActivePersonaUserName?.();
         const snapshotChanged = capturePersonaSnapshots(adapter.readNativePersonas?.() || []);
-        if (snapshotChanged) {
+        if (snapshotChanged || removedGhostCount > 0) {
           scheduleSnapshotSave();
         }
-        if (synced?.changed || healed || nameSynced || remoteStateChanged) {
+        if (synced?.changed || healed || nameSynced || remoteStateChanged || removedGhostCount > 0 || prevMissingCount !== nextMissingCount) {
           await refresh();
           return true;
         }
@@ -1791,18 +1813,44 @@ import { createSyncClient } from './sync-client.js';
       },
       async deletePersona(id) {
         // Native adapter delegates to SillyTavern's confirmation dialog and
-        // deletion path, including linked chat/default cleanup.
+        // deletion path, or cleans orphan records directly when the avatar file is gone.
         const ok = await adapter.deletePersona(id);
+        if (ok === 'cancelled') return false;
         if (!ok) throw new Error('酒馆没有完成删除，请保留当前人设并刷新后重试。');
         const deletedKey = String(id || '').trim();
         if (deletedKey) {
           adapter?.markPersonaDeletedLocally?.(deletedKey);
+          adapter?.markAvatarFileRemoved?.(deletedKey);
           state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
           state.personaMeta[deletedKey] = { deletedAt: Date.now() };
+          if (app?.state?.editingPersonaId === deletedKey) {
+            app.setLocalUi?.({ editingPersonaId: '', editorDraft: null });
+          }
         }
-        await new Promise(resolve => setTimeout(resolve, 320));
-        state.ui.tab = 'current';
-        await save();
+        await new Promise(resolve => setTimeout(resolve, 180));
+        await refresh();
+        await save({ syncGallery: false });
+        return true;
+      },
+      async purgeOrphanPersonas() {
+        const res = await adapter.purgeOrphanPersonas?.();
+        if (!res || res.cancelled) return { ok: false, cancelled: true, count: 0 };
+        const removed = Array.isArray(res.removed) ? res.removed : [];
+        if (removed.length) {
+          state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
+          const stamp = Date.now();
+          for (const key of removed) {
+            adapter?.markPersonaDeletedLocally?.(key);
+            adapter?.markAvatarFileRemoved?.(key);
+            state.personaMeta[String(key)] = { deletedAt: stamp };
+          }
+          if (app?.state?.editingPersonaId && removed.includes(String(app.state.editingPersonaId))) {
+            app.setLocalUi?.({ editingPersonaId: '', editorDraft: null });
+          }
+          await refresh();
+          await save({ syncGallery: false });
+        }
+        return { ok: true, cancelled: false, count: removed.length };
       },
       async focusPersona(id) { await adapter.focusNativePersona(id); await refresh(); },
       async openNativeCreate() {
@@ -1995,11 +2043,15 @@ import { createSyncClient } from './sync-client.js';
       const deletedId = typeof payload === 'string'
         ? payload
         : payload?.avatarId ?? payload?.personaId ?? payload?.id ?? '';
-      if (deletedId) adapter?.markPersonaDeletedLocally?.(deletedId);
+      if (deletedId) {
+        adapter?.markPersonaDeletedLocally?.(deletedId);
+        adapter?.markAvatarFileRemoved?.(deletedId);
+      }
       if (state.personaMeta && typeof state.personaMeta === 'object' && deletedId) {
         state.personaMeta[String(deletedId)] = { deletedAt: Date.now() };
       }
       if (state?.enabled === false) return;
+      if (deletedId) await adapter?.flushNativeSettingsSave?.();
       await refresh();
       if (deletedId) await save({ syncGallery: false });
     };

@@ -234,7 +234,11 @@ class App {
     // oldest persona is first and the newest is last. Reverse the filtered
     // result so recent personas are immediately visible at the top.
     const list = this.state.personas.filter(p => (!q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q)) && (selectedGroup === 'all' || this.personaGroupId(p) === selectedGroup)).slice().reverse();
-    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><select class="ytps-input ytps-library-group" data-field="libraryGroup" aria-label="筛选人设分组">' + groupOptions + '</select>' + groupManage + '<span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span><button class="ytps-btn ytps-group-create" data-action="create-persona-group"><i class="fa-solid fa-folder-plus"></i> 新建分组</button></div>' + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">这个分组里还没有人设。</div>');
+    const orphanCount = this.state.personas.filter(p => p?.avatarMissing).length;
+    const orphanBar = orphanCount > 0
+      ? '<div class="ytps-orphan-bar" role="status"><span><i class="fa-solid fa-triangle-exclamation"></i> 检测到 <b>' + orphanCount + '</b> 份原头像小图已删除的残留人设（可点右侧垃圾桶删除、进编辑补传新头像，或一键清理）</span><button class="ytps-btn ytps-danger" data-action="purge-orphan-personas"><i class="fa-solid fa-trash-can"></i> 一键清理残留</button></div>'
+      : '';
+    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><select class="ytps-input ytps-library-group" data-field="libraryGroup" aria-label="筛选人设分组">' + groupOptions + '</select>' + groupManage + '<span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span><button class="ytps-btn ytps-group-create" data-action="create-persona-group"><i class="fa-solid fa-folder-plus"></i> 新建分组</button></div>' + orphanBar + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">这个分组里还没有人设。</div>');
   }
   personaBindingLabel(p) {
     const bindings = this.state.bindings || {};
@@ -270,7 +274,13 @@ class App {
       ? '<span class="ytps-current-state" role="status" title="当前正在使用的人设">当前</span>'
       : '<button class="ytps-btn ytps-primary" data-action="use" data-id="' + esc(p.id) + '">设为当前</button>';
     const rowFallback = galleryFallbackUrl(p.avatarRef, 'persona');
-    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + '"><div class="ytps-row-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '"' + (rowFallback ? ' data-fallback-src="' + esc(rowFallback) + '"' : '') + ' alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + '</div><div class="ytps-row-meta"><small>' + esc(note) + '</small><div class="ytps-row-primary">' + useAction + '</div></div><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><label class="ytps-persona-group"><select data-field="personaGroup" data-id="' + esc(p.id) + '" aria-label="移动' + esc(p.name) + '到分组">' + groupOptions + '</select></label><div class="ytps-row-tools"><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></div></article>';
+    const avatarHtml = p.avatarRef && !p.avatarMissing
+      ? '<img src="' + esc(p.avatarRef) + '"' + (rowFallback ? ' data-fallback-src="' + esc(rowFallback) + '"' : '') + ' alt="">'
+      : '<i class="fa-solid fa-user"></i>';
+    const warnChip = p.avatarMissing
+      ? '<span class="ytps-chip ytps-chip-warn" title="原头像小图已被删除；可直接删除清理残留，或进入编辑重新上传头像">无原图</span>'
+      : '';
+    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + (p.avatarMissing ? ' is-orphan' : '') + '"><div class="ytps-row-avatar">' + avatarHtml + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + warnChip + '</div><div class="ytps-row-meta"><small>' + esc(note) + '</small><div class="ytps-row-primary">' + useAction + '</div></div><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><label class="ytps-persona-group"><select data-field="personaGroup" data-id="' + esc(p.id) + '" aria-label="移动' + esc(p.name) + '到分组">' + groupOptions + '</select></label><div class="ytps-row-tools"><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></div></article>';
   }
   editorPersona() {
     if (this.state.activeTab === 'create' || this.state.creatingPersona) return {};
@@ -308,7 +318,7 @@ class App {
     if (!existing && (id || creating)) this.state.editorDraft = draft;
     const avatar = persona.avatarRef || '';
     const avatarFallback = galleryFallbackUrl(avatar, 'persona');
-    const image = avatar ? '<img src="' + esc(avatar) + '"' + (avatarFallback ? ' data-fallback-src="' + esc(avatarFallback) + '"' : '') + ' alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
+    const image = avatar && !persona.avatarMissing ? '<img src="' + esc(avatar) + '"' + (avatarFallback ? ' data-fallback-src="' + esc(avatarFallback) + '"' : '') + ' alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
     if (creating) {
       const createButton = '<button class="ytps-btn ytps-primary ytps-editor-save" data-action="save-new-persona"><i class="fa-solid fa-check"></i> 创建人设</button>';
       const recent = this.state.recentCreatedPersona;
@@ -708,6 +718,17 @@ class App {
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = (p.name || 'yantai-persona') + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 500); return;
     }
     if (action === 'native-create') return this.call('openNativeCreate');
+    if (action === 'purge-orphan-personas') {
+      try {
+        const res = await this.call('purgeOrphanPersonas');
+        if (res?.ok && res.count > 0) {
+          this.options.report?.('已清理 ' + res.count + ' 份无原图的残留人设记录。', 'success');
+        }
+      } catch (error) {
+        this.options.report?.(error.message || String(error), 'error');
+      }
+      return;
+    }
     if (action === 'use' || action === 'copy-persona' || action === 'delete-persona') {
       try { return await this.call(action === 'use' ? 'usePersona' : action === 'copy-persona' ? 'copyPersona' : 'deletePersona', el.dataset.id); }
       catch (error) { this.options.report?.(error.message || String(error), 'error'); return; }

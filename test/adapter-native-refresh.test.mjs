@@ -23,6 +23,10 @@ import {
   hasRecentLocalPersonaMutation,
   clearLocalPersonaModificationsForTest,
   syncActivePersonaUserName,
+  deleteNativePersona,
+  reconcileMissingAvatarPersonas,
+  purgeOrphanNativePersonas,
+  isPersonaDeletedLocally,
 } from '../adapter.js';
 import { createApp } from '../ui.js';
 
@@ -598,6 +602,127 @@ test('gallery view resolves active editor persona even when entered from top Edi
   assert.match(html, /data-action="upload-gallery-avatar"/);
   assert.match(html, /设为头像/);
   assert.match(html, /取消并返回编辑/);
+});
+
+test('missing avatar thumbnails: auto-prunes empty [Unnamed Persona] ghosts and cleanly deletes or batch-purges orphan personas without 404 deadlock', async () => {
+  const prevFetch = globalThis.fetch;
+  clearLocalPersonaModificationsForTest();
+  try {
+    // Only 'keep.png' still exists in User Avatars/ on disk; 'ghost-empty.png', 'orphan-1.png', 'orphan-2.png' were deleted on disk!
+    const filesOnDisk = ['keep.png'];
+    globalThis.fetch = async url => {
+      if (String(url).includes('/api/avatars/get')) {
+        return { ok: true, json: async () => [...filesOnDisk] };
+      }
+      if (String(url).includes('/api/avatars/delete')) {
+        return { ok: false, status: 404, statusText: 'Not Found' };
+      }
+      return { ok: true, json: async () => ({}) };
+    };
+
+    const events = [];
+    let saves = 0;
+    let metaSaves = 0;
+    let selectedAvatar = 'orphan-1.png';
+    const context = {
+      user_avatar: 'orphan-1.png',
+      chatMetadata: { persona: 'orphan-1.png' },
+      powerUserSettings: {
+        user_avatar: 'orphan-1.png',
+        default_persona: 'orphan-1.png',
+        personas: {
+          'keep.png': '正常人设',
+          'ghost-empty.png': '[Unnamed Persona]',
+          'orphan-1.png': '原图已删的旧人设1',
+          'orphan-2.png': '原图已删的旧人设2',
+        },
+        persona_descriptions: {
+          'keep.png': { description: '还在用的正常设定', title: '' },
+          'ghost-empty.png': { description: '', title: '' },
+          'orphan-1.png': { description: '旧设定1', title: '' },
+          'orphan-2.png': { description: '旧设定2', title: '' },
+        },
+      },
+      Popup: {
+        show: {
+          confirm: async () => confirmAnswer,
+        },
+      },
+      executeSlashCommands: async cmd => {
+        if (String(cmd).includes('/persona-delete')) {
+          // Simulates SillyTavern's native /persona-delete returning 'false' either when cancelled or when /api/avatars/delete 404s
+          return 'false';
+        }
+        return '';
+      },
+      saveSettingsDebounced() { saves += 1; },
+      saveMetadata() { metaSaves += 1; },
+      eventSource: { emit(type, payload) { events.push({ type, payload }); } },
+    };
+    const api = {
+      get user_avatar() { return selectedAvatar; },
+      setUserAvatar(id) {
+        selectedAvatar = id;
+        context.user_avatar = id;
+        context.powerUserSettings.user_avatar = id;
+      },
+      getUserAvatars() {},
+    };
+    let confirmAnswer = true;
+
+    // 1. Reconcile on startup/open: empty [Unnamed Persona] without image file is silently pruned; real-named orphans remain with avatarMissing: true
+    const rec = await reconcileMissingAvatarPersonas({ context, api });
+    assert.equal(rec.ok, true);
+    assert.deepEqual(rec.removedPlaceholders, ['ghost-empty.png']);
+    assert.deepEqual(rec.orphanIds, ['orphan-1.png', 'orphan-2.png']);
+    assert.equal('ghost-empty.png' in context.powerUserSettings.personas, false);
+    assert.equal(isPersonaDeletedLocally('ghost-empty.png'), true);
+
+    const listed = listNativePersonas(context, api);
+    assert.equal(listed.find(p => p.id === 'keep.png')?.avatarMissing, false);
+    assert.equal(listed.find(p => p.id === 'orphan-1.png')?.avatarMissing, true);
+    assert.equal(listed.find(p => p.id === 'orphan-2.png')?.avatarMissing, true);
+
+    // UI Archive view renders the orphan cleanup banner and warning badge without broken <img> tags
+    const ui = createApp({});
+    ui.setLocalUi({ tab: 'library' });
+    ui.update({ personas: listed, state: {} });
+    const libHtml = ui.library();
+    assert.match(libHtml, /data-action="purge-orphan-personas"/);
+    assert.match(libHtml, /无原图/);
+
+    // 2. Cancelling deletion of an orphan persona returns 'cancelled' and preserves data
+    confirmAnswer = false;
+    const cancelOrphan = await deleteNativePersona('orphan-1.png', context, api);
+    assert.equal(cancelOrphan, 'cancelled');
+    assert.equal(context.powerUserSettings.personas['orphan-1.png'], '原图已删的旧人设1');
+
+    // Cancelling native /persona-delete on an existing-file persona also returns 'cancelled' without error
+    const cancelKeep = await deleteNativePersona('keep.png', context, api);
+    assert.equal(cancelKeep, 'cancelled');
+    assert.equal(context.powerUserSettings.personas['keep.png'], '正常人设');
+
+    // 3. Confirming single deletion on orphan-1.png succeeds directly (bypassing ST's 404 trap), cleans locks, and switches active persona to keep.png
+    confirmAnswer = true;
+    const deletedSingle = await deleteNativePersona('orphan-1.png', context, api);
+    assert.equal(deletedSingle, true);
+    assert.equal('orphan-1.png' in context.powerUserSettings.personas, false);
+    assert.equal('orphan-1.png' in context.powerUserSettings.persona_descriptions, false);
+    assert.equal(context.powerUserSettings.default_persona, null);
+    assert.equal('persona' in context.chatMetadata, false);
+    assert.equal(selectedAvatar, 'keep.png');
+    assert.ok(saves >= 2);
+    assert.ok(metaSaves >= 1);
+
+    // 4. One-click batch purge cleans all remaining orphan personas while untouched valid personas remain safe
+    const batch = await purgeOrphanNativePersonas(null, { context, api });
+    assert.equal(batch.ok, true);
+    assert.deepEqual(batch.removed, ['orphan-2.png']);
+    assert.deepEqual(Object.keys(context.powerUserSettings.personas), ['keep.png']);
+  } finally {
+    clearLocalPersonaModificationsForTest();
+    globalThis.fetch = prevFetch;
+  }
 });
 
 

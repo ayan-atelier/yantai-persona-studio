@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.4",
+  "latest": "1.1.5",
   "releases": [
+    {
+      "version": "1.1.5",
+      "branch": "v1.1.5",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆残留人设清理与删除兜底修复版。修复此前单独删除了人设头像小图文件后，酒馆原生页面不再显示但人设馆仍残留记录、且因原生 /api/avatars/delete 返回 404 导致无法删除的卡死问题；启动与打开时自动巡检 /api/avatars/get，无原图的空白占位符自动静默清除，有文字设定的无原图残留人设支持单条正常删除或点击顶部「一键清理残留」批量移除（也可进入编辑补传新头像），并补齐删除后立即落盘保存与跨端防诈尸墓碑。"
+    },
     {
       "version": "1.1.4",
       "branch": "v1.1.4",
