@@ -39,7 +39,11 @@
 #persona-management-block.ytps-takeover > .persona_management_right_column { display:none !important; }
 #persona-management-block.ytps-takeover > #yt-persona-native-workspace { display:block !important; width:100% !important; max-width:none !important; min-width:0 !important; margin:0; }
 #PersonaManagement.ytps-drawer-takeover :is(.user_stats_button, #personas_backup, #personas_restore),
-#PersonaManagement:has(#persona-management-block.ytps-takeover) :is(.user_stats_button, #personas_backup, #personas_restore) { display:none !important; }
+#PersonaManagement:has(#persona-management-block.ytps-takeover) :is(.user_stats_button, #personas_backup, #personas_restore),
+#PersonaManagement#PersonaManagement.ytps-drawer-takeover > .flex-container:first-child > .flex-container:first-child,
+#PersonaManagement#PersonaManagement.ytps-drawer-takeover > .flex-container:first-child > .flex-container:first-child > .flex-container:last-child > :is(.user_stats_button, #personas_backup, #personas_restore, #create_dummy_persona) { display:none !important; }
+#PersonaManagement#PersonaManagement.ytps-drawer-takeover { padding:0 !important; }
+#PersonaManagement#PersonaManagement.ytps-drawer-takeover #persona-management-block.ytps-takeover > #yt-persona-native-workspace { border:0 !important; border-radius:0 !important; margin:0 !important; }
 #persona-management-block.ytps-native-edit { display:block !important; width:100% !important; min-width:0 !important; }
 #persona-management-block.ytps-native-edit > .persona_management_left_column { display:none !important; }
 #persona-management-block.ytps-native-edit > .persona_management_right_column { display:block !important; width:100% !important; max-width:none !important; }
@@ -251,7 +255,8 @@
 .ytps-editor-empty p { margin:0; }
 @keyframes ytps-shimmer { to { background-position:-200% 0; } }
 @media (max-width:700px) {
-  #yt-persona-native-workspace { margin-bottom:9px; }
+  #top-settings-holder #persona-management-button #PersonaManagement#PersonaManagement.ytps-drawer-takeover { left:0 !important; right:0 !important; width:100vw !important; max-width:100vw !important; padding:0 !important; border-left:0 !important; border-right:0 !important; border-top:0 !important; border-radius:0 0 10px 10px !important; }
+  #yt-persona-native-workspace { margin-bottom:0; }
   #yt-persona-native-workspace .ytps-tabs { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:1px; padding:4px; overflow-x:hidden; }
   #yt-persona-native-workspace .ytps-tab { width:100%; min-width:0; min-height:40px; justify-content:center; gap:3px; padding:5px 2px; font-size:clamp(11px,3vw,13px); white-space:nowrap; }
   #yt-persona-native-workspace .ytps-tab i { flex:none; font-size:12px; }

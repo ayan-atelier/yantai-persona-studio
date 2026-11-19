@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.5",
+  "latest": "1.1.6",
   "releases": [
+    {
+      "version": "1.1.6",
+      "branch": "v1.1.6",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆第三方美化主题（如观月札记）兼容与窄屏满宽精修版。双端采用高权重选择器 + 行内 !important 压制美化主题强行顶出的「使用统计 / 导出 / 导入」原生顶栏按钮（关闭接管时自动还原）；同时抹除 #PersonaManagement 抽屉外层的多余留白与多层边框套娃，让手机竖屏左右 100% 顶满舒展。"
+    },
     {
       "version": "1.1.5",
       "branch": "v1.1.5",

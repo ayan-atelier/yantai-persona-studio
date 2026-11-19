@@ -1414,13 +1414,44 @@ export function isNativePersonaPanelOpen() {
   const block = document.querySelector('#persona-management-block');
   return Boolean(block && !block.closest('.closedDrawer') && isElementVisible(block));
 }
+function syncTakeoverHeaderBarSuppression(drawer, suppress) {
+  if (!drawer || typeof drawer.querySelectorAll !== 'function') return;
+  const nodes = drawer.querySelectorAll(
+    '.user_stats_button, #personas_backup, #personas_restore, :scope > .flex-container:first-child > .flex-container:first-child',
+  );
+  for (const node of nodes) {
+    if (!node?.style) continue;
+    if (suppress) {
+      if (node.dataset && !Object.prototype.hasOwnProperty.call(node.dataset, 'ytpsOrigDisplay')) {
+        node.dataset.ytpsOrigDisplay = node.style.getPropertyValue?.('display') || node.style.display || '';
+      }
+      if (typeof node.style.setProperty === 'function') {
+        node.style.setProperty('display', 'none', 'important');
+      } else {
+        node.style.display = 'none';
+      }
+    } else if (node.dataset && Object.prototype.hasOwnProperty.call(node.dataset, 'ytpsOrigDisplay')) {
+      const orig = node.dataset.ytpsOrigDisplay || '';
+      if (typeof node.style.removeProperty === 'function') {
+        node.style.removeProperty('display');
+        if (orig) node.style.display = orig;
+      } else {
+        node.style.display = orig;
+      }
+      delete node.dataset.ytpsOrigDisplay;
+    }
+  }
+}
+
 export function setNativeTakeover(active = true) {
   const blocks = [...document.querySelectorAll('#persona-management-block')];
   if (!blocks.length) return false;
   for (const block of blocks) {
     block.classList.toggle('ytps-takeover', Boolean(active));
     block.classList.toggle('ytps-native-edit', false);
-    block.closest?.('#PersonaManagement')?.classList?.toggle('ytps-drawer-takeover', Boolean(active));
+    const drawer = block.closest?.('#PersonaManagement');
+    drawer?.classList?.toggle('ytps-drawer-takeover', Boolean(active));
+    syncTakeoverHeaderBarSuppression(drawer, Boolean(active));
   }
   return true;
 }
@@ -1430,7 +1461,9 @@ export function setNativeEditMode(active = true) {
   for (const block of blocks) {
     block.classList.toggle('ytps-takeover', false);
     block.classList.toggle('ytps-native-edit', Boolean(active));
-    block.closest?.('#PersonaManagement')?.classList?.toggle('ytps-drawer-takeover', false);
+    const drawer = block.closest?.('#PersonaManagement');
+    drawer?.classList?.toggle('ytps-drawer-takeover', false);
+    syncTakeoverHeaderBarSuppression(drawer, false);
   }
   return true;
 }
