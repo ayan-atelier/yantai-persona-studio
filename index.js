@@ -1788,18 +1788,25 @@ import { createSyncClient } from './sync-client.js';
       async choosePersonaLorebook(id) { return adapter.choosePersonaLorebook?.(id) || { cancelled: true }; },
       async duplicatePersona(id) { const ok = await adapter.duplicatePersona?.(id); if (ok) await refresh(); return ok; },
       async setBinding(scope, mode, personaId = null) {
-        // The compact UI deliberately presents one binding choice. Clear the
-        // other native locks first so selecting a second row never appears to
-        // get stuck behind the previous chat/card/default lock.
-        if (mode === 'none') {
-          for (const other of ['chat', 'card', 'global']) await adapter.setNativeBinding(other, null);
-          state.sessionOverride = null;
+        const run = async () => {
+          // The compact UI deliberately presents one binding choice. Clear the
+          // other native locks first so selecting a second row never appears to
+          // get stuck behind the previous chat/card/default lock.
+          if (mode === 'none') {
+            for (const other of ['chat', 'card', 'global']) await adapter.setNativeBinding(other, null);
+            state.sessionOverride = null;
+          } else {
+            for (const other of ['chat', 'card', 'global']) if (other !== scope) await adapter.setNativeBinding(other, null);
+            state.sessionOverride = null;
+          }
+          if (mode !== 'none') await adapter.setNativeBinding(scope, personaId);
+          await save();
+        };
+        if (typeof adapter.withPreservedOpeningSwipe === 'function') {
+          await adapter.withPreservedOpeningSwipe(run);
         } else {
-          for (const other of ['chat', 'card', 'global']) if (other !== scope) await adapter.setNativeBinding(other, null);
-          state.sessionOverride = null;
+          await run();
         }
-        if (mode !== 'none') await adapter.setNativeBinding(scope, personaId);
-        await save();
       },
       async usePersona(id) {
         const ok = await adapter.selectNativePersona(id);

@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.6",
+  "latest": "1.1.7",
   "releases": [
+    {
+      "version": "1.1.7",
+      "branch": "v1.1.7",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆多开场白保护修复版。修复在多开场白角色卡开局第 0 楼选好开场白后，切换或点击「绑定当前存档」因酒馆原生 retriggerFirstMessageOnEmptyChat 重建首楼导致开场白跳回第 1 个（#0）的问题；现自动锁定并还原已选开场白页码，同时将当前开场白内的 {{user}} 实时刷新为新人设名并同步触发 MESSAGE_SWIPED。"
+    },
     {
       "version": "1.1.6",
       "branch": "v1.1.6",

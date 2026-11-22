@@ -814,21 +814,169 @@ async function executeNativeCommand(command, context) {
 }
 function escapeSelector(value) { return globalThis.CSS?.escape ? CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&'); }
 function findNativeCard(id) { return document.querySelector('#user_avatar_block .avatar-container[data-avatar-id="' + escapeSelector(id) + '"], #user_avatar_block [data-avatar-id="' + escapeSelector(id) + '"]'); }
+let openingSwipeGuardDepth = 0;
+let capturedOpeningSwipeSnap = null;
+
+function captureOpeningSwipeState(context) {
+  if (!context || context.groupId) return null;
+  const chat = context.chat;
+  if (!Array.isArray(chat) || chat.length !== 1) return null;
+  const msg0 = chat[0];
+  if (!msg0 || msg0.is_user || msg0.is_system) return null;
+  const swipeId = Number(msg0.swipe_id);
+  if (!Number.isInteger(swipeId) || swipeId <= 0) return null;
+  if (!Array.isArray(msg0.swipes) || swipeId >= msg0.swipes.length) return null;
+  const infoItem = Array.isArray(msg0.swipe_info) ? msg0.swipe_info[swipeId] : null;
+  return {
+    characterId: String(context.characterId ?? ''),
+    chatKey: String(getChatId(context) || ''),
+    swipeId,
+    swipeInfo: infoItem && typeof infoItem === 'object' ? JSON.parse(JSON.stringify(infoItem)) : null,
+  };
+}
+
+async function restoreOpeningSwipeState(snap, context = getStContext()) {
+  if (!snap || !context || context.groupId) return false;
+  if (String(context.characterId ?? '') !== snap.characterId) return false;
+  const curChatKey = String(getChatId(context) || '');
+  if (snap.chatKey && curChatKey && curChatKey !== snap.chatKey) return false;
+
+  const chat = context.chat;
+  if (!Array.isArray(chat) || chat.length !== 1) return false;
+  const msg0 = chat[0];
+  if (!msg0 || msg0.is_user || msg0.is_system) return false;
+  if (!Array.isArray(msg0.swipes) || snap.swipeId >= msg0.swipes.length) return false;
+  if (Number(msg0.swipe_id) === snap.swipeId) return false;
+
+  const rawTemplate = String(msg0.swipes[snap.swipeId] ?? '');
+  msg0.swipe_id = snap.swipeId;
+  msg0.mes = rawTemplate;
+  if (snap.swipeInfo && Array.isArray(msg0.swipe_info)) {
+    msg0.swipe_info[snap.swipeId] = {
+      ...(msg0.swipe_info[snap.swipeId] && typeof msg0.swipe_info[snap.swipeId] === 'object'
+        ? msg0.swipe_info[snap.swipeId]
+        : {}),
+      ...snap.swipeInfo,
+    };
+  }
+  if (msg0.extra && typeof msg0.extra === 'object' && 'display_text' in msg0.extra) {
+    delete msg0.extra.display_text;
+  }
+
+  const scriptMod =
+    cachedScriptModule ||
+    (typeof context?.updateMessageBlock === 'function' ? null : await scriptApi());
+  const updateBlock = context?.updateMessageBlock || scriptMod?.updateMessageBlock;
+  let renderedByHost = false;
+  if (typeof updateBlock === 'function') {
+    try {
+      updateBlock.call(context, 0, msg0, { rerenderMessage: true });
+      renderedByHost = true;
+    } catch {
+      renderedByHost = false;
+    }
+  }
+
+  const liveUser = String(scriptMod?.name1 ?? context?.name1 ?? '').trim();
+  const liveChar = String(
+    msg0.name ?? context?.characters?.[context?.characterId]?.name ?? context?.name2 ?? '',
+  ).trim();
+  if (msg0.mes === rawTemplate && typeof context?.substituteParams === 'function') {
+    try {
+      msg0.mes = context.substituteParams(rawTemplate, liveUser || undefined, liveChar || undefined);
+    } catch {
+      // ignore
+    }
+  } else if (msg0.mes === rawTemplate && liveUser) {
+    msg0.mes = rawTemplate.replace(/\{\{user\}\}/gi, liveUser);
+  }
+  if (Array.isArray(msg0.swipes) && snap.swipeId < msg0.swipes.length) {
+    msg0.swipes[snap.swipeId] = msg0.mes;
+  }
+
+  const doc = globalThis.document;
+  const mesNode = doc?.querySelector?.('#chat .mes[mesid="0"]') || null;
+  if (mesNode) {
+    if (!renderedByHost) {
+      const textEl = mesNode.querySelector?.('.mes_text');
+      if (textEl) {
+        if (typeof context?.messageFormatting === 'function') {
+          textEl.innerHTML = context.messageFormatting(
+            rawTemplate,
+            liveChar,
+            Boolean(msg0.is_system),
+            Boolean(msg0.is_user),
+            0,
+          );
+        } else {
+          textEl.textContent = msg0.mes;
+        }
+      }
+    }
+    const counterEl = mesNode.querySelector?.('.swipes-counter');
+    if (counterEl && msg0.swipes.length > 1) {
+      counterEl.textContent = `${snap.swipeId + 1}/${msg0.swipes.length}`;
+    }
+  }
+
+  try {
+    context?.swipe?.refresh?.();
+  } catch {
+    // ignore
+  }
+
+  await emitNativeEvent(context, 'MESSAGE_SWIPED', 0);
+  const chatSaver =
+    context?.saveChatConditional ??
+    scriptMod?.saveChatConditional ??
+    context?.saveChat ??
+    scriptMod?.saveChat;
+  if (typeof chatSaver === 'function') {
+    try {
+      await Promise.resolve(chatSaver.call(context));
+    } catch {
+      // ignore
+    }
+  }
+  return true;
+}
+
+export async function withPreservedOpeningSwipe(fn, context = getStContext()) {
+  if (openingSwipeGuardDepth === 0) {
+    capturedOpeningSwipeSnap = captureOpeningSwipeState(context);
+  }
+  openingSwipeGuardDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    openingSwipeGuardDepth = Math.max(0, openingSwipeGuardDepth - 1);
+    if (openingSwipeGuardDepth === 0) {
+      const snap = capturedOpeningSwipeSnap;
+      capturedOpeningSwipeSnap = null;
+      if (snap) {
+        await restoreOpeningSwipeState(snap, context);
+      }
+    }
+  }
+}
+
 export async function selectNativePersona(id, context = getStContext(), api = null) {
   if (!id) return false;
-  const setter = [api?.setUserAvatar, api?.selectPersona, api?.setPersona, context?.selectPersona, context?.setPersona, context?.setUserAvatar].find(fn => typeof fn === 'function');
-  if (setter) {
-    await Promise.resolve(setter.call(api || context, id));
-    await syncActivePersonaUserName(context, api);
-    return true;
-  }
-  const card = findNativeCard(id);
-  if (card) {
-    card.click();
-    await syncActivePersonaUserName(context, api);
-    return true;
-  }
-  return false;
+  return withPreservedOpeningSwipe(async () => {
+    const setter = [api?.setUserAvatar, api?.selectPersona, api?.setPersona, context?.selectPersona, context?.setPersona, context?.setUserAvatar].find(fn => typeof fn === 'function');
+    if (setter) {
+      await Promise.resolve(setter.call(api || context, id));
+      await syncActivePersonaUserName(context, api);
+      return true;
+    }
+    const card = findNativeCard(id);
+    if (card) {
+      card.click();
+      await syncActivePersonaUserName(context, api);
+      return true;
+    }
+    return false;
+  }, context);
 }
 export async function setNativeDefaultPersona(id, context = getStContext(), api = null) {
   await syncNativePersonasFromServer({ context, api, preferServer: true });
@@ -1293,73 +1441,75 @@ export async function choosePersonaLorebook(id, context = getStContext(), api = 
   return { cancelled: false, lorebook };
 }
 export async function setNativeBinding(scope, id, context = getStContext(), api = null) {
-  const native = api || await nativeApi();
-  if (scope === 'global') {
-    if (!id) {
-      const settings = powerSettings(context);
-      const locked = settings.default_persona ?? settings.defaultPersona ?? null;
-      if (locked) {
-        if (typeof native?.setPersonaLockState === 'function') {
-          await selectNativePersona(locked, context, native);
-          await native.setPersonaLockState(false, 'default');
-        } else {
-          delete settings.default_persona;
-          delete settings.defaultPersona;
-          const saver = context.saveSettingsDebounced ?? context.saveSettings;
-          if (typeof saver === 'function') await Promise.resolve(saver.call(context));
+  return withPreservedOpeningSwipe(async () => {
+    const native = api || await nativeApi();
+    if (scope === 'global') {
+      if (!id) {
+        const settings = powerSettings(context);
+        const locked = settings.default_persona ?? settings.defaultPersona ?? null;
+        if (locked) {
+          if (typeof native?.setPersonaLockState === 'function') {
+            await selectNativePersona(locked, context, native);
+            await native.setPersonaLockState(false, 'default');
+          } else {
+            delete settings.default_persona;
+            delete settings.defaultPersona;
+            const saver = context.saveSettingsDebounced ?? context.saveSettings;
+            if (typeof saver === 'function') await Promise.resolve(saver.call(context));
+          }
+          await emitNativeEvent(context, 'PERSONA_UPDATED', null);
         }
-        await emitNativeEvent(context, 'PERSONA_UPDATED', null);
+        return true;
+      }
+      const settings = powerSettings(context);
+      if (String(settings.default_persona) !== String(id)) {
+        await selectNativePersona(id, context, native);
+        if (typeof native?.setPersonaLockState === 'function') await native.setPersonaLockState(true, 'default');
+        else await setNativeDefaultPersona(id, context, native);
       }
       return true;
     }
+    if (scope === 'session') return id ? selectNativePersona(id, context, native) : false;
+
     const settings = powerSettings(context);
-    if (String(settings.default_persona) !== String(id)) {
-      await selectNativePersona(id, context, native);
-      if (typeof native?.setPersonaLockState === 'function') await native.setPersonaLockState(true, 'default');
-      else await setNativeDefaultPersona(id, context, native);
-    }
-    return true;
-  }
-  if (scope === 'session') return id ? selectNativePersona(id, context, native) : false;
-
-  const settings = powerSettings(context);
-  if (scope === 'chat') {
-    const metadata = getChatMetadata(context);
-    if (id) {
-      await selectNativePersona(id, context, native);
-      if (typeof native?.setPersonaLockState === 'function') await native.setPersonaLockState(true, 'chat');
-      else metadata.persona = String(id);
-    } else {
-      const locked = metadata.persona;
-      if (locked) {
-        await selectNativePersona(locked, context, native);
-        if (typeof native?.setPersonaLockState === 'function') await native.setPersonaLockState(false, 'chat');
-        else delete metadata.persona;
+    if (scope === 'chat') {
+      const metadata = getChatMetadata(context);
+      if (id) {
+        await selectNativePersona(id, context, native);
+        if (typeof native?.setPersonaLockState === 'function') await native.setPersonaLockState(true, 'chat');
+        else metadata.persona = String(id);
+      } else {
+        const locked = metadata.persona;
+        if (locked) {
+          await selectNativePersona(locked, context, native);
+          if (typeof native?.setPersonaLockState === 'function') await native.setPersonaLockState(false, 'chat');
+          else delete metadata.persona;
+        }
       }
+      if (typeof native?.setPersonaLockState !== 'function') {
+        const saver = context.saveMetadata ?? context.saveMetadataDebounced ?? context.saveChatDebounced;
+        if (typeof saver === 'function') await Promise.resolve(saver.call(context));
+      }
+      await emitNativeEvent(context, 'PERSONA_UPDATED', id || null);
+      return true;
     }
-    if (typeof native?.setPersonaLockState !== 'function') {
-      const saver = context.saveMetadata ?? context.saveMetadataDebounced ?? context.saveChatDebounced;
-      if (typeof saver === 'function') await Promise.resolve(saver.call(context));
-    }
-    await emitNativeEvent(context, 'PERSONA_UPDATED', id || null);
-    return true;
-  }
 
-  if (scope === 'card') {
-    if (typeof native?.setPersonaLockState !== 'function') return false;
-    const locked = nativeLockCandidates(settings, context).card;
-    if (id) {
-      await selectNativePersona(id, context, native);
-      await native.setPersonaLockState(true, 'character');
-    } else if (locked) {
-      await selectNativePersona(locked, context, native);
-      await native.setPersonaLockState(false, 'character');
+    if (scope === 'card') {
+      if (typeof native?.setPersonaLockState !== 'function') return false;
+      const locked = nativeLockCandidates(settings, context).card;
+      if (id) {
+        await selectNativePersona(id, context, native);
+        await native.setPersonaLockState(true, 'character');
+      } else if (locked) {
+        await selectNativePersona(locked, context, native);
+        await native.setPersonaLockState(false, 'character');
+      }
+      await emitNativeEvent(context, 'PERSONA_UPDATED', id || null);
+      return true;
     }
-    await emitNativeEvent(context, 'PERSONA_UPDATED', id || null);
-    return true;
-  }
 
-  return false;
+    return false;
+  }, context);
 }
 export function isElementVisible(item) {
   if (!item || item.hidden) return false;
@@ -1686,6 +1836,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async (id, options = {}) => deleteNativePersona(id, context(), await loadNativeApi(), options), purgeOrphanPersonas: async (ids = null, options = {}) => purgeOrphanNativePersonas(ids, { ...options, context: context(), api: await loadNativeApi() }), reconcileMissingAvatarPersonas: async () => reconcileMissingAvatarPersonas({ context: context(), api: await loadNativeApi() }), fetchExistingAvatarFiles: async (options = {}) => fetchExistingAvatarFiles({ ...options, context: context() }), flushNativeSettingsSave: async () => flushNativeSettingsSave(context()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, isPersonaDeletedLocally, markAvatarFileAdded, markAvatarFileRemoved, markPersonaModifiedLocally, isPersonaModifiedLocally, hasRecentLocalPersonaMutation, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), native, explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async (id, options = {}) => deleteNativePersona(id, context(), await loadNativeApi(), options), purgeOrphanPersonas: async (ids = null, options = {}) => purgeOrphanNativePersonas(ids, { ...options, context: context(), api: await loadNativeApi() }), reconcileMissingAvatarPersonas: async () => reconcileMissingAvatarPersonas({ context: context(), api: await loadNativeApi() }), fetchExistingAvatarFiles: async (options = {}) => fetchExistingAvatarFiles({ ...options, context: context() }), flushNativeSettingsSave: async () => flushNativeSettingsSave(context()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, isPersonaDeletedLocally, markAvatarFileAdded, markAvatarFileRemoved, markPersonaModifiedLocally, isPersonaModifiedLocally, hasRecentLocalPersonaMutation, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), native, explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), withPreservedOpeningSwipe: fn => withPreservedOpeningSwipe(fn, context()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

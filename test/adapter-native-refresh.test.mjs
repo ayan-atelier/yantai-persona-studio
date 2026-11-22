@@ -27,6 +27,9 @@ import {
   reconcileMissingAvatarPersonas,
   purgeOrphanNativePersonas,
   isPersonaDeletedLocally,
+  selectNativePersona,
+  setNativeBinding,
+  withPreservedOpeningSwipe,
 } from '../adapter.js';
 import { createApp } from '../ui.js';
 
@@ -723,6 +726,98 @@ test('missing avatar thumbnails: auto-prunes empty [Unnamed Persona] ghosts and 
     clearLocalPersonaModificationsForTest();
     globalThis.fetch = prevFetch;
   }
+});
+
+test('binding persona to current chat on opening floor preserves non-zero swipe_id and updates {{user}} macro', async () => {
+  const swipedEvents = [];
+  let chatSaved = 0;
+
+  const context = {
+    characterId: 0,
+    groupId: null,
+    chatId: 'song-chat-au',
+    name1: '旧名字',
+    name2: '宋仲庭',
+    characters: [{ avatar: '宋仲庭.png', name: '宋仲庭' }],
+    chatMetadata: {},
+    powerUserSettings: {
+      default_persona: 'default-p.png',
+      personas: {
+        'default-p.png': '默认路人',
+        'au-palace.png': '沈昭宁',
+      },
+      persona_descriptions: {
+        'default-p.png': { description: '默认' },
+        'au-palace.png': { description: '大雍长公主' },
+      },
+    },
+    chat: [
+      {
+        name: '宋仲庭',
+        is_user: false,
+        is_system: false,
+        swipe_id: 2,
+        mes: '大雍东宫夜雪，旧名字立于廊下。',
+        swipes: [
+          '现代主线开场，{{user}}你好。',
+          '边防开场，{{user}}来了。',
+          '大雍东宫夜雪，{{user}}立于廊下。',
+        ],
+        swipe_info: [{ send_date: 't0' }, { send_date: 't1' }, { send_date: 't2', extra: { au: 'palace' } }],
+      },
+    ],
+    eventTypes: { MESSAGE_SWIPED: 'message_swiped', PERSONA_UPDATED: 'persona_updated' },
+    eventSource: {
+      async emit(type, payload) {
+        if (type === 'message_swiped') swipedEvents.push(payload);
+      },
+    },
+    substituteParams(str, u) {
+      return String(str).replace(/\{\{user\}\}/gi, u || context.name1);
+    },
+    async saveChatConditional() {
+      chatSaved += 1;
+    },
+  };
+
+  const mockNativeApi = {
+    user_avatar: 'default-p.png',
+    async setUserAvatar(id) {
+      this.user_avatar = id;
+      context.name1 = context.powerUserSettings.personas[id] || context.name1;
+      // Simulate SillyTavern's retriggerFirstMessageOnEmptyChat() -> createOrEditCharacter() resetting swipe_id to 0!
+      context.chat[0] = {
+        name: '宋仲庭',
+        is_user: false,
+        is_system: false,
+        swipe_id: 0,
+        mes: `现代主线开场，${context.name1}你好。`,
+        swipes: [
+          `现代主线开场，${context.name1}你好。`,
+          '边防开场，{{user}}来了。',
+          '大雍东宫夜雪，{{user}}立于廊下。',
+        ],
+        swipe_info: [{ send_date: 't0' }, { send_date: 't1' }, { send_date: 't2' }],
+      };
+    },
+    async setPersonaLockState(state, type) {
+      if (type === 'default' && !state) delete context.powerUserSettings.default_persona;
+      if (type === 'chat' && state) context.chatMetadata.persona = this.user_avatar;
+    },
+  };
+
+  // Simulate setBinding('chat', 'bind', 'au-palace.png') clearing 'global' first, then locking 'chat'
+  await withPreservedOpeningSwipe(async () => {
+    await setNativeBinding('global', null, context, mockNativeApi);
+    await setNativeBinding('chat', 'au-palace.png', context, mockNativeApi);
+  }, context);
+
+  assert.equal(context.chatMetadata.persona, 'au-palace.png');
+  assert.equal(context.chat[0].swipe_id, 2, '开场白页码必须保持在原本选好的第 3 个，绝不跳回第 1 个');
+  assert.equal(context.chat[0].mes, '大雍东宫夜雪，沈昭宁立于廊下。', '当前开场白内的 {{user}} 已同步更新为新人设名');
+  assert.deepEqual(context.chat[0].swipe_info[2]?.extra, { au: 'palace' }, '保留原 swipe_info 扩展字段');
+  assert.deepEqual(swipedEvents, [0], '触发 MESSAGE_SWIPED 保持角色卡开场白联动脚本同步');
+  assert.equal(chatSaved, 1);
 });
 
 

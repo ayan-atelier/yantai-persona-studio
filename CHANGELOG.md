@@ -1,4 +1,10 @@
 # Changelog
+## 1.1.7
+
+- **修复多开场白角色卡开局第 0 楼切换人设或「绑定当前存档」跳回第 1 个开场白的问题**：
+  - 酒馆原生 `personas.js` 在 `chat.length === 1` 时调用 `setUserAvatar` 会触发 `retriggerFirstMessageOnEmptyChat() -> createOrEditCharacter()`，将第 0 楼重置回 `swipe_id = 0`；
+  - 现通过外层嵌套守卫 `withPreservedOpeningSwipe` 在切换人设或变更归属锁前后自动锁定当前选定的 `swipe_id` 与附加状态，待酒馆刷新 `swipes` 后无感还原回原开场白页码、将当前页 `{{user}}` 替换为新人设名称，并派发 `MESSAGE_SWIPED` 保持开场白联动脚本状态一致。
+
 ## 1.1.6
 
 - **第三方美化主题（如观月札记）兼容与手机窄屏满宽精修**：
