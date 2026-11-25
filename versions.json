@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.7",
+  "latest": "1.1.8",
   "releases": [
+    {
+      "version": "1.1.8",
+      "branch": "v1.1.8",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆新手体验头像内置版。首次打开空图库时自动预置 4 张精选高清主控体验头像（古风/现代女/现代男/潮酷男，可直接点击「设为头像」裁切启用），卡片注明「内置体验图 · 可删除」，删除后记入跨端墓碑永不复活，且绝不打扰已有自建图库的老用户。"
+    },
     {
       "version": "1.1.7",
       "branch": "v1.1.7",

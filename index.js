@@ -304,11 +304,42 @@ import { createSyncClient } from './sync-client.js';
     syncClient = createSyncClient({ getRequestHeaders: getDynamicHeaders, clientVersion: VERSION });
   }
 
+  function buildStarterGalleryItems() {
+    const defs = [
+      { id: 'starter_avatar_01', file: 'starter-01-gufeng.jpg', name: '莲池青衫（古风示例）' },
+      { id: 'starter_avatar_02', file: 'starter-02-modern-f.jpg', name: '奶霜卷发（现代女示例）' },
+      { id: 'starter_avatar_03', file: 'starter-03-silver-m.jpg', name: '银发少年（现代男示例）' },
+      { id: 'starter_avatar_04', file: 'starter-04-street-m.jpg', name: '海畔红挑（潮酷男示例）' },
+    ];
+    return defs.map((def, idx) => {
+      let url = `./scripts/extensions/third-party/yantai-persona-studio/assets/starter-avatars/${def.file}`;
+      try {
+        url = new URL(`./assets/starter-avatars/${def.file}`, import.meta.url).pathname;
+      } catch (_) { /* fallback to relative path */ }
+      const stamp = 1000 + (defs.length - idx);
+      return {
+        id: def.id,
+        kind: 'avatar',
+        name: def.name,
+        mime: 'image/jpeg',
+        size: 0,
+        hash: def.id,
+        createdAt: stamp,
+        updatedAt: stamp,
+        remoteUrl: url,
+        url,
+        previewUrl: url,
+        source: 'starter',
+        isStarter: true,
+      };
+    });
+  }
+
   function defaultState() {
     // Persona folders belong to the extension organiser rather than the
     // native persona store.  A missing groupId deliberately means “未分类”,
     // so older settings remain compatible without a migration pass.
-    return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, assistantThreads: {}, assistantGlobalClearedAt: 0, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
+    return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, starterGallerySeeded: false, assistantThreads: {}, assistantGlobalClearedAt: 0, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
   }
 
   function sharedState(source = state) {
@@ -331,7 +362,7 @@ import { createSyncClient } from './sync-client.js';
       shared.gallerySync = gallerySync;
     }
     if (Array.isArray(shared.gallery)) {
-      const fields = ['id', 'kind', 'name', 'mime', 'size', 'hash', 'createdAt', 'updatedAt', 'remoteUrl', 'previewUrl', 'thumbnailUrl', 'remoteResetAt', 'source', 'avatarId'];
+      const fields = ['id', 'kind', 'name', 'mime', 'size', 'hash', 'createdAt', 'updatedAt', 'remoteUrl', 'previewUrl', 'thumbnailUrl', 'remoteResetAt', 'source', 'avatarId', 'isStarter'];
       shared.gallery = shared.gallery.map(item => {
         const copy = {};
         for (const field of fields) if (item?.[field] !== undefined) copy[field] = item[field];
@@ -402,13 +433,14 @@ import { createSyncClient } from './sync-client.js';
     );
     return hasMeta
       || Array.isArray(shared.personaGroups) && shared.personaGroups.length > 0
-      || Array.isArray(shared.gallery) && shared.gallery.length > 0
+      || Array.isArray(shared.gallery) && shared.gallery.some(item => !item?.isStarter)
       || Object.values(shared.assistantThreads || {}).some(thread => Array.isArray(thread?.turns) && thread.turns.length > 0)
       || Array.isArray(shared.drafts) && shared.drafts.length > 0
       || Boolean(shared.gallerySync);
   }
   function mergeSharedState(remote = {}, local = {}) {
     const result = { ...local, ...remote };
+    result.starterGallerySeeded = Boolean(local.starterGallerySeeded || remote.starterGallerySeeded);
     const assistantGlobalClearedAt = Math.max(Number(remote.assistantGlobalClearedAt || 0), Number(local.assistantGlobalClearedAt || 0));
     const survivesAssistantClear = turn => assistantGlobalClearedAt <= 0 || Number(turn?.at || 0) > assistantGlobalClearedAt;
     result.assistantGlobalClearedAt = assistantGlobalClearedAt;
@@ -686,6 +718,20 @@ import { createSyncClient } from './sync-client.js';
       const image = /^image\//i.test(String(item?.mime || ''));
       return !image || Boolean(String(item?.url || item?.remoteUrl || item?.previewUrl || '').trim());
     });
+    let seededStarterGallery = false;
+    if (!state.starterGallerySeeded) {
+      const hasExisting = state.gallery.length > 0 || Object.keys(state.galleryRemoved || {}).length > 0;
+      state.starterGallerySeeded = true;
+      if (!hasExisting) {
+        const starters = buildStarterGalleryItems().filter(
+          item => Number(state.galleryRemoved[item.id] || 0) < Number(item.updatedAt || 0),
+        );
+        if (starters.length) {
+          state.gallery = storage.mergeGallery(state.gallery, starters);
+        }
+        seededStarterGallery = true;
+      }
+    }
     // Existing installs may contain local-only images from the old sync path
     // data-URL sync. Mark them for one-time server migration after the app is
     // ready; the local Blob remains usable even if upload is unavailable.
@@ -713,7 +759,7 @@ import { createSyncClient } from './sync-client.js';
       ? capturePersonaSnapshots(adapter.readNativePersonas?.() || [], { initialSeed: true })
       : false;
     stateHydratedPromise = null;
-    if ((seededSnapshots || bootRemovedGhosts || repairedTurns || shouldFlushPending) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
+    if ((seededSnapshots || seededStarterGallery || bootRemovedGhosts || repairedTurns || shouldFlushPending) && (syncStatus === 'ready' || syncStatus === 'host-ready')) {
       void save({ syncGallery: shouldFlushPending });
     }
     return state;
@@ -1877,7 +1923,7 @@ import { createSyncClient } from './sync-client.js';
       },
       async openNativeEdit(id) { editMode = true; adapter.setNativeEditMode(true); app?.close(); await adapter.selectNativePersona(id); await adapter.focusNativePersona(id); report('已切换到酒馆原生编辑区；编辑完成后关闭并重新打开人设按钮即可回到砚台工作区。', 'info'); },
       async addGalleryAssets(files, kind = null) { const added = await storage.importFiles(files, { kind }); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; for (const item of added) delete state.galleryRemoved[item.id]; state.gallery = storage.mergeGallery(state.gallery, added); gallerySyncDirty = true; await save(); return added; },
-      async removeGalleryAsset(id) { const removedItem = state.gallery.find(item => String(item?.id || '') === String(id)); await Promise.resolve(adapter.deleteGalleryAsset?.(removedItem?.remoteUrl)).catch(() => {}); state.gallery = state.gallery.filter(item => item.id !== id); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; state.galleryRemoved[String(id)] = Date.now(); storage.releasePreview?.(id); await storage.remove(id); gallerySyncDirty = true; await save(); },
+      async removeGalleryAsset(id) { const removedItem = state.gallery.find(item => String(item?.id || '') === String(id)); if (!removedItem?.isStarter) { await Promise.resolve(adapter.deleteGalleryAsset?.(removedItem?.remoteUrl)).catch(() => {}); } state.gallery = state.gallery.filter(item => item.id !== id); state.galleryRemoved = state.galleryRemoved && typeof state.galleryRemoved === 'object' ? state.galleryRemoved : {}; state.galleryRemoved[String(id)] = Date.now(); storage.releasePreview?.(id); await storage.remove(id); gallerySyncDirty = true; await save(); },
       async uploadGalleryAvatar(id, targetPersonaId = '') {
         const asset = await storage.getAsset(id).catch(() => null);
         let blob = asset?.blob;
