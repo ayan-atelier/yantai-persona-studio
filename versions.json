@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "extension": "yantai-persona-studio",
-  "latest": "1.1.8",
+  "latest": "1.1.9",
   "releases": [
+    {
+      "version": "1.1.9",
+      "branch": "v1.1.9",
+      "settings_schema": 3,
+      "minimum_client_version": "1.16.0",
+      "notes": "砚台 · 人设馆多标签与第三方人设标签零迁移兼容版。新增人设多标签系统（莫兰迪 8 色自选 + 智能反色、回车/逗号快添、常用标签一键复用、点击卡片标签多选交集筛选、搜索框支持搜标签名、跨设备同步与导出保留）；无标签人设保持零占位清爽留白；同时自动无损兼容读取 XiaoBai20001212/persona-tags、Samueras/PersonaTags 与 LukaTheHero/SillyTavern-PersonaTools 已打好的旧标签，老用户更新后直接亮显无需重打。"
+    },
     {
       "version": "1.1.8",
       "branch": "v1.1.8",

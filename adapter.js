@@ -368,6 +368,192 @@ async function scriptApi() {
   return scriptModulePromise;
 }
 
+export const PERSONA_TAG_PALETTE = [
+  '#6e8577', // 苔青
+  '#8b6f8e', // 烟紫
+  '#b88454', // 琥珀
+  '#a86762', // 陶红
+  '#5f7f96', // 石青
+  '#7a825d', // 橄榄
+  '#967680', // 藕粉
+  '#6b7280', // 黛灰
+];
+
+const SAFE_TAG_COLOR_RE = /^(?:#[0-9a-f]{3}|#[0-9a-f]{6}|rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\)|rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*(?:0|1|0?\.\d+)\s*\)|hsl\(\s*\d{1,3}(?:deg)?\s*,\s*\d{1,3}%\s*,\s*\d{1,3}%\s*\))$/i;
+
+export function normalizeTagColor(color, fallbackName = '') {
+  const raw = String(color || '').trim();
+  if (raw && SAFE_TAG_COLOR_RE.test(raw)) return raw;
+  const seed = String(fallbackName || '').trim().toLocaleLowerCase();
+  if (!seed) return PERSONA_TAG_PALETTE[0];
+  const hash = parseInt(fnv1a(seed), 16) || 0;
+  return PERSONA_TAG_PALETTE[hash % PERSONA_TAG_PALETTE.length];
+}
+
+export function contrastTagTextColor(color) {
+  const raw = String(color || '').trim();
+  let r = 110; let g = 133; let b = 119;
+  const hex3 = raw.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/i);
+  const hex6 = raw.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+  const rgb = raw.match(/^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i);
+  if (hex3) {
+    r = parseInt(hex3[1] + hex3[1], 16);
+    g = parseInt(hex3[2] + hex3[2], 16);
+    b = parseInt(hex3[3] + hex3[3], 16);
+  } else if (hex6) {
+    r = parseInt(hex6[1], 16);
+    g = parseInt(hex6[2], 16);
+    b = parseInt(hex6[3], 16);
+  } else if (rgb) {
+    r = Math.min(255, Number(rgb[1]) || 0);
+    g = Math.min(255, Number(rgb[2]) || 0);
+    b = Math.min(255, Number(rgb[3]) || 0);
+  } else {
+    return '#f8f6f2';
+  }
+  const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return lum > 0.62 ? '#1e1c1a' : '#f8f6f2';
+}
+
+export function normalizePersonaTagList(tags) {
+  const items = Array.isArray(tags)
+    ? tags
+    : (typeof tags === 'string' ? tags.split(/[,，、;\n]+/) : []);
+  const out = [];
+  const seen = new Set();
+  for (const item of items) {
+    const raw = typeof item === 'object' && item !== null ? item.name : item;
+    const label = String(raw ?? '').trim().replace(/^#+/, '').replace(/\s+/g, ' ').slice(0, 24);
+    if (!label) continue;
+    const key = label.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(label);
+    if (out.length >= 16) break;
+  }
+  return out;
+}
+
+export function normalizePersonaTagCatalog(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const byKey = new Map();
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') continue;
+    const name = String(entry.name || '').trim().replace(/^#+/, '').replace(/\s+/g, ' ').slice(0, 24);
+    if (!name) continue;
+    const key = name.toLocaleLowerCase();
+    const updatedAt = Number(entry.updatedAt || entry.createdAt || 0) || 1;
+    const prev = byKey.get(key);
+    if (!prev || updatedAt >= prev.updatedAt) {
+      byKey.set(key, {
+        name,
+        color: normalizeTagColor(entry.color, name),
+        updatedAt,
+      });
+    }
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * Non-destructively read persona tags created by popular third-party SillyTavern
+ * persona tag plugins (`XiaoBai20001212/persona-tags`, `LukaTheHero/SillyTavern-PersonaTools`,
+ * and `Samueras/PersonaTags`) so existing tagged personas display immediately with zero migration.
+ */
+export function readExternalPersonaTags(context = getStContext(), scriptMod = cachedScriptModule) {
+  const byPersonaId = {};
+  const catalogByKey = new Map();
+  const ext = context?.extensionSettings && typeof context.extensionSettings === 'object'
+    ? context.extensionSettings
+    : {};
+  const sources = [
+    ['persona-tags', ext.personaTags],
+    ['persona-tags', ext['persona-tags']],
+    ['PersonaTools', ext.PersonaTools],
+    ['PersonaTools', ext['SillyTavern-PersonaTools']],
+    ['PersonaTags', scriptMod?.settings],
+    ['PersonaTags', context?.settings],
+    ['PersonaTags', ext],
+    ['PersonaTags', ext.PersonaTags],
+  ];
+
+  const seenObjects = new Set();
+  for (const [sourceName, container] of sources) {
+    if (!container || typeof container !== 'object' || seenObjects.has(container)) continue;
+    seenObjects.add(container);
+    const rawTags = Array.isArray(container.persona_tags)
+      ? container.persona_tags
+      : (Array.isArray(container.personaTags) ? container.personaTags : null);
+    const rawMap = (container.persona_tag_map && typeof container.persona_tag_map === 'object' && !Array.isArray(container.persona_tag_map))
+      ? container.persona_tag_map
+      : ((container.personaTagMap && typeof container.personaTagMap === 'object' && !Array.isArray(container.personaTagMap))
+        ? container.personaTagMap
+        : ((container.tagMap && typeof container.tagMap === 'object' && !Array.isArray(container.tagMap))
+          ? container.tagMap
+          : null));
+    const rawOrder = Array.isArray(container.tagOrder) ? container.tagOrder : null;
+    if (!rawTags && !rawMap) continue;
+
+    const idToDef = new Map();
+    for (const rawDef of rawTags || []) {
+      if (!rawDef || typeof rawDef !== 'object') continue;
+      const name = String(rawDef.name || '').trim().replace(/^#+/, '').replace(/\s+/g, ' ').slice(0, 24);
+      if (!name) continue;
+      const color = normalizeTagColor(rawDef.color, name);
+      const idKey = rawDef.id !== undefined && rawDef.id !== null ? String(rawDef.id) : name;
+      const def = { name, color, source: sourceName };
+      idToDef.set(idKey, def);
+      idToDef.set(name.toLocaleLowerCase(), def);
+      const lower = name.toLocaleLowerCase();
+      if (!catalogByKey.has(lower)) {
+        catalogByKey.set(lower, def);
+      }
+    }
+
+    if (rawOrder) {
+      for (const orderedNameRaw of rawOrder) {
+        const name = String(orderedNameRaw || '').trim().replace(/^#+/, '').replace(/\s+/g, ' ').slice(0, 24);
+        if (!name) continue;
+        const lower = name.toLocaleLowerCase();
+        if (!catalogByKey.has(lower)) {
+          catalogByKey.set(lower, { name, color: normalizeTagColor('', name), source: sourceName });
+        }
+      }
+    }
+
+    if (!rawMap) continue;
+    for (const [avatarIdRaw, assigned] of Object.entries(rawMap)) {
+      const avatarId = String(avatarIdRaw || '').trim();
+      if (!avatarId || !Array.isArray(assigned) || !assigned.length) continue;
+      const list = byPersonaId[avatarId] || (byPersonaId[avatarId] = []);
+      const existingLower = new Set(list.map(t => t.name.toLocaleLowerCase()));
+      for (const token of assigned) {
+        if (token === null || token === undefined) continue;
+        const tokenStr = typeof token === 'object' ? String(token.id ?? token.name ?? '').trim() : String(token).trim();
+        if (!tokenStr) continue;
+        const resolved = idToDef.get(tokenStr) || idToDef.get(tokenStr.toLocaleLowerCase());
+        const name = resolved
+          ? resolved.name
+          : (typeof token === 'object' && token.name ? String(token.name).trim().slice(0, 24) : (!rawTags?.length ? tokenStr.slice(0, 24) : ''));
+        if (!name) continue;
+        const lower = name.toLocaleLowerCase();
+        if (existingLower.has(lower)) continue;
+        existingLower.add(lower);
+        const color = resolved
+          ? resolved.color
+          : normalizeTagColor(typeof token === 'object' ? token.color : '', name);
+        const entry = { name, color, source: sourceName };
+        list.push(entry);
+        if (!catalogByKey.has(lower)) {
+          catalogByKey.set(lower, entry);
+        }
+      }
+    }
+  }
+
+  return { byPersonaId, catalog: [...catalogByKey.values()] };
+}
+
 function avatarFileName(value) {
   let raw = String(value || '').trim();
   if (!raw) return '';
@@ -1822,7 +2008,7 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
   };
   const loadExtensionState = async (fallback = {}) => ({ ...fallback, ...getExtensionSettings(context(), namespace) });
   const saveExtensionState = async state => saveExtensionSettings(state, context(), namespace);
-  const normalizeState = state => ({ ...state, version: Math.max(Number(state?.version || 0), 3), personaMeta: state?.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {}, personaGroups: Array.isArray(state?.personaGroups) ? state.personaGroups.filter(group => group && typeof group === 'object' && String(group.id || '').trim() && String(group.name || '').trim()).map(group => ({ id: String(group.id), name: String(group.name).trim().slice(0, 40), createdAt: Number(group.createdAt || 0) || Date.now() })) : [], drafts: Array.isArray(state?.drafts) ? state.drafts : [], gallery: Array.isArray(state?.gallery) ? state.gallery : [], assistantThreads: state?.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {}, assistantActiveThreadKey: String(state?.assistantActiveThreadKey || ''), ui: { tab: 'current', libraryGroup: 'all', ...(state?.ui || {}) } });
+  const normalizeState = state => ({ ...state, version: Math.max(Number(state?.version || 0), 3), personaMeta: state?.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {}, personaGroups: Array.isArray(state?.personaGroups) ? state.personaGroups.filter(group => group && typeof group === 'object' && String(group.id || '').trim() && String(group.name || '').trim()).map(group => ({ id: String(group.id), name: String(group.name).trim().slice(0, 40), createdAt: Number(group.createdAt || 0) || Date.now() })) : [], personaTags: normalizePersonaTagCatalog(state?.personaTags), drafts: Array.isArray(state?.drafts) ? state.drafts : [], gallery: Array.isArray(state?.gallery) ? state.gallery : [], assistantThreads: state?.assistantThreads && typeof state.assistantThreads === 'object' ? state.assistantThreads : {}, assistantActiveThreadKey: String(state?.assistantActiveThreadKey || ''), ui: { tab: 'current', libraryGroup: 'all', libraryTags: [], ...(state?.ui || {}) } });
   const nativePersonas = () => listNativePersonas(context(), native);
   const resolvePersona = ({ state, target: passedTarget } = {}) => { const ctx = context(); const nativeBindings = readPersonaBindings(ctx, namespace); const binding = resolveBinding({ ...nativeBindings, session: state?.sessionOverride ?? nativeBindings.session }, ctx); const all = listNativePersonas(ctx, native); const persona = all.find(item => String(item.id) === String(binding.personaId)) || (binding.scope === 'none' ? readNativePersona(ctx, native) : null); return { ...binding, persona, target: passedTarget || { cardKey: getCardFingerprint(ctx), chatKey: getChatId(ctx) || 'current-chat' }, all }; };
   const writeBinding = async ({ scope, mode, personaId = null }) => setNativeBinding(scope, mode === 'none' ? null : personaId, context(), await nativeApi());
@@ -1836,6 +2022,6 @@ export function createAdapter({ namespace = EXTENSION_ID, version = '0.2.0', rep
     renameNativeTransferLabels(true);
     renameNativePersonaHeader(true);
   };
-  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async (id, options = {}) => deleteNativePersona(id, context(), await loadNativeApi(), options), purgeOrphanPersonas: async (ids = null, options = {}) => purgeOrphanNativePersonas(ids, { ...options, context: context(), api: await loadNativeApi() }), reconcileMissingAvatarPersonas: async () => reconcileMissingAvatarPersonas({ context: context(), api: await loadNativeApi() }), fetchExistingAvatarFiles: async (options = {}) => fetchExistingAvatarFiles({ ...options, context: context() }), flushNativeSettingsSave: async () => flushNativeSettingsSave(context()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, isPersonaDeletedLocally, markAvatarFileAdded, markAvatarFileRemoved, markPersonaModifiedLocally, isPersonaModifiedLocally, hasRecentLocalPersonaMutation, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), native, explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), withPreservedOpeningSwipe: fn => withPreservedOpeningSwipe(fn, context()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
+  return { context, on, off, dispose, loadNativeApi, loadExtensionState, saveExtensionState, normalizeState, readExternalPersonaTags: () => readExternalPersonaTags(context(), cachedScriptModule), preloadExternalTags: async () => { await scriptApi().catch(() => null); return readExternalPersonaTags(context(), cachedScriptModule); }, chatKey: ctx => getChatId(ctx) || 'current-chat', cardKey: ctx => getStableCardKey(ctx), cardFingerprint: ctx => getCardFingerprint(ctx), targetKey: personaTargetKey, threadMatchesTarget, currentCharacter: getCurrentCharacter, chatTitle: ctx => ctx?.chatMetadata?.title || ctx?.chatName || '当前存档', contextSnapshot: async (options = {}) => snapshot(context(), options), nativePersonas, readNativePersona: () => readNativePersona(context(), native), readNativePersonas: nativePersonas, resolvePersona, createDraftPersona, createPersona: async value => createNativePersona(value, context(), await loadNativeApi()), referencesToPersona: () => [], clearPersonaReferences: async () => {}, writeBinding, applyPersona: async persona => selectNativePersona(persona?.nativeId || persona?.id, context(), await loadNativeApi()), setDefault: async id => setNativeDefaultPersona(id, context(), await loadNativeApi()), updatePersona: async (id, patch) => updateNativePersona(id, patch, context(), await loadNativeApi()), choosePersonaLorebook: async id => choosePersonaLorebook(id, context(), await loadNativeApi()), deletePersona: async (id, options = {}) => deleteNativePersona(id, context(), await loadNativeApi(), options), purgeOrphanPersonas: async (ids = null, options = {}) => purgeOrphanNativePersonas(ids, { ...options, context: context(), api: await loadNativeApi() }), reconcileMissingAvatarPersonas: async () => reconcileMissingAvatarPersonas({ context: context(), api: await loadNativeApi() }), fetchExistingAvatarFiles: async (options = {}) => fetchExistingAvatarFiles({ ...options, context: context() }), flushNativeSettingsSave: async () => flushNativeSettingsSave(context()), duplicatePersona: async id => duplicateNativePersona(id, context(), await loadNativeApi()), focusNativePersona, findNativePersonaPanel, isElementVisible, openNativePersonaPanel, isNativePersonaPanelOpen, setNativeTakeover, setNativeEditMode, setNativePresentation: active => { renameNativeTransferLabels(active); renameNativePersonaHeader(active); }, installEntry, listNativePersonas, isPlaceholderPersonaName, isPlaceholderPersonaBody, isPlaceholderPersonaRecord, markPersonaDeletedLocally, isPersonaDeletedLocally, markAvatarFileAdded, markAvatarFileRemoved, markPersonaModifiedLocally, isPersonaModifiedLocally, hasRecentLocalPersonaMutation, syncActivePersonaUserName: async (explicitName = '') => syncActivePersonaUserName(context(), native, explicitName), mergeNativePersonasFromPayload: (raw, options = {}) => mergeNativePersonasFromPayload(raw, { ...options, context: context(), api: native }), syncNativePersonasFromServer: async (options = {}) => syncNativePersonasFromServer({ ...options, context: context(), api: await loadNativeApi() }), readPersonaBindings: () => readPersonaBindings(context(), namespace), selectNativePersona: async id => selectNativePersona(id, context(), await loadNativeApi()), setNativeBinding: async (scope, id) => setNativeBinding(scope, id, context(), await loadNativeApi()), withPreservedOpeningSwipe: fn => withPreservedOpeningSwipe(fn, context()), uploadNativeAvatar, uploadGalleryAsset: async (file, options = {}) => uploadGalleryAsset(file, { ...options, context: context() }), deleteGalleryAsset: async url => deleteGalleryAsset(url, { context: context() }), removeLegacyGalleryAvatar: async file => removeLegacyGalleryAvatar(file, { context: context() }), report, version };
 }
 export { nativeApi, normalizeBinding, normalizeChatMessages, worldNamesForContext };

@@ -6,7 +6,7 @@
  */
 import { PERSONA_VERSION, createVersionManager } from './versions.js';
 import { openVersionDialog } from './version-ui.js';
-import { createAdapter, getExtensionSettings } from './adapter.js';
+import { createAdapter, getExtensionSettings, normalizePersonaTagCatalog, normalizePersonaTagList, normalizeTagColor } from './adapter.js';
 import { createStorage } from './storage.js';
 import * as uiModule from './ui.js';
 import { createAiHelper } from './ai.js';
@@ -339,7 +339,7 @@ import { createSyncClient } from './sync-client.js';
     // Persona folders belong to the extension organiser rather than the
     // native persona store.  A missing groupId deliberately means “未分类”,
     // so older settings remain compatible without a migration pass.
-    return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], gallery: [], galleryRemoved: {}, starterGallerySeeded: false, assistantThreads: {}, assistantGlobalClearedAt: 0, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' } };
+    return { version: 3, enabled: true, personaMeta: {}, personaGroups: [], personaTags: [], gallery: [], galleryRemoved: {}, starterGallerySeeded: false, assistantThreads: {}, assistantGlobalClearedAt: 0, assistantActiveThreadKey: '', ui: { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', libraryTags: [] } };
   }
 
   function sharedState(source = state) {
@@ -429,10 +429,11 @@ import { createSyncClient } from './sync-client.js';
   function hasSharedData(value = state, { includeSnapshots = false } = {}) {
     const shared = sharedState(value);
     const hasMeta = Object.values(shared.personaMeta || {}).some(meta =>
-      Boolean(meta?.groupId || (includeSnapshots && meta?.snapshot && !meta?.deletedAt)),
+      Boolean(meta?.groupId || (Array.isArray(meta?.tags) && meta.tags.length > 0) || (includeSnapshots && meta?.snapshot && !meta?.deletedAt)),
     );
     return hasMeta
       || Array.isArray(shared.personaGroups) && shared.personaGroups.length > 0
+      || Array.isArray(shared.personaTags) && shared.personaTags.length > 0
       || Array.isArray(shared.gallery) && shared.gallery.some(item => !item?.isStarter)
       || Object.values(shared.assistantThreads || {}).some(thread => Array.isArray(thread?.turns) && thread.turns.length > 0)
       || Array.isArray(shared.drafts) && shared.drafts.length > 0
@@ -467,11 +468,27 @@ import { createSyncClient } from './sync-client.js';
       if (deletedAt > 0 && (!chosenSnap || deletedAt >= Number(chosenSnap.updatedAt || 0))) {
         delete entry.snapshot;
         delete entry.groupId;
+        delete entry.tags;
+        delete entry.tagsUpdatedAt;
         entry.deletedAt = deletedAt;
       } else {
         delete entry.deletedAt;
         if (chosenSnap) entry.snapshot = chosenSnap;
         else delete entry.snapshot;
+        const hasLTags = Object.prototype.hasOwnProperty.call(lObj, 'tags') && Array.isArray(lObj.tags);
+        const hasRTags = Object.prototype.hasOwnProperty.call(rObj, 'tags') && Array.isArray(rObj.tags);
+        if (hasLTags && hasRTags) {
+          const rAt = Number(rObj.tagsUpdatedAt || 0);
+          const lAt = Number(lObj.tagsUpdatedAt || 0);
+          entry.tags = normalizePersonaTagList(rAt >= lAt ? rObj.tags : lObj.tags);
+          entry.tagsUpdatedAt = Math.max(rAt, lAt);
+        } else if (hasRTags) {
+          entry.tags = normalizePersonaTagList(rObj.tags);
+          if (rObj.tagsUpdatedAt) entry.tagsUpdatedAt = Number(rObj.tagsUpdatedAt);
+        } else if (hasLTags) {
+          entry.tags = normalizePersonaTagList(lObj.tags);
+          if (lObj.tagsUpdatedAt) entry.tagsUpdatedAt = Number(lObj.tagsUpdatedAt);
+        }
       }
       if (Object.keys(entry).length) mergedPersonaMeta[id] = entry;
     }
@@ -483,6 +500,7 @@ import { createSyncClient } from './sync-client.js';
       if (!previous || Number(group.createdAt || 0) >= Number(previous.createdAt || 0)) groups.set(String(group.id), group);
     }
     result.personaGroups = [...groups.values()];
+    result.personaTags = normalizePersonaTagCatalog([...(local.personaTags || []), ...(remote.personaTags || [])]);
     result.gallery = storage?.mergeGallery ? storage.mergeGallery(remote.gallery || [], local.gallery || []) : [...(remote.gallery || []), ...(local.gallery || [])];
     const remoteManifest = remote.gallerySync && typeof remote.gallerySync === 'object' ? remote.gallerySync : null;
     const localManifest = local.gallerySync && typeof local.gallerySync === 'object' ? local.gallerySync : null;
@@ -1242,7 +1260,8 @@ import { createSyncClient } from './sync-client.js';
     }
     const finalTarget = activeTarget();
     personas = adapter.readNativePersonas();
-    app.update({ state, target: finalTarget, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas, nativeGallery: nativeGallery(), contextSnapshot });
+    const externalTags = adapter.readExternalPersonaTags?.() || { byPersonaId: {}, catalog: [] };
+    app.update({ state, target: finalTarget, assistantActiveThreadKey: localAssistantThreadKey, current: resolved(), bindings: adapter.readPersonaBindings(), native: adapter.readNativePersona(), personas, externalTags, nativeGallery: nativeGallery(), contextSnapshot });
   }
   async function persistHostSharedState(candidate, { preservePending = false } = {}) {
     const context = adapter?.context?.();
@@ -1726,6 +1745,32 @@ import { createSyncClient } from './sync-client.js';
         state.ui.libraryGroup = known ? wanted : 'all';
         app?.setLocalUi?.({ libraryGroup: state.ui.libraryGroup });
       },
+      async setLibraryTags(tags) {
+        const next = normalizePersonaTagList(tags);
+        state.ui = { ...(state.ui || {}), libraryTags: next };
+        app?.setLocalUi?.({ libraryTags: next });
+      },
+      async setPersonaTagsForPersona(personaId, tags, colorOverrides = {}) {
+        const id = String(personaId || '').trim();
+        if (!id) return false;
+        const normalized = normalizePersonaTagList(tags);
+        state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
+        const current = state.personaMeta[id] && typeof state.personaMeta[id] === 'object' ? state.personaMeta[id] : {};
+        state.personaMeta[id] = { ...current, tags: normalized, tagsUpdatedAt: Date.now() };
+        const now = Date.now();
+        const catalogUpdates = normalized.map(name => {
+          const override = colorOverrides?.[name.toLocaleLowerCase()] || colorOverrides?.[name];
+          const existing = (state.personaTags || []).find(item => String(item?.name || '').toLocaleLowerCase() === name.toLocaleLowerCase());
+          return {
+            name,
+            color: normalizeTagColor(override || existing?.color, name),
+            updatedAt: override ? now : Number(existing?.updatedAt || now),
+          };
+        });
+        state.personaTags = normalizePersonaTagCatalog([...(state.personaTags || []), ...catalogUpdates]);
+        await save({ syncGallery: false });
+        return true;
+      },
       async createPersonaGroup(name) {
         const label = String(name || '').trim().replace(/\s+/g, ' ').slice(0, 40);
         if (!label) return null;
@@ -1797,6 +1842,11 @@ import { createSyncClient } from './sync-client.js';
       async updatePersona(id, patch) {
         const prevSnap = state?.personaMeta?.[id]?.snapshot;
         const effectivePatch = { ...patch };
+        const hasTagsPatch = Object.prototype.hasOwnProperty.call(effectivePatch, 'tags');
+        const tagsPatch = hasTagsPatch ? normalizePersonaTagList(effectivePatch.tags) : null;
+        const tagColorsPatch = effectivePatch.tagColors && typeof effectivePatch.tagColors === 'object' ? effectivePatch.tagColors : {};
+        delete effectivePatch.tags;
+        delete effectivePatch.tagColors;
         if (isPlaceholderName(effectivePatch.name) && !isPlaceholderName(prevSnap?.name)) {
           effectivePatch.name = String(prevSnap.name).trim();
         }
@@ -1804,11 +1854,27 @@ import { createSyncClient } from './sync-client.js';
         if (ok) {
           const updated = (adapter.readNativePersonas?.() || []).find(item => String(item?.id || '') === String(id || ''));
           const snap = normalizePersonaSnapshot(updated || { id, ...effectivePatch }, Date.now(), prevSnap?.name);
-          if (snap) {
+          if (snap || hasTagsPatch) {
             state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
             const prev = state.personaMeta[id] && typeof state.personaMeta[id] === 'object' ? state.personaMeta[id] : {};
             const { deletedAt: _deletedAt, ...rest } = prev;
-            state.personaMeta[id] = { ...rest, snapshot: snap };
+            const now = Date.now();
+            const nextMeta = { ...rest, ...(snap ? { snapshot: snap } : {}) };
+            if (hasTagsPatch) {
+              nextMeta.tags = tagsPatch;
+              nextMeta.tagsUpdatedAt = now;
+              const catalogUpdates = tagsPatch.map(name => {
+                const override = tagColorsPatch?.[name.toLocaleLowerCase()] || tagColorsPatch?.[name];
+                const existing = (state.personaTags || []).find(item => String(item?.name || '').toLocaleLowerCase() === name.toLocaleLowerCase());
+                return {
+                  name,
+                  color: normalizeTagColor(override || existing?.color, name),
+                  updatedAt: override ? now : Number(existing?.updatedAt || now),
+                };
+              });
+              state.personaTags = normalizePersonaTagCatalog([...(state.personaTags || []), ...catalogUpdates]);
+            }
+            state.personaMeta[id] = nextMeta;
             await save({ syncGallery: false });
           } else {
             await refresh();
@@ -1817,15 +1883,34 @@ import { createSyncClient } from './sync-client.js';
         return ok;
       },
       async createPersona(input) {
+        const hasTagsInput = Array.isArray(input?.tags) && input.tags.length > 0;
+        const tagsInput = hasTagsInput ? normalizePersonaTagList(input.tags) : [];
+        const tagColorsInput = input?.tagColors && typeof input.tagColors === 'object' ? input.tagColors : {};
         const created = await adapter.createPersona?.(input);
         state.ui = { ...(state.ui || {}), tab: 'create', editingPersonaId: '' };
         if (created?.id) {
           const snap = normalizePersonaSnapshot({ ...input, name: created.name || input?.name }, Date.now());
-          if (snap) {
+          if (snap || hasTagsInput) {
             state.personaMeta = state.personaMeta && typeof state.personaMeta === 'object' ? state.personaMeta : {};
             const prev = state.personaMeta[created.id] && typeof state.personaMeta[created.id] === 'object' ? state.personaMeta[created.id] : {};
             const { deletedAt: _deletedAt, ...rest } = prev;
-            state.personaMeta[created.id] = { ...rest, snapshot: snap };
+            const now = Date.now();
+            const nextMeta = { ...rest, ...(snap ? { snapshot: snap } : {}) };
+            if (hasTagsInput) {
+              nextMeta.tags = tagsInput;
+              nextMeta.tagsUpdatedAt = now;
+              const catalogUpdates = tagsInput.map(name => {
+                const override = tagColorsInput?.[name.toLocaleLowerCase()] || tagColorsInput?.[name];
+                const existing = (state.personaTags || []).find(item => String(item?.name || '').toLocaleLowerCase() === name.toLocaleLowerCase());
+                return {
+                  name,
+                  color: normalizeTagColor(override || existing?.color, name),
+                  updatedAt: override ? now : Number(existing?.updatedAt || now),
+                };
+              });
+              state.personaTags = normalizePersonaTagCatalog([...(state.personaTags || []), ...catalogUpdates]);
+            }
+            state.personaMeta[created.id] = nextMeta;
           }
         }
         await save({ syncGallery: false });
@@ -2249,6 +2334,11 @@ import { createSyncClient } from './sync-client.js';
     // IndexedDB, optional server sync, or /api/settings/get are still pending.
     await syncNativeDrawer();
     await refresh();
+    void adapter.preloadExternalTags?.().then(ext => {
+      if (!disposed && ext && Object.keys(ext.byPersonaId || {}).length > 0) {
+        void refresh();
+      }
+    }).catch(() => {});
 
     for (const delayMs of [350, 1200, 2800]) {
       const timer = setTimeout(async () => {

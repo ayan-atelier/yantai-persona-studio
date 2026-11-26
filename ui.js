@@ -1,4 +1,5 @@
 import { extractJsonPreview, inferCandidateName } from './ai.js';
+import { PERSONA_TAG_PALETTE, contrastTagTextColor, normalizePersonaTagList, normalizeTagColor } from './adapter.js';
 
 const TABS = {
   current: { label: '当前', icon: 'fa-house' },
@@ -13,11 +14,13 @@ const UNCATEGORIZED_GROUP = '__uncategorized__';
 const LOCAL_UI_STORAGE_KEY = 'yantai-persona-studio.ui.v1';
 function uiStorage() { try { return globalThis.sessionStorage || globalThis.localStorage; } catch (_) { return null; } }
 function readLocalUi() {
-  const fallback = { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all' };
+  const fallback = { tab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', libraryTags: [] };
   try {
     const raw = uiStorage()?.getItem(LOCAL_UI_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : null;
-    return { ...fallback, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+    const merged = { ...fallback, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+    merged.libraryTags = normalizePersonaTagList(merged.libraryTags);
+    return merged;
   } catch (_) { return fallback; }
 }
 function writeLocalUi(value) {
@@ -58,7 +61,7 @@ class App {
     this.fileInput = null;
     this.visible = false;
     this.localUi = readLocalUi();
-    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', personaGroups: [], personaMeta: {}, personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiStreaming: null, importedCandidates: {}, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
+    this.state = { activeTab: 'current', gallerySheet: 'avatars', selectedAssetId: '', editingPersonaId: '', libraryGroup: 'all', libraryTags: [], personaGroups: [], personaTags: [], externalTags: { byPersonaId: {}, catalog: [] }, personaMeta: {}, personas: [], gallery: [], nativeGallery: [], drafts: [], assistantThreads: {}, assistantActiveThreadKey: '', current: {}, target: {}, aiBusy: false, aiStreaming: null, importedCandidates: {}, aiSessionFresh: false, query: '', assetQuery: '', aiPrompt: '', includeCard: true, includeWorld: false, includeChat: false, editorDraft: null, recentCreatedPersona: null };
   }
   setLocalUi(patch = {}) {
     this.localUi = { ...this.localUi, ...patch };
@@ -143,7 +146,10 @@ class App {
       selectedAssetId: local.selectedAssetId || '',
       editingPersonaId,
       libraryGroup: local.libraryGroup || 'all',
+      libraryTags: normalizePersonaTagList(local.libraryTags),
       personaGroups: Array.isArray(s.personaGroups || data.personaGroups) ? (s.personaGroups || data.personaGroups) : this.state.personaGroups || [],
+      personaTags: Array.isArray(s.personaTags || data.personaTags) ? (s.personaTags || data.personaTags) : this.state.personaTags || [],
+      externalTags: data.externalTags && typeof data.externalTags === 'object' ? data.externalTags : (this.state.externalTags || { byPersonaId: {}, catalog: [] }),
       personaMeta: s.personaMeta || data.personaMeta || this.state.personaMeta || {},
       personas,
       gallery: s.gallery || [],
@@ -208,9 +214,130 @@ class App {
     const desc = p.description || '暂无描述';
     const rows = [['global', '默认'], ['card', '当前角色卡'], ['chat', '当前存档']];
     const curFallback = galleryFallbackUrl(p.avatarRef, 'persona');
-    return '<div class="ytps-current"><div class="ytps-current-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '"' + (curFallback ? ' data-fallback-src="' + esc(curFallback) + '"' : '') + ' alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-current-copy"><div class="ytps-kicker">当前生效 · ' + esc(this.sourceLabel(this.state.current?.scope)) + '</div><h2>' + esc(name) + '</h2><p>' + esc(short(desc, 260)) + '</p></div></div>' +
+    const curTags = this.personaTagsFor(p);
+    const curTagsHtml = curTags.length
+      ? '<div class="ytps-row-tags ytps-current-tags" role="list" aria-label="人设标签">' + curTags.map(tag => this.renderTagPill(tag, { staticPill: true })).join('') + '</div>'
+      : '';
+    return '<div class="ytps-current"><div class="ytps-current-avatar">' + (p.avatarRef ? '<img src="' + esc(p.avatarRef) + '"' + (curFallback ? ' data-fallback-src="' + esc(curFallback) + '"' : '') + ' alt="">' : '<i class="fa-solid fa-user"></i>') + '<span class="ytps-image-fade"></span></div><div class="ytps-current-copy"><div class="ytps-kicker">当前生效 · ' + esc(this.sourceLabel(this.state.current?.scope)) + '</div><h2>' + esc(name) + '</h2>' + curTagsHtml + '<p>' + esc(short(desc, 260)) + '</p></div></div>' +
       '<div class="ytps-section-title"><strong>绑定到：</strong></div>' +
       '<div class="ytps-binding-grid" role="group" aria-label="绑定到">' + rows.map(([scope, label]) => { const active = this.state.current?.scope === scope; return '<button class="ytps-choice ' + (active ? 'is-active' : '') + '" data-action="bind-current" data-scope="' + scope + '" data-mode="' + (active ? 'none' : 'bind') + '" aria-pressed="' + active + '" title="' + (active ? '再次点击解除绑定' : '绑定到' + label) + '">' + label + (active ? ' <i class="fa-solid fa-link" aria-hidden="true"></i>' : '') + '</button>'; }).join('') + '</div>';
+  }
+  resolveTagColor(tagName, explicitOverrides = null) {
+    const label = String(tagName || '').trim();
+    const lower = label.toLocaleLowerCase();
+    if (!lower) return PERSONA_TAG_PALETTE[0];
+    const override = explicitOverrides?.[lower] || explicitOverrides?.[label];
+    if (override) return normalizeTagColor(override, label);
+    const catalogHit = (this.state.personaTags || []).find(item => String(item?.name || '').toLocaleLowerCase() === lower);
+    if (catalogHit?.color) return normalizeTagColor(catalogHit.color, label);
+    const extHit = (this.state.externalTags?.catalog || []).find(item => String(item?.name || '').toLocaleLowerCase() === lower);
+    if (extHit?.color) return normalizeTagColor(extHit.color, label);
+    return normalizeTagColor('', label);
+  }
+  personaTagsFor(persona) {
+    const id = String(persona?.id || '').trim();
+    if (!id) return [];
+    const meta = this.state.personaMeta?.[id];
+    if (meta && typeof meta === 'object' && Object.prototype.hasOwnProperty.call(meta, 'tags') && Array.isArray(meta.tags)) {
+      return normalizePersonaTagList(meta.tags).map(name => {
+        const color = this.resolveTagColor(name);
+        return { name, color, fg: contrastTagTextColor(color), source: 'native' };
+      });
+    }
+    const extList = this.state.externalTags?.byPersonaId?.[id];
+    if (!Array.isArray(extList) || !extList.length) return [];
+    return extList.map(item => {
+      const name = String(item?.name || '').trim();
+      if (!name) return null;
+      const color = normalizeTagColor(item.color || this.resolveTagColor(name), name);
+      return { name, color, fg: contrastTagTextColor(color), source: item.source || 'external' };
+    }).filter(Boolean);
+  }
+  allActiveTagStats() {
+    const map = new Map();
+    for (const p of this.state.personas || []) {
+      const seenOnPersona = new Set();
+      for (const tag of this.personaTagsFor(p)) {
+        const key = tag.name.toLocaleLowerCase();
+        if (seenOnPersona.has(key)) continue;
+        seenOnPersona.add(key);
+        const existing = map.get(key);
+        if (existing) existing.count += 1;
+        else map.set(key, { name: tag.name, color: tag.color, fg: tag.fg, count: 1 });
+      }
+    }
+    return [...map.values()].sort((a, b) => (b.count - a.count) || a.name.localeCompare(b.name, 'zh-Hans-CN'));
+  }
+  allKnownTagSuggestions(excludeList = []) {
+    const excluded = new Set(normalizePersonaTagList(excludeList).map(t => t.toLocaleLowerCase()));
+    const map = new Map();
+    for (const stat of this.allActiveTagStats()) {
+      const key = stat.name.toLocaleLowerCase();
+      if (!excluded.has(key) && !map.has(key)) map.set(key, stat.name);
+    }
+    for (const item of [...(this.state.personaTags || []), ...(this.state.externalTags?.catalog || [])]) {
+      const name = String(item?.name || '').trim();
+      const key = name.toLocaleLowerCase();
+      if (name && !excluded.has(key) && !map.has(key)) map.set(key, name);
+    }
+    return [...map.values()].slice(0, 10);
+  }
+  renderTagPill(tag, { active = false, count = null, staticPill = false } = {}) {
+    const style = '--ytps-tag-bg:' + esc(tag.color) + ';--ytps-tag-fg:' + esc(tag.fg) + ';';
+    const countHtml = typeof count === 'number' ? ' <em>' + count + '</em>' : '';
+    if (staticPill) {
+      return '<span class="ytps-tag-pill is-static" role="listitem" style="' + style + '">' + esc(tag.name) + '</span>';
+    }
+    return '<button type="button" class="ytps-tag-pill ' + (active ? 'is-active' : '') + '" role="listitem" data-action="filter-persona-tag" data-tag="' + esc(tag.name) + '" aria-pressed="' + (active ? 'true' : 'false') + '" title="' + (active ? '点击取消筛选标签「' + esc(tag.name) + '」' : '点击按标签「' + esc(tag.name) + '」筛选') + '" style="' + style + '">' + esc(tag.name) + countHtml + '</button>';
+  }
+  renderTagEditorField(draft) {
+    const tags = normalizePersonaTagList(draft.tags);
+    const overrides = draft.tagColors && typeof draft.tagColors === 'object' ? draft.tagColors : {};
+    const selectedColor = normalizeTagColor(draft.tagColor || PERSONA_TAG_PALETTE[tags.length % PERSONA_TAG_PALETTE.length]);
+    const currentChips = tags.length
+      ? '<div class="ytps-tag-editor-list">' + tags.map(name => {
+        const color = this.resolveTagColor(name, overrides);
+        const fg = contrastTagTextColor(color);
+        return '<span class="ytps-tag-chip-edit" style="--ytps-tag-bg:' + esc(color) + ';--ytps-tag-fg:' + esc(fg) + ';"><button type="button" class="ytps-tag-chip-color" data-action="editor-cycle-tag-color" data-tag="' + esc(name) + '" title="点击切换标签颜色">' + esc(name) + '</button><button type="button" class="ytps-tag-chip-del" data-action="editor-remove-tag" data-tag="' + esc(name) + '" title="移除标签" aria-label="移除标签 ' + esc(name) + '">×</button></span>';
+      }).join('') + '</div>'
+      : '';
+    const swatches = '<div class="ytps-tag-swatches" role="radiogroup" aria-label="标签颜色">' + PERSONA_TAG_PALETTE.map(hex => '<button type="button" class="ytps-tag-swatch ' + (selectedColor.toLowerCase() === hex.toLowerCase() ? 'is-selected' : '') + '" data-action="editor-select-tag-color" data-color="' + esc(hex) + '" style="--ytps-swatch-color:' + esc(hex) + ';" title="选择标签配色" aria-checked="' + (selectedColor.toLowerCase() === hex.toLowerCase() ? 'true' : 'false') + '" role="radio"></button>').join('') + '</div>';
+    const suggestions = this.allKnownTagSuggestions(tags);
+    const suggestHtml = suggestions.length
+      ? '<div class="ytps-tag-suggestions"><small>常用：</small>' + suggestions.map(name => '<button type="button" class="ytps-tag-suggest-btn" data-action="editor-pick-suggest-tag" data-tag="' + esc(name) + '">+ ' + esc(name) + '</button>').join('') + '</div>'
+      : '';
+    return '<div class="ytps-field ytps-tags-field"><span>标签 <small>选填 · 回车或逗号添加，留空则不在卡片显示</small></span><div class="ytps-tag-editor">' + currentChips + '<div class="ytps-tag-editor-controls"><input class="ytps-input ytps-tag-input" data-field="editorTagInput" value="' + esc(draft.tagInput || '') + '" placeholder="如：女大、现代、男高">' + swatches + '<button type="button" class="ytps-btn ytps-tag-add-btn" data-action="editor-add-tag">添加</button></div>' + suggestHtml + '</div></div>';
+  }
+  commitEditorTags(rawInput, { focusInput = false } = {}) {
+    const creating = this.state.activeTab === 'create' || this.state.creatingPersona === true;
+    const persona = creating ? {} : this.editorPersona();
+    const draft = this.state.editorDraft || { id: persona.id || '', name: persona.name || '', note: persona.title || '', description: persona.description || '', lorebook: persona.lorebook || '', tags: this.personaTagsFor(persona).map(t => t.name), tagColors: {}, tagInput: '', tagColor: PERSONA_TAG_PALETTE[0] };
+    const incoming = normalizePersonaTagList(rawInput);
+    if (!incoming.length) return false;
+    const prevTags = normalizePersonaTagList(draft.tags);
+    const prevSet = new Set(prevTags.map(t => t.toLocaleLowerCase()));
+    const nextTags = normalizePersonaTagList([...prevTags, ...incoming]);
+    const nextColors = { ...(draft.tagColors || {}) };
+    const pickedColor = draft.tagColor ? normalizeTagColor(draft.tagColor) : '';
+    for (const label of incoming) {
+      const lower = label.toLocaleLowerCase();
+      if (!prevSet.has(lower) && pickedColor && !nextColors[lower]) {
+        const hasCatalogColor = (this.state.personaTags || []).some(item => String(item?.name || '').toLocaleLowerCase() === lower)
+          || (this.state.externalTags?.catalog || []).some(item => String(item?.name || '').toLocaleLowerCase() === lower);
+        if (!hasCatalogColor || draft.tagColorPickedManually) {
+          nextColors[lower] = pickedColor;
+        }
+      }
+    }
+    draft.tags = nextTags;
+    draft.tagColors = nextColors;
+    draft.tagInput = '';
+    draft.tagColor = PERSONA_TAG_PALETTE[nextTags.length % PERSONA_TAG_PALETTE.length];
+    draft.tagColorPickedManually = false;
+    this.state.editorDraft = draft;
+    this.render();
+    if (focusInput) this.root?.querySelector('[data-field="editorTagInput"]')?.focus();
+    return true;
   }
   personaGroups() {
     const groups = Array.isArray(this.state.personaGroups) ? this.state.personaGroups : [];
@@ -230,15 +357,35 @@ class App {
     const groupOptions = '<option value="all" ' + (selectedGroup === 'all' ? 'selected' : '') + '>全部</option>' + groups.map(group => '<option value="' + esc(group.id) + '" ' + (selectedGroup === String(group.id) ? 'selected' : '') + '>' + esc(group.name) + '</option>').join('');
     const selectedCustomGroup = selectedGroup !== 'all' && selectedGroup !== UNCATEGORIZED_GROUP ? groups.find(group => String(group.id) === selectedGroup) : null;
     const groupManage = selectedCustomGroup ? '<span class="ytps-group-manage" role="group" aria-label="管理分组"><button class="ytps-icon-btn ytps-group-manage-btn" data-action="rename-persona-group" data-id="' + esc(selectedCustomGroup.id) + '" title="重命名分组" aria-label="重命名分组"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn ytps-group-manage-btn ytps-danger" data-action="delete-persona-group" data-id="' + esc(selectedCustomGroup.id) + '" title="删除分组" aria-label="删除分组"><i class="fa-solid fa-trash"></i></button></span>' : '';
+    const tagStats = this.allActiveTagStats();
+    const availableTagKeys = new Set(tagStats.map(item => item.name.toLocaleLowerCase()));
+    const activeTags = normalizePersonaTagList(this.state.libraryTags).filter(name => availableTagKeys.has(name.toLocaleLowerCase()));
+    const activeTagKeys = new Set(activeTags.map(name => name.toLocaleLowerCase()));
     // SillyTavern keeps native persona entries in insertion order, so the
     // oldest persona is first and the newest is last. Reverse the filtered
     // result so recent personas are immediately visible at the top.
-    const list = this.state.personas.filter(p => (!q || (p.name + ' ' + p.title + ' ' + p.description).toLowerCase().includes(q)) && (selectedGroup === 'all' || this.personaGroupId(p) === selectedGroup)).slice().reverse();
+    const list = this.state.personas.filter(p => {
+      const pTags = this.personaTagsFor(p);
+      const pTagText = pTags.map(t => t.name).join(' ');
+      if (q && !(p.name + ' ' + p.title + ' ' + p.description + ' ' + pTagText).toLowerCase().includes(q)) return false;
+      if (selectedGroup !== 'all' && this.personaGroupId(p) !== selectedGroup) return false;
+      if (activeTagKeys.size > 0) {
+        const pTagSet = new Set(pTags.map(t => t.name.toLocaleLowerCase()));
+        for (const wantedTag of activeTagKeys) {
+          if (!pTagSet.has(wantedTag)) return false;
+        }
+      }
+      return true;
+    }).slice().reverse();
+    const tagFilterBar = tagStats.length > 0
+      ? '<div class="ytps-tag-filter-bar" role="list" aria-label="按人设标签筛选"><span class="ytps-tag-filter-label"><i class="fa-solid fa-tags" aria-hidden="true"></i></span>' + tagStats.map(tag => this.renderTagPill(tag, { active: activeTagKeys.has(tag.name.toLocaleLowerCase()), count: tag.count })).join('') + (activeTags.length ? '<button type="button" class="ytps-tag-clear" data-action="clear-tag-filter">清除</button>' : '') + '</div>'
+      : '';
     const orphanCount = this.state.personas.filter(p => p?.avatarMissing).length;
     const orphanBar = orphanCount > 0
       ? '<div class="ytps-orphan-bar" role="status"><span><i class="fa-solid fa-triangle-exclamation"></i> 检测到 <b>' + orphanCount + '</b> 份原头像小图已删除的残留人设（可点右侧垃圾桶删除、进编辑补传新头像，或一键清理）</span><button class="ytps-btn ytps-danger" data-action="purge-orphan-personas"><i class="fa-solid fa-trash-can"></i> 一键清理残留</button></div>'
       : '';
-    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><select class="ytps-input ytps-library-group" data-field="libraryGroup" aria-label="筛选人设分组">' + groupOptions + '</select>' + groupManage + '<span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span><button class="ytps-btn ytps-group-create" data-action="create-persona-group"><i class="fa-solid fa-folder-plus"></i> 新建分组</button></div>' + orphanBar + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p)).join('') + '</div>' : '<div class="ytps-empty">这个分组里还没有人设。</div>');
+    const emptyText = (activeTags.length || q) ? '没有符合当前筛选条件的人设。' : '这个分组里还没有人设。';
+    return '<div class="ytps-toolbar"><input class="ytps-input" data-field="query" value="' + esc(this.state.query || '') + '" placeholder="搜索人设档案…"><select class="ytps-input ytps-library-group" data-field="libraryGroup" aria-label="筛选人设分组">' + groupOptions + '</select>' + groupManage + '<span class="ytps-count">' + list.length + ' / ' + this.state.personas.length + '</span><button class="ytps-btn ytps-group-create" data-action="create-persona-group"><i class="fa-solid fa-folder-plus"></i> 新建分组</button></div>' + tagFilterBar + orphanBar + (list.length ? '<div class="ytps-persona-list">' + list.map(p => this.personaRow(p, activeTagKeys)).join('') + '</div>' : '<div class="ytps-empty">' + emptyText + '</div>');
   }
   personaBindingLabel(p) {
     const bindings = this.state.bindings || {};
@@ -266,7 +413,7 @@ class App {
     if (p.isCurrent) return '当前使用 · 未单独绑定';
     return '未绑定';
   }
-  personaRow(p) {
+  personaRow(p, activeTagKeys = null) {
     const binding = this.personaBindingLabel(p);
     const note = p.title || '原生人设';
     const groupOptions = this.personaGroups().map(group => '<option value="' + esc(group.id) + '" ' + (this.personaGroupId(p) === String(group.id) ? 'selected' : '') + '>' + esc(group.name) + '</option>').join('');
@@ -280,7 +427,11 @@ class App {
     const warnChip = p.avatarMissing
       ? '<span class="ytps-chip ytps-chip-warn" title="原头像小图已被删除；可直接删除清理残留，或进入编辑重新上传头像">无原图</span>'
       : '';
-    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + (p.avatarMissing ? ' is-orphan' : '') + '"><div class="ytps-row-avatar">' + avatarHtml + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + warnChip + '</div><div class="ytps-row-meta"><small>' + esc(note) + '</small><div class="ytps-row-primary">' + useAction + '</div></div><p>' + esc(short(p.description || '暂无描述', 155)) + '</p></div><div class="ytps-row-actions"><label class="ytps-persona-group"><select data-field="personaGroup" data-id="' + esc(p.id) + '" aria-label="移动' + esc(p.name) + '到分组">' + groupOptions + '</select></label><div class="ytps-row-tools"><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></div></article>';
+    const rowTags = this.personaTagsFor(p);
+    const tagsHtml = rowTags.length
+      ? '<div class="ytps-row-tags" role="list" aria-label="人设标签">' + rowTags.map(tag => this.renderTagPill(tag, { active: Boolean(activeTagKeys?.has?.(tag.name.toLocaleLowerCase())) })).join('') + '</div>'
+      : '';
+    return '<article class="ytps-persona-row ' + (p.isCurrent ? 'is-current' : '') + (p.avatarMissing ? ' is-orphan' : '') + '"><div class="ytps-row-avatar">' + avatarHtml + '<span class="ytps-image-fade"></span></div><div class="ytps-row-main"><div class="ytps-row-title"><strong>' + esc(p.name) + '</strong><span class="ytps-binding-inline">（' + esc(binding) + '）</span>' + (p.isDefault ? '<span class="ytps-chip">默认</span>' : '') + warnChip + '</div><div class="ytps-row-meta"><small>' + esc(note) + '</small><div class="ytps-row-primary">' + useAction + '</div></div><p>' + esc(short(p.description || '暂无描述', 155)) + '</p>' + tagsHtml + '</div><div class="ytps-row-actions"><label class="ytps-persona-group"><select data-field="personaGroup" data-id="' + esc(p.id) + '" aria-label="移动' + esc(p.name) + '到分组">' + groupOptions + '</select></label><div class="ytps-row-tools"><button class="ytps-icon-btn" data-action="edit-persona" data-id="' + esc(p.id) + '" title="编辑人设"><i class="fa-solid fa-pen"></i></button><button class="ytps-icon-btn" data-action="copy-persona" data-id="' + esc(p.id) + '" title="复制人设"><i class="fa-solid fa-copy"></i></button><button class="ytps-icon-btn ytps-danger" data-action="delete-persona" data-id="' + esc(p.id) + '" title="删除人设"><i class="fa-solid fa-trash"></i></button></div></div></article>';
   }
   editorPersona() {
     if (this.state.activeTab === 'create' || this.state.creatingPersona) return {};
@@ -314,8 +465,18 @@ class App {
         existing.description = persona.description;
       }
     }
-    const draft = existing || { id, name: persona.name || '', note: persona.title || '', description: persona.description || '', lorebook: persona.lorebook || '' };
+    const initialTags = creating ? [] : this.personaTagsFor(persona).map(t => t.name);
+    const initialTagColors = {};
+    if (!creating) {
+      for (const t of this.personaTagsFor(persona)) {
+        initialTagColors[t.name.toLocaleLowerCase()] = t.color;
+      }
+    }
+    const draft = existing || { id, name: persona.name || '', note: persona.title || '', description: persona.description || '', lorebook: persona.lorebook || '', tags: initialTags, tagColors: initialTagColors, tagInput: '', tagColor: PERSONA_TAG_PALETTE[initialTags.length % PERSONA_TAG_PALETTE.length] };
+    if (!Array.isArray(draft.tags)) draft.tags = initialTags;
+    if (!draft.tagColors || typeof draft.tagColors !== 'object') draft.tagColors = initialTagColors;
     if (!existing && (id || creating)) this.state.editorDraft = draft;
+    const tagEditorField = this.renderTagEditorField(draft);
     const avatar = persona.avatarRef || '';
     const avatarFallback = galleryFallbackUrl(avatar, 'persona');
     const image = avatar && !persona.avatarMissing ? '<img src="' + esc(avatar) + '"' + (avatarFallback ? ' data-fallback-src="' + esc(avatarFallback) + '"' : '') + ' alt="' + esc(draft.name || '人设头像') + '"><span class="ytps-image-fade"></span>' : '<i class="fa-solid fa-user"></i><span class="ytps-image-fade"></span>';
@@ -323,14 +484,14 @@ class App {
       const createButton = '<button class="ytps-btn ytps-primary ytps-editor-save" data-action="save-new-persona"><i class="fa-solid fa-check"></i> 创建人设</button>';
       const recent = this.state.recentCreatedPersona;
       const recentBar = recent?.id ? '<div class="ytps-create-result" role="status"><span><i class="fa-solid fa-circle-check"></i> 已创建“' + esc(recent.name || '未命名人设') + '”</span><div class="ytps-create-result-actions"><button class="ytps-btn ytps-primary" data-action="edit-persona" data-id="' + esc(recent.id) + '">立即编辑</button><button class="ytps-btn" data-action="continue-new-persona">继续新建</button></div></div>' : '';
-      return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建人设</h2><p class="ytps-muted">填写后点击“创建人设”保存。</p></div></div>' + recentBar + '<div class="ytps-editor-fields ytps-create-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + createButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea></label><p class="ytps-muted">保存后可通过“立即编辑”更换头像、设置世界书与归属。</p></div></div>';
+      return '<div class="ytps-editor"><div class="ytps-editor-head"><div><span class="ytps-kicker">人设馆</span><h2>新建人设</h2><p class="ytps-muted">填写后点击“创建人设”保存。</p></div></div>' + recentBar + '<div class="ytps-editor-fields ytps-create-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + createButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea></label>' + tagEditorField + '<p class="ytps-muted">保存后可通过“立即编辑”更换头像、设置世界书与归属。</p></div></div>';
     }
     const currentScope = this.personaScope(id);
     const scopeButton = (scope, label) => '<button class="ytps-choice ' + (currentScope === scope ? 'is-active' : '') + '" data-action="editor-bind" data-scope="' + scope + '" data-id="' + esc(id) + '">' + label + '</button>';
     const lorebookField = '<div class="ytps-field ytps-lorebook-field"><span>绑定人设世界书 <small>可留空</small></span><div class="ytps-lorebook-picker"><input class="ytps-input" data-field="editorLorebook" value="' + esc(draft.lorebook) + '" placeholder="未选择" readonly><button class="ytps-btn" data-action="choose-lorebook" data-id="' + esc(id) + '" type="button"><i class="fa-solid fa-book-open"></i> 选择</button></div></div>';
     const saveButton = '<button class="ytps-btn ytps-primary ytps-editor-save" data-action="save-editor" data-id="' + esc(id) + '"><i class="fa-solid fa-check"></i> 保存修改</button>';
     const nativeEditButton = '<button class="ytps-btn ytps-quiet ytps-editor-native" data-action="open-native-edit" data-id="' + esc(id) + '"><i class="fa-solid fa-sliders"></i> 原生编辑</button>';
-    return '<div class="ytps-editor"><div class="ytps-editor-layout"><button class="ytps-editor-avatar" data-action="editor-avatar-gallery" title="点击打开人设头像图库">' + image + '<span class="ytps-editor-avatar-hint"><i class="fa-solid fa-images"></i> 更换头像</span></button><div class="ytps-editor-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + saveButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea>' + lorebookField + '</div></div><section class="ytps-editor-section"><div class="ytps-section-title"><strong>常用归属</strong><span>选择后会沿用酒馆原生绑定</span>' + nativeEditButton + '</div><div class="ytps-choice-grid"><button class="ytps-choice ' + (currentScope === 'none' ? 'is-active' : '') + '" data-action="editor-unbind" data-id="' + esc(id) + '">未绑定</button>' + scopeButton('global', '默认') + scopeButton('card', '当前角色卡') + scopeButton('chat', '当前存档') + '</div></section><div class="ytps-editor-footer"><button class="ytps-btn ytps-quiet" data-action="export-persona" data-id="' + esc(id) + '"><i class="fa-solid fa-file-export"></i> 导出</button></div></div>';
+    return '<div class="ytps-editor"><div class="ytps-editor-layout"><button class="ytps-editor-avatar" data-action="editor-avatar-gallery" title="点击打开人设头像图库">' + image + '<span class="ytps-editor-avatar-hint"><i class="fa-solid fa-images"></i> 更换头像</span></button><div class="ytps-editor-fields"><label class="ytps-field ytps-name-field"><span class="ytps-name-label"><b>名称</b>' + saveButton + '</span><input class="ytps-input" data-field="editorName" value="' + esc(draft.name) + '" placeholder="人设名称"></label><label class="ytps-field"><span>备注 <small>显示在头像下面</small></span><input class="ytps-input" data-field="editorNote" value="' + esc(draft.note) + '" placeholder="一句简短说明"></label><label class="ytps-field"><span>描述</span><textarea class="ytps-textarea" data-field="editorDescription" placeholder="这份人设会以什么身份进入故事？">' + esc(draft.description) + '</textarea></label>' + tagEditorField + lorebookField + '</div></div><section class="ytps-editor-section"><div class="ytps-section-title"><strong>常用归属</strong><span>选择后会沿用酒馆原生绑定</span>' + nativeEditButton + '</div><div class="ytps-choice-grid"><button class="ytps-choice ' + (currentScope === 'none' ? 'is-active' : '') + '" data-action="editor-unbind" data-id="' + esc(id) + '">未绑定</button>' + scopeButton('global', '默认') + scopeButton('card', '当前角色卡') + scopeButton('chat', '当前存档') + '</div></section><div class="ytps-editor-footer"><button class="ytps-btn ytps-quiet" data-action="export-persona" data-id="' + esc(id) + '"><i class="fa-solid fa-file-export"></i> 导出</button></div></div>';
   }
   gallery() {
     const sheet = this.state.gallerySheet === 'cards' ? 'cards' : 'avatars';
@@ -566,6 +727,69 @@ class App {
     event.stopPropagation();
     const action = el.dataset.action;
     if (action === 'close') return this.call('close');
+    if (action === 'filter-persona-tag') {
+      const tag = String(el.dataset.tag || '').trim();
+      if (!tag) return;
+      const lower = tag.toLocaleLowerCase();
+      const prev = normalizePersonaTagList(this.state.libraryTags);
+      const exists = prev.some(item => item.toLocaleLowerCase() === lower);
+      const next = exists ? prev.filter(item => item.toLocaleLowerCase() !== lower) : [...prev, tag];
+      this.state.libraryTags = next;
+      this.setLocalUi({ libraryTags: next });
+      this.render();
+      this.call('setLibraryTags', next).catch(() => {});
+      return;
+    }
+    if (action === 'clear-tag-filter') {
+      this.state.libraryTags = [];
+      this.setLocalUi({ libraryTags: [] });
+      this.render();
+      this.call('setLibraryTags', []).catch(() => {});
+      return;
+    }
+    if (action === 'editor-select-tag-color') {
+      const color = normalizeTagColor(el.dataset.color || '');
+      const persona = this.state.creatingPersona ? {} : this.editorPersona();
+      const draft = this.state.editorDraft || { id: persona.id || '', tags: this.personaTagsFor(persona).map(t => t.name), tagColors: {}, tagInput: '' };
+      draft.tagColor = color;
+      draft.tagColorPickedManually = true;
+      this.state.editorDraft = draft;
+      this.render();
+      return;
+    }
+    if (action === 'editor-add-tag') {
+      const inputEl = this.root?.querySelector('[data-field="editorTagInput"]');
+      const raw = inputEl ? inputEl.value : (this.state.editorDraft?.tagInput || '');
+      if (!this.commitEditorTags(raw, { focusInput: true })) {
+        this.options.report?.('请输入标签名称后再添加。', 'info');
+      }
+      return;
+    }
+    if (action === 'editor-pick-suggest-tag') {
+      const tag = String(el.dataset.tag || '').trim();
+      if (tag) this.commitEditorTags([tag], { focusInput: false });
+      return;
+    }
+    if (action === 'editor-remove-tag') {
+      const tag = String(el.dataset.tag || '').trim().toLocaleLowerCase();
+      const draft = this.state.editorDraft;
+      if (!draft || !tag) return;
+      draft.tags = normalizePersonaTagList(draft.tags).filter(item => item.toLocaleLowerCase() !== tag);
+      this.render();
+      return;
+    }
+    if (action === 'editor-cycle-tag-color') {
+      const tag = String(el.dataset.tag || '').trim();
+      const draft = this.state.editorDraft;
+      if (!draft || !tag) return;
+      const lower = tag.toLocaleLowerCase();
+      draft.tagColors = draft.tagColors && typeof draft.tagColors === 'object' ? draft.tagColors : {};
+      const currentColor = this.resolveTagColor(tag, draft.tagColors).toLowerCase();
+      const idx = PERSONA_TAG_PALETTE.findIndex(hex => hex.toLowerCase() === currentColor);
+      draft.tagColors[lower] = PERSONA_TAG_PALETTE[(idx + 1) % PERSONA_TAG_PALETTE.length];
+      this.render();
+      return;
+    }
     if (action === 'rename-persona-group') {
       const id = String(el.dataset.id || '');
       const group = this.personaGroups().find(item => String(item.id) === id);
@@ -594,7 +818,7 @@ class App {
       this.state.activeTab = el.dataset.tab;
       this.state.creatingPersona = this.state.activeTab === 'create';
       if (this.state.creatingPersona) {
-        this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' };
+        this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '', tags: [], tagColors: {}, tagInput: '', tagColor: PERSONA_TAG_PALETTE[0] };
         this.state.recentCreatedPersona = null;
         this.setLocalUi({ tab: 'create', editingPersonaId: '' });
       } else if (this.state.activeTab === 'editor' && !this.state.editingPersonaId) {
@@ -653,8 +877,8 @@ class App {
       return;
     }
     if (action === 'editor-back') { this.state.activeTab = 'current'; this.setLocalUi({ tab: 'current', editingPersonaId: '' }); this.render(); await this.call('setTab', 'current'); return; }
-    if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.setLocalUi({ tab: 'create', editingPersonaId: '' }); this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.state.recentCreatedPersona = null; this.render(); await this.call('startNewPersona'); return; }
-    if (action === 'continue-new-persona') { this.state.recentCreatedPersona = null; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' }; this.render(); this.root?.querySelector('[data-field="editorName"]')?.focus(); return; }
+    if (action === 'new-persona-form') { this.state.activeTab = 'create'; this.setLocalUi({ tab: 'create', editingPersonaId: '' }); this.state.creatingPersona = true; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '', tags: [], tagColors: {}, tagInput: '', tagColor: PERSONA_TAG_PALETTE[0] }; this.state.recentCreatedPersona = null; this.render(); await this.call('startNewPersona'); return; }
+    if (action === 'continue-new-persona') { this.state.recentCreatedPersona = null; this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '', tags: [], tagColors: {}, tagInput: '', tagColor: PERSONA_TAG_PALETTE[0] }; this.render(); this.root?.querySelector('[data-field="editorName"]')?.focus(); return; }
     if (action === 'editor-avatar-gallery') {
       const targetId = String(this.state.editingPersonaId || this.editorPersona()?.id || '');
       this.state.creatingPersona = false;
@@ -694,18 +918,28 @@ class App {
     if (action === 'save-editor') {
       const draft = this.state.editorDraft;
       if (!draft || !el.dataset.id) return;
-      try { await this.call('updatePersona', el.dataset.id, { name: draft.name, note: draft.note, description: draft.description, lorebook: draft.lorebook }); this.options.report?.('人设资料已保存。', 'success'); this.state.editorDraft = null; this.render(); } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
+      if (String(draft.tagInput || '').trim()) {
+        this.commitEditorTags(draft.tagInput, { focusInput: false });
+      }
+      const nextTags = normalizePersonaTagList(draft.tags);
+      const nextTagColors = draft.tagColors && typeof draft.tagColors === 'object' ? draft.tagColors : {};
+      try { await this.call('updatePersona', el.dataset.id, { name: draft.name, note: draft.note, description: draft.description, lorebook: draft.lorebook, tags: nextTags, tagColors: nextTagColors }); this.options.report?.('人设资料已保存。', 'success'); this.state.editorDraft = null; this.render(); } catch (error) { this.options.report?.(error.message || String(error), 'error'); }
       return;
     }
     if (action === 'save-new-persona') {
       const draft = this.state.editorDraft || {};
       if (!String(draft.name || '').trim()) { this.options.report?.('请先填写人设名称。', 'info'); return; }
+      if (String(draft.tagInput || '').trim()) {
+        this.commitEditorTags(draft.tagInput, { focusInput: false });
+      }
+      const nextTags = normalizePersonaTagList(draft.tags);
+      const nextTagColors = draft.tagColors && typeof draft.tagColors === 'object' ? draft.tagColors : {};
       try {
-        const created = await this.call('createPersona', { name: draft.name, title: draft.note, description: draft.description });
+        const created = await this.call('createPersona', { name: draft.name, title: draft.note, description: draft.description, tags: nextTags, tagColors: nextTagColors });
         if (!created?.id) throw new Error('酒馆没有返回新建人设的编号，请检查人设档案。');
         this.state.creatingPersona = true;
         this.state.activeTab = 'create';
-        this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '' };
+        this.state.editorDraft = { id: '', name: '', note: '', description: '', lorebook: '', tags: [], tagColors: {}, tagInput: '', tagColor: PERSONA_TAG_PALETTE[0] };
         this.state.recentCreatedPersona = { id: created.id, name: created.name || String(draft.name).trim() };
         this.render();
         this.options.report?.('人设已创建，并已加入人设档案。', 'success');
@@ -714,7 +948,7 @@ class App {
     }
     if (action === 'export-persona') {
       const p = this.state.personas.find(item => String(item.id) === String(el.dataset.id)) || this.editorPersona();
-      const payload = { version: 1, exportedAt: new Date().toISOString(), persona: { id: p.id, name: p.name, title: p.title || '', description: p.description || '', avatar: p.avatarRef || '', lorebook: p.lorebook || '' } };
+      const payload = { version: 1, exportedAt: new Date().toISOString(), persona: { id: p.id, name: p.name, title: p.title || '', description: p.description || '', avatar: p.avatarRef || '', lorebook: p.lorebook || '', tags: this.personaTagsFor(p).map(t => t.name) } };
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = (p.name || 'yantai-persona') + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 500); return;
     }
     if (action === 'native-create') return this.call('openNativeCreate');
@@ -830,6 +1064,30 @@ class App {
   onInput(event) {
     const field = event.target.dataset?.field; if (!field) return;
     this.state[field] = event.target.value;
+    if (field === 'editorTagInput') {
+      const val = String(event.target.value || '');
+      const persona = this.state.creatingPersona ? {} : this.editorPersona();
+      const draft = this.state.editorDraft && String(this.state.editorDraft.id || '') === String(persona.id || '') ? this.state.editorDraft : { id: persona.id || '', tags: this.personaTagsFor(persona).map(t => t.name), tagColors: {} };
+      if (/[,，、]/.test(val)) {
+        const parts = val.split(/[,，、]/);
+        const tail = parts.pop() || '';
+        const head = parts.join(',');
+        draft.tagInput = tail;
+        this.state.editorDraft = draft;
+        if (head.trim()) {
+          this.commitEditorTags(head, { focusInput: true });
+          const nextEl = this.root?.querySelector('[data-field="editorTagInput"]');
+          if (nextEl) {
+            nextEl.value = tail;
+            draft.tagInput = tail;
+          }
+        }
+      } else {
+        draft.tagInput = val;
+        this.state.editorDraft = draft;
+      }
+      return;
+    }
     if (field.startsWith('editor')) {
       const map = { editorName: 'name', editorNote: 'note', editorDescription: 'description', editorLorebook: 'lorebook' };
       const key = map[field];
@@ -868,12 +1126,27 @@ class App {
       return;
     }
     this.state[field] = value;
+    if (field === 'editorTagInput') {
+      const persona = this.state.creatingPersona ? {} : this.editorPersona();
+      const draft = this.state.editorDraft && String(this.state.editorDraft.id || '') === String(persona.id || '') ? this.state.editorDraft : { id: persona.id || '', tags: this.personaTagsFor(persona).map(t => t.name), tagColors: {} };
+      draft.tagInput = String(value || '');
+      this.state.editorDraft = draft;
+      return;
+    }
     if (field.startsWith('editor')) {
       const map = { editorName: 'name', editorNote: 'note', editorDescription: 'description', editorLorebook: 'lorebook' };
       const key = map[field]; if (key) { const persona = this.editorPersona(); const draft = this.state.editorDraft || { id: persona.id || '' }; draft[key] = value; this.state.editorDraft = draft; }
     }
   }
   onKeyDown(event) {
+    if (event.target?.dataset?.field === 'editorTagInput') {
+      if (event.key === 'Enter' && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.commitEditorTags(event.target.value, { focusInput: true });
+      }
+      return;
+    }
     if (event.target?.dataset?.field !== 'aiPrompt') return;
     if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
